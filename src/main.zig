@@ -2,8 +2,8 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2 then
-//! programs the PIT and may hand control to the round-robin scheduler.
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2/M3 then
+//! program the PIT, create tasks and may hand control to the scheduler.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -22,7 +22,7 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.5.0-m2";
+pub const version = "0.6.0-m3";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -30,8 +30,10 @@ const task_stack_size = 16 * 1024;
 
 var task_a_stack: [task_stack_size]u8 align(16) = undefined;
 var task_b_stack: [task_stack_size]u8 align(16) = undefined;
+var task_c_stack: [task_stack_size]u8 align(16) = undefined;
 var task_a_runs: u64 = 0;
 var task_b_runs: u64 = 0;
+var task_c_runs: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -50,18 +52,22 @@ fn kernelPanic(message: []const u8, return_address: ?usize) noreturn {
 
 fn workerA() callconv(.c) void {
     const counter: *volatile u64 = &task_a_runs;
-    while (true) {
-        counter.* +%= 1;
-        asm volatile ("pause");
-    }
+    counter.* +%= 1;
+    sched.yield();
+    counter.* +%= 1;
+    sched.exit();
 }
 
 fn workerB() callconv(.c) void {
     const counter: *volatile u64 = &task_b_runs;
-    while (true) {
-        counter.* +%= 1;
-        asm volatile ("pause");
-    }
+    counter.* +%= 1;
+    sched.exit();
+}
+
+fn workerC() callconv(.c) void {
+    const counter: *volatile u64 = &task_c_runs;
+    counter.* +%= 1;
+    sched.exit();
 }
 
 /// ELF entry point. Limine gives us a valid stack, but it lives in
@@ -152,16 +158,27 @@ export fn kmain() callconv(.c) noreturn {
 
         serial.write("selftest: checking timer and scheduler\n");
         if (!selftestTimerScheduler()) {
+            stopTimer();
             serial.write("selftest: timer/scheduler checks failed\n");
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: timer checks passed\n");
         serial.write("selftest: scheduler checks passed\n");
+        serial.write("selftest: M2 checks passed\n");
+
+        serial.write("selftest: checking task lifecycle\n");
+        if (!selftestTaskLifecycle()) {
+            stopTimer();
+            serial.write("selftest: task lifecycle checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        stopTimer();
+        serial.write("selftest: lifecycle checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M2 checks passed, exiting QEMU\n");
+        serial.write("selftest: M3 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -169,7 +186,8 @@ export fn kmain() callconv(.c) noreturn {
     pit.init(timer_hz);
     pic.unmask(0);
     console.print("timer: PIT {d} Hz, interrupts enabled\n", .{timer_hz});
-    halt();
+    console.write("scheduler: boot task exiting to idle\n");
+    sched.exit();
 }
 
 fn banner() void {
@@ -390,9 +408,10 @@ fn selftestTimerScheduler() bool {
     task_b_runs = 0;
 
     sched.init();
+    if (sched.stats().tasks != 2) return false; // boot + idle
     if (sched.create("worker-a", workerA, task_a_stack[0..]) == null) return false;
     if (sched.create("worker-b", workerB, task_b_stack[0..]) == null) return false;
-    if (sched.stats().tasks != 3) return false;
+    if (sched.stats().tasks != 4) return false;
 
     pit.init(timer_hz);
     pic.unmask(0);
@@ -404,26 +423,47 @@ fn selftestTimerScheduler() bool {
     }
     asm volatile ("cli");
 
-    pic.mask(0);
-    sched.stop();
-
     const elapsed = sched.ticks() - start;
     const a = @as(*const volatile u64, &task_a_runs).*;
     const b = @as(*const volatile u64, &task_b_runs).*;
+    const finished = sched.finishedCount();
     console.print("timer: {d} ticks at {d} Hz\n", .{ elapsed, timer_hz });
-    console.print("scheduler: worker counters a={d}, b={d}\n", .{ a, b });
+    console.print("scheduler: worker counters a={d}, b={d}, finished={d}\n", .{ a, b, finished });
 
-    return elapsed >= timer_test_ticks and a > 0 and b > 0;
+    return elapsed >= timer_test_ticks and a > 0 and b > 0 and finished >= 2;
+}
+
+fn selftestTaskLifecycle() bool {
+    task_c_runs = 0;
+
+    // The timer test leaves interrupts disabled. Interrupts are enabled again
+    // only after worker-c has been fully inserted into the scheduler.
+    if (sched.create("worker-c", workerC, task_c_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false; // worker-c reused a finished slot
+
+    const start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - start < timer_test_ticks and sched.finishedCount() < 3) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const elapsed = sched.ticks() - start;
+    const c = @as(*const volatile u64, &task_c_runs).*;
+    const finished = sched.finishedCount();
+    console.print("lifecycle: worker-c={d}, finished={d}, elapsed={d} ticks\n", .{ c, finished, elapsed });
+
+    return c > 0 and finished >= 3;
+}
+
+fn stopTimer() void {
+    asm volatile ("cli");
+    pic.mask(0);
+    sched.stop();
 }
 
 fn rangesOverlap(a: [*]u8, a_len: usize, b: [*]u8, b_len: usize) bool {
     const a_start = @intFromPtr(a);
     const b_start = @intFromPtr(b);
     return a_start < b_start + b_len and b_start < a_start + a_len;
-}
-
-fn halt() noreturn {
-    while (true) {
-        asm volatile ("sti; hlt");
-    }
 }

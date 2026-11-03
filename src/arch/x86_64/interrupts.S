@@ -68,6 +68,9 @@ ISR_ERR   29   /* #VC */
 ISR_ERR   30   /* #SX */
 ISR_NOERR 31
 
+ISR_NOERR 48   /* scheduler yield */
+ISR_NOERR 49   /* scheduler exit */
+
 IRQ_NOERR 32   /* IRQ0: PIT */
 IRQ_NOERR 33
 IRQ_NOERR 34
@@ -150,5 +153,9 @@ isr_stub_table:
 irq_stub_table:
     .quad irq_32, irq_33, irq_34, irq_35, irq_36, irq_37, irq_38, irq_39
     .quad irq_40, irq_41, irq_42, irq_43, irq_44, irq_45, irq_46, irq_47
+
+.globl sched_stub_table
+sched_stub_table:
+    .quad isr_48, isr_49
 
 .section .note.GNU-stack,"",@progbits
