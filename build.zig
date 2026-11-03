@@ -15,16 +15,24 @@ pub fn build(b: *std.Build) void {
     });
 
     // Normal kernel image: stays alive after boot so it can be explored in QEMU.
-    const kernel = makeKernel(b, target, optimize, "zig-kernel", false);
+    const kernel = makeKernel(b, target, optimize, "zig-kernel", false, false);
     b.installArtifact(kernel);
 
-    // Smoke-test image: reports success to QEMU's isa-debug-exit once M0 init
+    // Smoke-test image: reports success to QEMU's isa-debug-exit once M1a init
     // finishes, which lets CI (and `zig build test`) assert the exit code.
-    const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true);
+    const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false);
     const smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     smoke.addArtifactArg(selftest_kernel);
     smoke.addArg("--test");
     smoke.has_side_effects = true;
+
+    // Fault-test image: deliberately dereferences a null pointer to verify the
+    // #PF gate, the CR2 report and the fatal-exception exit path.
+    const fault_kernel = makeKernel(b, target, optimize, "zig-kernel-fault-test", false, true);
+    const fault_smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
+    fault_smoke.addArtifactArg(fault_kernel);
+    fault_smoke.addArg("--test-fault");
+    fault_smoke.has_side_effects = true;
 
     // Host-side unit tests for pure logic (no arch/IO dependencies).
     const test_mod = b.createModule(.{
@@ -34,9 +42,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));
 
-    const test_step = b.step("test", "Run host unit tests and the QEMU smoke test");
+    const test_step = b.step("test", "Run host unit tests and the QEMU smoke tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&smoke.step);
+    test_step.dependOn(&fault_smoke.step);
 
     const run_cmd = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     run_cmd.addArtifactArg(kernel);
@@ -51,9 +60,11 @@ fn makeKernel(
     optimize: std.builtin.Optimize,
     name: []const u8,
     exit_after_boot: bool,
+    test_page_fault: bool,
 ) *std.Build.Step.Compile {
     const opts = b.addOptions();
     opts.addOption(bool, "exit_after_boot", exit_after_boot);
+    opts.addOption(bool, "test_page_fault", test_page_fault);
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -70,9 +81,10 @@ fn makeKernel(
             .{ .name = "build_options", .module = opts.createModule() },
         },
     });
+    mod.addAssemblyFile(b.path("src/arch/x86_64/interrupts.S"));
 
     const exe = b.addExecutable(.{ .name = name, .root_module = mod });
-    exe.entry = .{ .symbol_name = "kmain" };
+    exe.entry = .{ .symbol_name = "_start" };
     exe.use_llvm = true;
     exe.setLinkerScript(b.path("linker.ld"));
     return exe;

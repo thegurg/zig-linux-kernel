@@ -2,17 +2,23 @@
 # Boot the kernel in QEMU through Limine (UEFI).
 #
 # Usage:
-#   tools/run.sh <kernel.elf>           interactive, serial on stdio
-#   tools/run.sh <kernel.elf> --test    headless smoke test, exit code = verdict
+#   tools/run.sh <kernel.elf>                interactive, serial on stdio
+#   tools/run.sh <kernel.elf> --test         headless smoke test, exit code = verdict
+#   tools/run.sh <kernel.elf> --test-fault   headless fault test, expects a handled #PF
 #
 # The ESP is exposed to QEMU as a synthesized FAT (vvfat) drive backed by a
 # directory, so no root, loop devices, mtools or ISO tooling are required.
 
 set -euo pipefail
 
-KERNEL="${1:?usage: run.sh <kernel.elf> [--test]}"
-TEST=0
-[ "${2:-}" = "--test" ] && TEST=1
+KERNEL="${1:?usage: run.sh <kernel.elf> [--test|--test-fault]}"
+MODE=run
+case "${2:-}" in
+  --test) MODE=smoke ;;
+  --test-fault) MODE=fault ;;
+  "") ;;
+  *) echo "run.sh: unknown mode: ${2:-}" >&2; exit 2 ;;
+esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIMINE_BIN="${LIMINE_BIN:-$ROOT/third_party/limine}"
@@ -59,7 +65,7 @@ QEMU=(
   -net none
 )
 
-if [ $TEST -eq 1 ]; then
+if [ "$MODE" != "run" ]; then
   set +e
   timeout 90 "${QEMU[@]}" -serial "file:$WORK/serial.log"
   status=$?
@@ -67,12 +73,37 @@ if [ $TEST -eq 1 ]; then
   if [ -f "$WORK/serial.log" ]; then
     sed -e 's/\r$//' "$WORK/serial.log"
   fi
-  # isa-debug-exit reports (value << 1) | 1: 0x10 -> 33, 0x11 -> 35.
+
+  if [ "$MODE" = "smoke" ]; then
+    # isa-debug-exit reports (value << 1) | 1: 0x10 -> 33, 0x11 -> 35.
+    case $status in
+      33)
+        if grep -q "returned from int3" "$WORK/serial.log" &&
+           grep -q "M1a checks passed" "$WORK/serial.log"; then
+          exit 0
+        fi
+        echo "run.sh: selftest exited successfully but the expected log is missing" >&2
+        exit 1
+        ;;
+      35) echo "run.sh: kernel panic" >&2; exit 1 ;;
+      124) echo "run.sh: timed out waiting for kernel" >&2; exit 1 ;;
+      *) echo "run.sh: unexpected QEMU exit status $status" >&2; exit 1 ;;
+    esac
+  fi
+
+  # Fault test: the kernel must catch #PF, report CR2 and exit through
+  # isa-debug-exit with the failure code (35).
   case $status in
-    33) exit 0 ;;
-    35) echo "run.sh: kernel panic" >&2; exit 1 ;;
+    35)
+      if grep -q "vector 14: #PF" "$WORK/serial.log" &&
+         grep -q "cr2=0x0" "$WORK/serial.log"; then
+        exit 0
+      fi
+      echo "run.sh: fault test exited with 35 but the expected #PF log is missing" >&2
+      exit 1
+      ;;
     124) echo "run.sh: timed out waiting for kernel" >&2; exit 1 ;;
-    *) echo "run.sh: unexpected QEMU exit status $status" >&2; exit 1 ;;
+    *) echo "run.sh: unexpected QEMU exit status $status for fault test" >&2; exit 1 ;;
   esac
 fi
 
