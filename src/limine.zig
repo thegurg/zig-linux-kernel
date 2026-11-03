@@ -55,6 +55,17 @@ pub const HhdmResponse = extern struct {
     offset: u64,
 };
 
+pub const ExecutableAddressResponse = extern struct {
+    revision: u64,
+    physical_base: u64,
+    virtual_base: u64,
+};
+
+pub const PagingModeResponse = extern struct {
+    revision: u64,
+    mode: u64,
+};
+
 pub const MemmapEntryType = enum(u64) {
     usable = 0,
     reserved = 1,
@@ -90,6 +101,21 @@ const HhdmRequest = extern struct {
     id: [4]u64,
     revision: u64,
     response: ?*HhdmResponse,
+};
+
+const ExecutableAddressRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*ExecutableAddressResponse,
+};
+
+const PagingModeRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*PagingModeResponse,
+    mode: u64,
+    max_mode: u64,
+    min_mode: u64,
 };
 
 const MemmapRequest = extern struct {
@@ -130,6 +156,22 @@ export var memmap_request: MemmapRequest linksection(".limine_requests") = .{
     .response = null,
 };
 
+export var executable_address_request: ExecutableAddressRequest linksection(".limine_requests") = .{
+    .id = .{ common_magic_0, common_magic_1, 0x71ba76863cc55f63, 0xb2644a48c516a487 },
+    .revision = 0,
+    .response = null,
+};
+
+/// Force 4-level paging: M1c builds 4-level tables and assumes CR4.LA57 = 0.
+export var paging_mode_request: PagingModeRequest linksection(".limine_requests") = .{
+    .id = .{ common_magic_0, common_magic_1, 0x95c1a0edab0944cb, 0xa4e5cb3842f7488a },
+    .revision = 0,
+    .response = null,
+    .mode = 0,
+    .max_mode = 0,
+    .min_mode = 0,
+};
+
 pub fn baseRevisionSupported() bool {
     return base_revision[2] == 0;
 }
@@ -147,6 +189,14 @@ pub fn hhdmOffset() ?u64 {
 
 pub fn memmap() ?*MemmapResponse {
     return memmap_request.response;
+}
+
+pub fn executableAddress() ?*ExecutableAddressResponse {
+    return executable_address_request.response;
+}
+
+pub fn pagingMode() ?*PagingModeResponse {
+    return paging_mode_request.response;
 }
 
 test "base revision marker layout" {

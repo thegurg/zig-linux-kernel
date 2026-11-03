@@ -21,25 +21,32 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+    __kernel_start = .;
 
     .limine_requests : {
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
     } :limine
+    __kernel_requests_end = .;
 
     . = ALIGN(0x1000);
+    __kernel_text_start = .;
     .text : {
         *(.text .text.*)
     } :text
+    __kernel_text_end = .;
 
     . = ALIGN(0x1000);
+    __kernel_rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
         *(.rodata.cst*)
     } :rodata
+    __kernel_rodata_end = .;
 
     . = ALIGN(0x1000);
+    __kernel_data_start = .;
     .data : {
         *(.data .data.*)
         *(.data.rel.ro*)
@@ -49,6 +56,7 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     } :data
+    __kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

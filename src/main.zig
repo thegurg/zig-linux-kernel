@@ -10,6 +10,8 @@ const build_options = @import("build_options");
 const limine = @import("limine.zig");
 const console = @import("console.zig");
 const pmm = @import("memory/pmm.zig");
+const vmm = @import("memory/vmm.zig");
+const heap = @import("memory/heap.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
@@ -17,7 +19,7 @@ const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.3.0-m1b";
+pub const version = "0.4.0-m1c";
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -74,10 +76,18 @@ export fn kmain() callconv(.c) noreturn {
         qemu.exit(qemu.EXIT_FAILURE);
     };
 
+    vmm.init() catch |err| {
+        serial.write("vmm: initialization failed: ");
+        serial.write(@errorName(err));
+        serial.write("\n");
+        qemu.exit(qemu.EXIT_FAILURE);
+    };
+    heap.init();
+
     console.init();
     banner();
     reportBootInfo();
-    console.write("\nM1b complete. Physical page allocator online.\n");
+    console.write("\nM1c complete. Paging and kernel heap are live.\n");
 
     if (build_options.test_page_fault) {
         serial.write("selftest: triggering page fault\n");
@@ -97,10 +107,24 @@ export fn kmain() callconv(.c) noreturn {
         }
         serial.write("selftest: PMM checks passed\n");
 
+        serial.write("selftest: checking VMM\n");
+        if (!selftestVmm()) {
+            serial.write("selftest: VMM checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: VMM checks passed\n");
+
+        serial.write("selftest: checking heap\n");
+        if (!selftestHeap()) {
+            serial.write("selftest: heap checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: heap checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M1b checks passed, exiting QEMU\n");
+        serial.write("selftest: M1c checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -121,9 +145,18 @@ fn reportBootInfo() void {
         console.write("hhdm offset: unavailable\n");
     }
 
+    if (limine.executableAddress()) |address| {
+        console.print("executable: phys=0x{x} virt=0x{x}\n", .{
+            address.physical_base, address.virtual_base,
+        });
+    } else {
+        console.write("executable: address unavailable\n");
+    }
+
     if (limine.framebuffer()) |fb| {
-        console.print("framebuffer: {d}x{d}, {d} bpp, pitch {d} bytes\n", .{
-            fb.width, fb.height, fb.bpp, fb.pitch,
+        const address = if (fb.address) |ptr| @intFromPtr(ptr) else 0;
+        console.print("framebuffer: {d}x{d}, {d} bpp, pitch {d} bytes, at 0x{x}\n", .{
+            fb.width, fb.height, fb.bpp, fb.pitch, address,
         });
     } else {
         console.write("framebuffer: unavailable (serial only)\n");
@@ -151,6 +184,22 @@ fn reportBootInfo() void {
         pmm.freeBytes() / (1024 * 1024),
         pmm.totalBytes() / (1024 * 1024),
         pmm_stats.total_pages,
+    });
+
+    const paging = vmm.stats();
+    console.print("paging: pml4=0x{x}, kernel 0x{x} -> 0x{x} ({d} KiB), hhdm {d} MiB\n", .{
+        paging.pml4_phys,
+        paging.kernel_virt_base,
+        paging.kernel_phys_base,
+        paging.kernel_bytes / 1024,
+        paging.hhdm_bytes / (1024 * 1024),
+    });
+
+    const heap_stats = heap.stats();
+    console.print("heap: {d} MiB reserved at 0x{x}, {d} KiB mapped\n", .{
+        heap_stats.reserved_bytes / (1024 * 1024),
+        heap.base,
+        heap_stats.mapped_bytes / 1024,
     });
 }
 
@@ -191,6 +240,114 @@ fn selftestPmm() bool {
     if (!pmm.freePage(pages[3])) return false;
 
     return pmm.stats().free_pages == before.free_pages;
+}
+
+fn selftestVmm() bool {
+    const paging = vmm.stats();
+    if (!paging.active) return false;
+    if (vmm.currentPml4() != paging.pml4_phys) return false;
+
+    const code = @intFromPtr(&selftestVmm);
+    const expected = vmm.kernelPhysical(code) orelse return false;
+    if (vmm.translate(code) != expected) return false;
+
+    const hhdm = vmm.hhdmOffset();
+    if (limine.framebuffer()) |fb| {
+        if (fb.address) |address| {
+            const fb_virt: u64 = @intCast(@intFromPtr(address));
+            if (fb_virt >= hhdm) {
+                const fb_phys = fb_virt - hhdm;
+                if (fb_phys < pmm.max_physical_address and vmm.translate(fb_virt) != fb_phys) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    const phys = pmm.allocPage() orelse return false;
+    const test_virt: u64 = 0xffffffffb0000000;
+    var mapped = false;
+    defer {
+        if (mapped) _ = vmm.unmapPage(test_virt);
+        _ = pmm.freePage(phys);
+    }
+
+    const hhdm_ptr: *volatile u64 = @ptrFromInt(hhdm + phys);
+    hhdm_ptr.* = 0x1122334455667788;
+    if (vmm.translate(hhdm + phys) != phys) return false;
+
+    if (vmm.mapPage(test_virt + 1, phys, vmm.kernel_rw)) return false; // misaligned
+    if (!vmm.mapPage(test_virt, phys, vmm.kernel_rw)) return false;
+    mapped = true;
+
+    if (vmm.mapPage(test_virt, phys, vmm.kernel_rw)) return false; // already mapped
+    if (vmm.translate(test_virt) != phys) return false;
+
+    const test_ptr: *volatile u64 = @ptrFromInt(test_virt);
+    if (test_ptr.* != 0x1122334455667788) return false;
+    test_ptr.* = 0x8877665544332211;
+    if (hhdm_ptr.* != 0x8877665544332211) return false;
+
+    if (!vmm.unmapPage(test_virt)) return false;
+    mapped = false;
+    if (vmm.translate(test_virt) != null) return false;
+
+    return true;
+}
+
+fn selftestHeap() bool {
+    const empty = heap.stats();
+    if (empty.mapped_bytes != 0) return false;
+    if (empty.reserved_bytes != heap.reserved_bytes) return false;
+
+    const a = heap.alloc(64, 8) orelse return false;
+    const b = heap.alloc(128, 16) orelse return false;
+    const c = heap.alloc(4096, 4096) orelse return false;
+
+    if (@intFromPtr(a) % 8 != 0) return false;
+    if (@intFromPtr(b) % 16 != 0) return false;
+    if (@intFromPtr(c) % 4096 != 0) return false;
+    if (rangesOverlap(a, 64, b, 128)) return false;
+    if (rangesOverlap(a, 64, c, 4096)) return false;
+    if (rangesOverlap(b, 128, c, 4096)) return false;
+
+    for (0..64) |i| a[i] = @truncate(i);
+    for (0..128) |i| b[i] = @truncate(i + 1);
+    @memset(c[0..4096], 0xab);
+
+    for (0..64) |i| {
+        if (a[i] != @as(u8, @truncate(i))) return false;
+    }
+    for (0..128) |i| {
+        if (b[i] != @as(u8, @truncate(i + 1))) return false;
+    }
+    for (c[0..4096]) |byte| {
+        if (byte != 0xab) return false;
+    }
+
+    heap.free(a, 64);
+    const a2 = heap.alloc(64, 8) orelse return false;
+    if (a2 != a) return false;
+
+    heap.free(b, 128);
+    heap.free(c, 4096);
+    heap.free(a2, 64);
+
+    const slice = heap.allocator.alloc(u8, 100) catch return false;
+    @memset(slice, 0x5a);
+    if (slice[99] != 0x5a) return false;
+    heap.allocator.free(slice);
+
+    if (heap.alloc(heap.reserved_bytes + 1, 8) != null) return false;
+
+    const after = heap.stats();
+    return after.mapped_bytes > 0 and after.free_bytes == after.mapped_bytes;
+}
+
+fn rangesOverlap(a: [*]u8, a_len: usize, b: [*]u8, b_len: usize) bool {
+    const a_start = @intFromPtr(a);
+    const b_start = @intFromPtr(b);
+    return a_start < b_start + b_len and b_start < a_start + a_len;
 }
 
 fn halt() noreturn {
