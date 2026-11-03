@@ -2,7 +2,8 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault.
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2 then
+//! programs the PIT and may hand control to the round-robin scheduler.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -17,9 +18,20 @@ const cpu = @import("arch/x86_64/cpu.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
+const pit = @import("arch/x86_64/pit.zig");
+const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.4.0-m1c";
+pub const version = "0.5.0-m2";
+
+const timer_hz: u32 = 100;
+const timer_test_ticks: u64 = 30;
+const task_stack_size = 16 * 1024;
+
+var task_a_stack: [task_stack_size]u8 align(16) = undefined;
+var task_b_stack: [task_stack_size]u8 align(16) = undefined;
+var task_a_runs: u64 = 0;
+var task_b_runs: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -34,6 +46,22 @@ fn kernelPanic(message: []const u8, return_address: ?usize) noreturn {
     }
     serial.write("\n");
     qemu.exit(qemu.EXIT_FAILURE);
+}
+
+fn workerA() callconv(.c) void {
+    const counter: *volatile u64 = &task_a_runs;
+    while (true) {
+        counter.* +%= 1;
+        asm volatile ("pause");
+    }
+}
+
+fn workerB() callconv(.c) void {
+    const counter: *volatile u64 = &task_b_runs;
+    while (true) {
+        counter.* +%= 1;
+        asm volatile ("pause");
+    }
 }
 
 /// ELF entry point. Limine gives us a valid stack, but it lives in
@@ -120,14 +148,27 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: heap checks passed\n");
+        serial.write("selftest: M1c checks passed\n");
+
+        serial.write("selftest: checking timer and scheduler\n");
+        if (!selftestTimerScheduler()) {
+            serial.write("selftest: timer/scheduler checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: timer checks passed\n");
+        serial.write("selftest: scheduler checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M1c checks passed, exiting QEMU\n");
+        serial.write("selftest: M2 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
+    sched.init();
+    pit.init(timer_hz);
+    pic.unmask(0);
+    console.print("timer: PIT {d} Hz, interrupts enabled\n", .{timer_hz});
     halt();
 }
 
@@ -344,6 +385,37 @@ fn selftestHeap() bool {
     return after.mapped_bytes > 0 and after.free_bytes == after.mapped_bytes;
 }
 
+fn selftestTimerScheduler() bool {
+    task_a_runs = 0;
+    task_b_runs = 0;
+
+    sched.init();
+    if (sched.create("worker-a", workerA, task_a_stack[0..]) == null) return false;
+    if (sched.create("worker-b", workerB, task_b_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 3) return false;
+
+    pit.init(timer_hz);
+    pic.unmask(0);
+
+    const start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - start < timer_test_ticks) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    pic.mask(0);
+    sched.stop();
+
+    const elapsed = sched.ticks() - start;
+    const a = @as(*const volatile u64, &task_a_runs).*;
+    const b = @as(*const volatile u64, &task_b_runs).*;
+    console.print("timer: {d} ticks at {d} Hz\n", .{ elapsed, timer_hz });
+    console.print("scheduler: worker counters a={d}, b={d}\n", .{ a, b });
+
+    return elapsed >= timer_test_ticks and a > 0 and b > 0;
+}
+
 fn rangesOverlap(a: [*]u8, a_len: usize, b: [*]u8, b_len: usize) bool {
     const a_start = @intFromPtr(a);
     const b_start = @intFromPtr(b);
@@ -352,6 +424,6 @@ fn rangesOverlap(a: [*]u8, a_len: usize, b: [*]u8, b_len: usize) bool {
 
 fn halt() noreturn {
     while (true) {
-        asm volatile ("cli; hlt");
+        asm volatile ("sti; hlt");
     }
 }

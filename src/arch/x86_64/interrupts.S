@@ -1,13 +1,13 @@
-/* CPU exception entry stubs.
+/* CPU exception and IRQ entry stubs.
  *
  * Every stub normalises the stack frame to:
  *     [rsp+0]  vector
  *     [rsp+8]  error code (synthesised as zero when the CPU pushes none)
  *     [rsp+16] RIP
  *     ...
- * then jumps to isr_common, which preserves the caller-saved registers and
- * calls the Zig dispatcher. The dispatcher may return (breakpoint) or never
- * return (fatal exception).
+ * then jumps to isr_common, which saves every general-purpose register and
+ * calls the Zig dispatcher. The dispatcher returns the saved-register base to
+ * resume, which lets the scheduler switch tasks from the timer interrupt.
  */
 
 .text
@@ -23,6 +23,14 @@ isr_\num:
 .macro ISR_ERR num
     .globl isr_\num
 isr_\num:
+    pushq $\num
+    jmp isr_common
+.endm
+
+.macro IRQ_NOERR num
+    .globl irq_\num
+irq_\num:
+    pushq $0
     pushq $\num
     jmp isr_common
 .endm
@@ -60,39 +68,70 @@ ISR_ERR   29   /* #VC */
 ISR_ERR   30   /* #SX */
 ISR_NOERR 31
 
+IRQ_NOERR 32   /* IRQ0: PIT */
+IRQ_NOERR 33
+IRQ_NOERR 34
+IRQ_NOERR 35
+IRQ_NOERR 36
+IRQ_NOERR 37
+IRQ_NOERR 38
+IRQ_NOERR 39
+IRQ_NOERR 40   /* IRQ8 */
+IRQ_NOERR 41
+IRQ_NOERR 42
+IRQ_NOERR 43
+IRQ_NOERR 44
+IRQ_NOERR 45
+IRQ_NOERR 46
+IRQ_NOERR 47   /* IRQ15 */
+
 .globl isr_common
 .type isr_common, @function
 isr_common:
     cld
     pushq %rax
+    pushq %rbx
     pushq %rcx
     pushq %rdx
     pushq %rsi
     pushq %rdi
+    pushq %rbp
     pushq %r8
     pushq %r9
     pushq %r10
     pushq %r11
     pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
 
     /* C ABI requires 16-byte stack alignment at the call site. r12 holds the
      * saved-register base, and the dispatcher preserves r12 as a callee-saved
-     * register. The frame starts 10 registers (80 bytes) above it. */
+     * register. The frame starts 15 registers (120 bytes) above it. */
     movq %rsp, %r12
     andq $-16, %rsp
-    leaq 80(%r12), %rdi
+    leaq 120(%r12), %rdi
+    movq %r12, %rsi
     call isr_dispatch
 
+    /* The dispatcher returns the saved-register base to resume. It is the
+     * same base for exceptions, or another task's context for a timer tick. */
+    movq %rax, %r12
     movq %r12, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
     popq %r12
     popq %r11
     popq %r10
     popq %r9
     popq %r8
+    popq %rbp
     popq %rdi
     popq %rsi
     popq %rdx
     popq %rcx
+    popq %rbx
     popq %rax
     addq $16, %rsp         /* drop vector + error code */
     iretq
@@ -106,5 +145,10 @@ isr_stub_table:
     .quad isr_8,  isr_9,  isr_10, isr_11, isr_12, isr_13, isr_14, isr_15
     .quad isr_16, isr_17, isr_18, isr_19, isr_20, isr_21, isr_22, isr_23
     .quad isr_24, isr_25, isr_26, isr_27, isr_28, isr_29, isr_30, isr_31
+
+.globl irq_stub_table
+irq_stub_table:
+    .quad irq_32, irq_33, irq_34, irq_35, irq_36, irq_37, irq_38, irq_39
+    .quad irq_40, irq_41, irq_42, irq_43, irq_44, irq_45, irq_46, irq_47
 
 .section .note.GNU-stack,"",@progbits

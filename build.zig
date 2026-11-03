@@ -18,9 +18,9 @@ pub fn build(b: *std.Build) void {
     const kernel = makeKernel(b, target, optimize, "zig-kernel", false, false);
     b.installArtifact(kernel);
 
-    // Smoke-test image: exercises the PMM, page tables, heap and exception
-    // path, then reports success to QEMU's isa-debug-exit so CI (and
-    // `zig build test`) can assert the exit code.
+    // Smoke-test image: exercises the PMM, page tables, heap, PIT/IRQ0,
+    // preemptive scheduler and exception path, then reports success to QEMU's
+    // isa-debug-exit so CI (and `zig build test`) can assert the exit code.
     const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false);
     const smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     smoke.addArtifactArg(selftest_kernel);

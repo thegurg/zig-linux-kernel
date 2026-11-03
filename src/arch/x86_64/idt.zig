@@ -1,12 +1,15 @@
-//! Interrupt Descriptor Table and CPU exception handling.
+//! Interrupt Descriptor Table, CPU exception handling and IRQ entry points.
 //!
-//! The 32 CPU exception stubs live in `interrupts.S`. Each stub normalises the
-//! frame (pushing a synthetic error code when the CPU does not) and jumps to a
-//! common entry that saves registers, calls `isr_dispatch`, and `iretq`s back.
+//! The 32 CPU exception stubs and 16 IRQ stubs live in `interrupts.S`. Each
+//! stub normalises the frame (pushing a synthetic error code when the CPU does
+//! not) and jumps to a common entry that saves registers, calls
+//! `isr_dispatch`, and `iretq`s back. IRQ0 feeds the scheduler.
 
 const std = @import("std");
 const console = @import("../../console.zig");
+const sched = @import("../../sched.zig");
 const gdt = @import("gdt.zig");
+const pic = @import("pic.zig");
 const qemu = @import("qemu.zig");
 
 const gate_count = 256;
@@ -15,12 +18,14 @@ var idt: [gate_count][16]u8 align(16) = @splat(@splat(0));
 
 var idtr: [10]u8 align(8) = @splat(0);
 
-/// Addresses of the 32 stubs, exported by `interrupts.S` in .rodata.
+/// Addresses of the 32 exception and 16 IRQ stubs, exported by
+/// `interrupts.S` in .rodata.
 extern const isr_stub_table: [32]u64;
+extern const irq_stub_table: [16]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
-/// `rsp` and `ss` are only architecturally present when the privilege level
-/// changed; they still occupy this slot when the CPU did not push them.
+/// In long mode the CPU pushes a full five-qword frame (RIP, CS, RFLAGS, RSP,
+/// SS) even for same-privilege interrupts.
 const Frame = extern struct {
     vector: u64,
     error_code: u64,
@@ -71,6 +76,9 @@ pub fn init() void {
         const ist: u8 = if (vector == 8) 1 else 0;
         setGate(vector, isr_stub_table[vector], ist);
     }
+    inline for (0..16) |irq| {
+        setGate(32 + irq, irq_stub_table[irq], 0);
+    }
 
     idtr = @splat(0);
     std.mem.writeInt(u16, idtr[0..2], @sizeOf(@TypeOf(idt)) - 1, .little);
@@ -102,8 +110,16 @@ fn setGate(vector: usize, handler: u64, ist: u8) void {
     entry[15] = 0;
 }
 
-export fn isr_dispatch(frame: *Frame) callconv(.c) void {
+export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
     const vector: u8 = @intCast(frame.vector & 0xff);
+
+    if (vector >= 32 and vector < 48) {
+        const irq = vector - 32;
+        pic.sendEoi(irq);
+        if (irq == 0) return sched.tick(saved_rsp);
+        return saved_rsp;
+    }
+
     const from_user = (frame.cs & 3) == 3;
 
     console.print("\n[exception] vector {d}: {s}\n", .{
@@ -126,7 +142,7 @@ export fn isr_dispatch(frame: *Frame) callconv(.c) void {
 
     if (vector == 3) {
         console.write("breakpoint handled, resuming\n");
-        return;
+        return saved_rsp;
     }
 
     console.write("fatal exception, halting\n");
