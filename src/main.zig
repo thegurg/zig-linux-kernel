@@ -9,6 +9,7 @@ const build_options = @import("build_options");
 
 const limine = @import("limine.zig");
 const console = @import("console.zig");
+const pmm = @import("memory/pmm.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
@@ -16,7 +17,7 @@ const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.2.0-m1a";
+pub const version = "0.3.0-m1b";
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -66,10 +67,17 @@ export fn kmain() callconv(.c) noreturn {
         qemu.exit(qemu.EXIT_FAILURE);
     }
 
+    pmm.init() catch |err| {
+        serial.write("pmm: initialization failed: ");
+        serial.write(@errorName(err));
+        serial.write("\n");
+        qemu.exit(qemu.EXIT_FAILURE);
+    };
+
     console.init();
     banner();
     reportBootInfo();
-    console.write("\nM1a complete. GDT/TSS and IDT are live.\n");
+    console.write("\nM1b complete. Physical page allocator online.\n");
 
     if (build_options.test_page_fault) {
         serial.write("selftest: triggering page fault\n");
@@ -82,10 +90,17 @@ export fn kmain() callconv(.c) noreturn {
     }
 
     if (build_options.exit_after_boot) {
+        serial.write("selftest: checking PMM\n");
+        if (!selftestPmm()) {
+            serial.write("selftest: PMM checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: PMM checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M1a checks passed, exiting QEMU\n");
+        serial.write("selftest: M1b checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -130,6 +145,52 @@ fn reportBootInfo() void {
     console.print("memory map: {d} entries, {d} MiB usable\n", .{
         memmap.entry_count, usable_bytes / (1024 * 1024),
     });
+
+    const pmm_stats = pmm.stats();
+    console.print("pmm: {d} MiB free / {d} MiB managed ({d} pages)\n", .{
+        pmm.freeBytes() / (1024 * 1024),
+        pmm.totalBytes() / (1024 * 1024),
+        pmm_stats.total_pages,
+    });
+}
+
+fn selftestPmm() bool {
+    const before = pmm.stats();
+    if (before.total_pages < 4 or before.free_pages < 4) return false;
+
+    var pages: [4]u64 = undefined;
+    for (&pages) |*slot| {
+        slot.* = pmm.allocPage() orelse return false;
+        if (slot.* == 0) return false; // zero page must stay reserved
+        if (slot.* % pmm.page_size != 0) return false;
+        if (slot.* >= pmm.max_physical_address) return false;
+    }
+
+    for (0..pages.len) |i| {
+        for (i + 1..pages.len) |j| {
+            if (pages[i] == pages[j]) return false;
+        }
+    }
+
+    if (pmm.stats().free_pages != before.free_pages - pages.len) return false;
+
+    if (!pmm.freePage(pages[1])) return false;
+    if (pmm.stats().free_pages != before.free_pages - pages.len + 1) return false;
+    if (pmm.freePage(pages[1])) return false; // double free must fail
+    if (pmm.freePage(1)) return false; // misaligned address
+    if (pmm.freePage(pmm.max_physical_address)) return false; // out of range
+    if (pmm.freePage(0)) return false; // reserved/never allocated
+
+    const reused = pmm.allocPage() orelse return false;
+    if (reused != pages[1]) return false; // free page must be reused first
+    if (pmm.stats().free_pages != before.free_pages - pages.len) return false;
+
+    if (!pmm.freePage(reused)) return false;
+    if (!pmm.freePage(pages[0])) return false;
+    if (!pmm.freePage(pages[2])) return false;
+    if (!pmm.freePage(pages[3])) return false;
+
+    return pmm.stats().free_pages == before.free_pages;
 }
 
 fn halt() noreturn {
