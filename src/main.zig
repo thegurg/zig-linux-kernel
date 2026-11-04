@@ -2,7 +2,7 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M4 then
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M5 then
 //! program the PIT, create tasks and may hand control to the scheduler.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.7.0-m4";
+pub const version = "0.8.0-m5";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -36,6 +36,7 @@ var task_a_runs: u64 = 0;
 var task_b_runs: u64 = 0;
 var task_c_runs: u64 = 0;
 var task_d_runs: u64 = 0;
+var task_e_runs: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -75,6 +76,14 @@ fn workerC() callconv(.c) void {
 fn workerSleep() callconv(.c) void {
     const counter: *volatile u64 = &task_d_runs;
     sched.sleep(sleep_ticks);
+    counter.* +%= 1;
+    sched.exit();
+}
+
+fn workerBlock() callconv(.c) void {
+    const counter: *volatile u64 = &task_e_runs;
+    counter.* +%= 1;
+    sched.block();
     counter.* +%= 1;
     sched.exit();
 }
@@ -190,13 +199,22 @@ export fn kmain() callconv(.c) noreturn {
             serial.write("selftest: sleep checks failed\n");
             qemu.exit(qemu.EXIT_FAILURE);
         }
-        stopTimer();
         serial.write("selftest: sleep checks passed\n");
+        serial.write("selftest: M4 checks passed\n");
+
+        serial.write("selftest: checking blocking wakeup\n");
+        if (!selftestBlocking()) {
+            stopTimer();
+            serial.write("selftest: blocking checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        stopTimer();
+        serial.write("selftest: block checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M4 checks passed, exiting QEMU\n");
+        serial.write("selftest: M5 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -494,6 +512,42 @@ fn selftestSleep() bool {
     console.print("sleep: worker-sleep={d}, finished={d}, elapsed={d} ticks\n", .{ d, finished, elapsed });
 
     return d > 0 and finished >= 4 and elapsed >= sleep_ticks;
+}
+
+fn selftestBlocking() bool {
+    task_e_runs = 0;
+
+    const worker = sched.create("worker-block", workerBlock, task_c_stack[0..]) orelse return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - start < timer_test_ticks and sched.blockedCount() == 0) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    if (sched.blockedCount() == 0) {
+        console.write("block: timed out waiting for worker to block\n");
+        return false;
+    }
+    const first = @as(*const volatile u64, &task_e_runs).*;
+    if (first == 0) return false;
+    if (!sched.wake(worker)) return false;
+
+    const wake_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - wake_start < timer_test_ticks and sched.finishedCount() < 5) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const elapsed = sched.ticks() - start;
+    const e = @as(*const volatile u64, &task_e_runs).*;
+    const finished = sched.finishedCount();
+    console.print("block: worker-block={d}, finished={d}, elapsed={d} ticks\n", .{ e, finished, elapsed });
+
+    return e == 2 and finished >= 5;
 }
 
 fn stopTimer() void {

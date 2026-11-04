@@ -1,14 +1,14 @@
 //! Round-robin kernel task scheduler: preemption, cooperative yield/exit,
-//! timer-based sleep, an idle task, and finished-slot reuse.
+//! timer-based sleep, explicit block/wake, an idle task, and slot reuse.
 //!
 //! `tasks[0]` is the boot context and `tasks[1]` is the idle task. User tasks
 //! use caller-owned kernel stacks. IRQ0 calls `tick`; `int $48` calls
 //! `yieldCurrent`; `int $49` calls `exitCurrent`; `int $50` calls
-//! `sleepCurrent`. All return the saved-register base that the assembly
-//! epilogue should resume.
+//! `sleepCurrent`; `int $51` calls `blockCurrent`. All return the
+//! saved-register base that the assembly epilogue should resume.
 //!
 //! Every GPR is saved (see `interrupts.S`). FPU/SIMD state is not switched
-//! yet, so M4 tasks must not rely on live XMM registers across a preemption.
+//! yet, so M5 tasks must not rely on live XMM registers across a preemption.
 
 const gdt = @import("arch/x86_64/gdt.zig");
 const sync = @import("sync.zig");
@@ -17,6 +17,7 @@ pub const max_tasks = 8;
 pub const yield_vector: u8 = 48;
 pub const exit_vector: u8 = 49;
 pub const sleep_vector: u8 = 50;
+pub const block_vector: u8 = 51;
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
@@ -35,6 +36,7 @@ pub const Stats = struct {
     ticks: u64,
     tasks: usize,
     finished: u64,
+    blocked: u64,
     current_id: u32,
     enabled: bool,
 };
@@ -49,6 +51,7 @@ var task_count: usize = 0;
 var current: ?*Task = null;
 var tick_counter: u64 = 0;
 var finished_counter: u64 = 0;
+var blocked_counter: u64 = 0;
 var sleep_request: u64 = 0;
 var next_id: u32 = 0;
 var enabled = false;
@@ -68,6 +71,7 @@ pub fn init() void {
     current = &tasks[0];
     tick_counter = 0;
     finished_counter = 0;
+    blocked_counter = 0;
     sleep_request = 0;
     next_id = 2;
     enabled = true;
@@ -176,6 +180,8 @@ pub fn sleepCurrent(saved_rsp: u64) u64 {
     current_task.rsp = saved_rsp;
     current_task.state = .blocked;
     current_task.wake_tick = tick_counter +% duration;
+    const blocked: *volatile u64 = &blocked_counter;
+    blocked.* +%= 1;
 
     if (nextOtherReady(current_task.index)) |next| {
         next.state = .running;
@@ -186,6 +192,47 @@ pub fn sleepCurrent(saved_rsp: u64) u64 {
     idle.state = .running;
     current = idle;
     return idle.rsp;
+}
+
+pub fn block() void {
+    const flags = sync.irqSave();
+    asm volatile ("cli");
+    asm volatile ("int $51" ::: .{ .memory = true });
+    sync.irqRestore(flags);
+}
+
+pub fn blockCurrent(saved_rsp: u64) u64 {
+    if (!initialized) return saved_rsp;
+    if (!enabled) return saved_rsp;
+    const current_task = current orelse return saved_rsp;
+    if (current_task.index == idle_index) return saved_rsp;
+
+    current_task.rsp = saved_rsp;
+    current_task.state = .blocked;
+    current_task.wake_tick = ~@as(u64, 0);
+    const blocked: *volatile u64 = &blocked_counter;
+    blocked.* +%= 1;
+
+    if (nextOtherReady(current_task.index)) |next| {
+        next.state = .running;
+        current = next;
+        return next.rsp;
+    }
+    const idle = &tasks[idle_index];
+    idle.state = .running;
+    current = idle;
+    return idle.rsp;
+}
+
+pub fn wake(task: *Task) bool {
+    task_lock.acquire();
+    defer task_lock.release();
+
+    if (task.state != .blocked) return false;
+    task.state = .ready;
+    const blocked: *volatile u64 = &blocked_counter;
+    blocked.* -%= 1;
+    return true;
 }
 
 pub fn yield() void {
@@ -213,11 +260,17 @@ pub fn finishedCount() u64 {
     return counter.*;
 }
 
+pub fn blockedCount() u64 {
+    const counter: *const volatile u64 = &blocked_counter;
+    return counter.*;
+}
+
 pub fn stats() Stats {
     return .{
         .ticks = ticks(),
         .tasks = task_count,
         .finished = finishedCount(),
+        .blocked = blockedCount(),
         .current_id = if (current) |task| task.id else 0,
         .enabled = enabled,
     };
@@ -230,6 +283,8 @@ fn wakeBlocked() void {
         const task = &tasks[index];
         if (task.state == .blocked and tick_counter >= task.wake_tick) {
             task.state = .ready;
+            const blocked: *volatile u64 = &blocked_counter;
+            blocked.* -%= 1;
         }
     }
 }
