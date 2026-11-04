@@ -22,7 +22,7 @@ var idtr: [10]u8 align(8) = @splat(0);
 /// `interrupts.S` in .rodata.
 extern const isr_stub_table: [32]u64;
 extern const irq_stub_table: [16]u64;
-extern const sched_stub_table: [2]u64;
+extern const sched_stub_table: [3]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
 /// In long mode the CPU pushes a full five-qword frame (RIP, CS, RFLAGS, RSP,
@@ -80,7 +80,7 @@ pub fn init() void {
     inline for (0..16) |irq| {
         setGate(32 + irq, irq_stub_table[irq], 0);
     }
-    inline for (0..2) |index| {
+    inline for (0..3) |index| {
         setGate(@as(usize, sched.yield_vector) + index, sched_stub_table[index], 0);
     }
 
@@ -125,6 +125,7 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
     }
     if (vector == sched.yield_vector) return sched.yieldCurrent(saved_rsp);
     if (vector == sched.exit_vector) return sched.exitCurrent(saved_rsp);
+    if (vector == sched.sleep_vector) return sched.sleepCurrent(saved_rsp);
 
     const from_user = (frame.cs & 3) == 3;
 

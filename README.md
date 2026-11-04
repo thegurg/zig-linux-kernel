@@ -9,7 +9,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M1c complete:** own 4-level page tables, higher-half kernel mapping, 4 GiB HHDM direct map, and a 64 MiB lazily-mapped kernel heap with `std.mem.Allocator` support.
 - **M2 complete:** IRQ gates/stubs, 100 Hz PIT on IRQ0, full 15-GPR interrupt context save/restore, and a preemptive round-robin kernel task scheduler with per-task stacks.
 - **M3 complete:** cooperative `yield`/`exit` software interrupts, an idle task that runs when no other task is ready, and reuse of finished task slots.
-- **Next:** M4 - blocking/sleep and synchronization groundwork.
+- **M4 complete:** timer-based blocking sleep (`sched.sleep`), deadline wakeups in the timer tick, and a small interrupt-safe lock (`sync.IrqLock`).
+- **Next:** M5 - wait queues and richer synchronization primitives.
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -32,8 +33,9 @@ Build options:
 - the selftest checks PMM allocation/free/reuse, page-table translation and
   map/unmap, heap allocation/alignment/coalescing, waits for 30 PIT ticks while
   two round-robin tasks yield and exit, creates a third task to verify
-  finished-slot reuse, triggers `int3` and must return from the handler (QEMU
-  status 33);
+  finished-slot reuse, creates a sleeping task and checks that it wakes after
+  its deadline, triggers `int3` and must return from the handler (QEMU status
+  33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35).
 
@@ -47,11 +49,12 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M2 smoke test
+  main.zig         _start, kmain, panic, boot sequence, M2-M4 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch
   memory/heap.zig  lazily mapped first-fit kernel heap + std.mem.Allocator
   sched.zig        preemptive/cooperative scheduler, idle task, slot reuse
+  sync.zig         interrupt-safe critical-section lock (`IrqLock`)
 tools/run.sh       Build ESP (vvfat) and launch QEMU
 tools/genfont.py   Regenerate src/font.zig from a system font
 third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
@@ -65,5 +68,6 @@ third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 - M1c forces 4-level paging, builds a fresh PML4, maps the kernel image at its Limine physical base, and maps the first 4 GiB of physical memory at the HHDM offset with 2 MiB pages. Kernel text/rodata are read-only and `CR0.WP` is enabled; the framebuffer's HHDM range is marked uncached.
 - The heap reserves `0xffffffff90000000..0xffffffff94000000` and grows in 64 KiB batches from the PMM. It is a first-fit free-list allocator with block headers, coalescing, arbitrary power-of-two alignment, and a `std.mem.Allocator` adapter; `resize`/`remap` are not implemented yet.
 - M2 programs the PIT channel 0 to 100 Hz on IRQ0 and unmasks only that PIC line. Every interrupt saves all 15 general-purpose registers into a common frame; the IRQ0 dispatcher sends EOI and calls the round-robin scheduler, which returns the saved-register base of the next task. `tasks[0]` is the boot context, and the selftest creates workers with static 16 KiB stacks.
-- M3 adds software interrupts 48 and 49 for `sched.yield()` and `sched.exit()`. `tasks[1]` is a dedicated idle task that halts when no other task is ready, and finished slots are reused by later `create` calls. The normal kernel exits its boot task into the idle task after starting the timer. With 8 slots total (boot + idle + 6 user tasks), the task table currently has no synchronization beyond disabling interrupts while it is modified.
-- Context switching does not save floating-point/SIMD state yet. M3 tasks must not rely on live XMM registers across a preemption; FPU context switching, blocking/sleep and synchronization are planned for later milestones.
+- M3 adds software interrupts 48 and 49 for `sched.yield()` and `sched.exit()`. `tasks[1]` is a dedicated idle task that halts when no other task is ready, and finished slots are reused by later `create` calls. The normal kernel exits its boot task into the idle task after starting the timer. With 8 slots total (boot + idle + 6 user tasks), the task table is modified under `sync.IrqLock`.
+- M4 adds software interrupt 50 for `sched.sleep(ticks)`. A sleeping task enters the `blocked` state with a wake tick; the IRQ0 handler marks it ready once the deadline passes, and the idle task covers the case where every other task is asleep. `sync.IrqLock` saves RFLAGS, disables interrupts for a short critical section, and restores the previous interrupt state; it is not reentrant and is only correct on a single CPU.
+- Context switching does not save floating-point/SIMD state yet. M4 tasks must not rely on live XMM registers across a preemption; FPU context switching, wait queues and SMP-safe locks are planned for later milestones.
