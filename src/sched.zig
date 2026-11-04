@@ -1,14 +1,16 @@
 //! Round-robin kernel task scheduler: preemption, cooperative yield/exit,
-//! timer-based sleep, explicit block/wake, an idle task, and slot reuse.
+//! timer-based sleep, explicit block/wake, wait queues, an idle task, and slot
+//! reuse.
 //!
 //! `tasks[0]` is the boot context and `tasks[1]` is the idle task. User tasks
 //! use caller-owned kernel stacks. IRQ0 calls `tick`; `int $48` calls
 //! `yieldCurrent`; `int $49` calls `exitCurrent`; `int $50` calls
-//! `sleepCurrent`; `int $51` calls `blockCurrent`. All return the
-//! saved-register base that the assembly epilogue should resume.
+//! `sleepCurrent`; `int $51` calls `blockCurrent`; `int $52` calls
+//! `waitQueueCurrent`. All return the saved-register base that the assembly
+//! epilogue should resume.
 //!
 //! Every GPR is saved (see `interrupts.S`). FPU/SIMD state is not switched
-//! yet, so M5 tasks must not rely on live XMM registers across a preemption.
+//! yet, so M6 tasks must not rely on live XMM registers across a preemption.
 
 const gdt = @import("arch/x86_64/gdt.zig");
 const sync = @import("sync.zig");
@@ -18,6 +20,7 @@ pub const yield_vector: u8 = 48;
 pub const exit_vector: u8 = 49;
 pub const sleep_vector: u8 = 50;
 pub const block_vector: u8 = 51;
+pub const wait_vector: u8 = 52;
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
@@ -30,6 +33,68 @@ pub const Task = struct {
     wake_tick: u64,
     id: u32,
     index: usize,
+};
+
+pub const WaitQueue = struct {
+    waiters: [max_tasks]u32 = @splat(0),
+    count: usize = 0,
+
+    pub fn wait(self: *WaitQueue) void {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+        wait_request = self;
+        asm volatile ("int $52" ::: .{ .memory = true });
+        sync.irqRestore(flags);
+    }
+
+    pub fn wakeOne(self: *WaitQueue) bool {
+        task_lock.acquire();
+        defer task_lock.release();
+
+        while (self.count > 0) {
+            const id = self.waiters[0];
+            self.removeAt(0);
+            if (findTaskById(id)) |task| {
+                if (wakeLocked(task)) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn wakeAll(self: *WaitQueue) usize {
+        task_lock.acquire();
+        defer task_lock.release();
+
+        var woken: usize = 0;
+        for (self.waiters[0..self.count]) |id| {
+            if (findTaskById(id)) |task| {
+                if (wakeLocked(task)) woken += 1;
+            }
+        }
+        self.count = 0;
+        return woken;
+    }
+
+    fn compactLocked(self: *WaitQueue) void {
+        var write: usize = 0;
+        for (self.waiters[0..self.count]) |id| {
+            if (findTaskById(id)) |task| {
+                if (task.state == .blocked) {
+                    self.waiters[write] = id;
+                    write += 1;
+                }
+            }
+        }
+        self.count = write;
+    }
+
+    fn removeAt(self: *WaitQueue, index: usize) void {
+        var cursor = index;
+        while (cursor + 1 < self.count) : (cursor += 1) {
+            self.waiters[cursor] = self.waiters[cursor + 1];
+        }
+        self.count -= 1;
+    }
 };
 
 pub const Stats = struct {
@@ -53,6 +118,7 @@ var tick_counter: u64 = 0;
 var finished_counter: u64 = 0;
 var blocked_counter: u64 = 0;
 var sleep_request: u64 = 0;
+var wait_request: ?*WaitQueue = null;
 var next_id: u32 = 0;
 var enabled = false;
 var initialized = false;
@@ -73,6 +139,7 @@ pub fn init() void {
     finished_counter = 0;
     blocked_counter = 0;
     sleep_request = 0;
+    wait_request = null;
     next_id = 2;
     enabled = true;
     initialized = true;
@@ -224,10 +291,28 @@ pub fn blockCurrent(saved_rsp: u64) u64 {
     return idle.rsp;
 }
 
+pub fn waitQueueCurrent(saved_rsp: u64) u64 {
+    const queue = wait_request orelse return saved_rsp;
+    wait_request = null;
+    if (!initialized) return saved_rsp;
+    if (!enabled) return saved_rsp;
+    const current_task = current orelse return saved_rsp;
+    if (current_task.index == idle_index) return saved_rsp;
+
+    queue.compactLocked();
+    if (queue.count >= queue.waiters.len) return saved_rsp;
+    queue.waiters[queue.count] = current_task.id;
+    queue.count += 1;
+    return blockCurrent(saved_rsp);
+}
+
 pub fn wake(task: *Task) bool {
     task_lock.acquire();
     defer task_lock.release();
+    return wakeLocked(task);
+}
 
+fn wakeLocked(task: *Task) bool {
     if (task.state != .blocked) return false;
     task.state = .ready;
     const blocked: *volatile u64 = &blocked_counter;
@@ -282,9 +367,7 @@ fn wakeBlocked() void {
         if (index == idle_index) continue;
         const task = &tasks[index];
         if (task.state == .blocked and tick_counter >= task.wake_tick) {
-            task.state = .ready;
-            const blocked: *volatile u64 = &blocked_counter;
-            blocked.* -%= 1;
+            _ = wakeLocked(task);
         }
     }
 }
@@ -295,6 +378,14 @@ fn nextOtherReady(start: usize) ?*Task {
         const index = (start + offset) % task_count;
         const task = &tasks[index];
         if (task.state == .ready) return task;
+    }
+    return null;
+}
+
+fn findTaskById(id: u32) ?*Task {
+    var index: usize = 0;
+    while (index < task_count) : (index += 1) {
+        if (tasks[index].id == id) return &tasks[index];
     }
     return null;
 }

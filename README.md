@@ -11,7 +11,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M3 complete:** cooperative `yield`/`exit` software interrupts, an idle task that runs when no other task is ready, and reuse of finished task slots.
 - **M4 complete:** timer-based blocking sleep (`sched.sleep`), deadline wakeups in the timer tick, and a small interrupt-safe lock (`sync.IrqLock`).
 - **M5 complete:** explicit indefinite blocking (`sched.block`) and wakeup (`sched.wake`) with a blocked-task counter.
-- **Next:** M6 - wait queues and event synchronization.
+- **M6 complete:** `sched.WaitQueue` with `wait`, `wakeOne` and `wakeAll`, plus pruning of stale waiter entries.
+- **Next:** M7 - condition variables and richer event synchronization.
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -35,8 +36,9 @@ Build options:
   map/unmap, heap allocation/alignment/coalescing, waits for 30 PIT ticks while
   two round-robin tasks yield and exit, creates a third task to verify
   finished-slot reuse, creates a sleeping task and checks that it wakes after
-  its deadline, blocks a worker until the boot task wakes it explicitly,
-  triggers `int3` and must return from the handler (QEMU status 33);
+  its deadline, blocks a worker until the boot task wakes it explicitly, puts
+  another worker on a wait queue and wakes it with `wakeOne`, triggers `int3`
+  and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35).
 
@@ -50,11 +52,11 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M2-M5 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M2-M6 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch
   memory/heap.zig  lazily mapped first-fit kernel heap + std.mem.Allocator
-  sched.zig        preemptive/cooperative scheduler, sleep/block/wake, idle
+  sched.zig        scheduler, sleep/block/wake, wait queues, idle task
   sync.zig         interrupt-safe critical-section lock (`IrqLock`)
 tools/run.sh       Build ESP (vvfat) and launch QEMU
 tools/genfont.py   Regenerate src/font.zig from a system font
@@ -71,5 +73,6 @@ third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 - M2 programs the PIT channel 0 to 100 Hz on IRQ0 and unmasks only that PIC line. Every interrupt saves all 15 general-purpose registers into a common frame; the IRQ0 dispatcher sends EOI and calls the round-robin scheduler, which returns the saved-register base of the next task. `tasks[0]` is the boot context, and the selftest creates workers with static 16 KiB stacks.
 - M3 adds software interrupts 48 and 49 for `sched.yield()` and `sched.exit()`. `tasks[1]` is a dedicated idle task that halts when no other task is ready, and finished slots are reused by later `create` calls. The normal kernel exits its boot task into the idle task after starting the timer. With 8 slots total (boot + idle + 6 user tasks), the task table is modified under `sync.IrqLock`.
 - M4 adds software interrupt 50 for `sched.sleep(ticks)`. A sleeping task enters the `blocked` state with a wake tick; the IRQ0 handler marks it ready once the deadline passes, and the idle task covers the case where every other task is asleep. `sync.IrqLock` saves RFLAGS, disables interrupts for a short critical section, and restores the previous interrupt state; it is not reentrant and is only correct on a single CPU.
-- M5 adds software interrupt 51 for `sched.block()` and `sched.wake(*Task)`. An indefinitely blocked task has no wake tick; another task must explicitly mark it ready. `sched.blockedCount()` exposes the number of blocked tasks, which the smoke test uses as a handshake before waking the worker. There is no wait-queue object or condition-variable layer yet.
-- Context switching does not save floating-point/SIMD state yet. M5 tasks must not rely on live XMM registers across a preemption; FPU context switching, wait queues and SMP-safe locks are planned for later milestones.
+- M5 adds software interrupt 51 for `sched.block()` and `sched.wake(*Task)`. An indefinitely blocked task has no wake tick; another task must explicitly mark it ready. `sched.blockedCount()` exposes the number of blocked tasks, which the smoke test uses as a handshake before waking the worker.
+- M6 adds `sched.WaitQueue`. Waiters are stored by task ID, so a reused slot cannot accidentally satisfy an old wakeup. `wakeOne` removes stale or already-ready entries and wakes the first task that is still blocked; `wakeAll` drains the queue. A condition-variable layer and timed waits are not implemented yet.
+- Context switching does not save floating-point/SIMD state yet. M6 tasks must not rely on live XMM registers across a preemption; FPU context switching, condition variables and SMP-safe locks are planned for later milestones.

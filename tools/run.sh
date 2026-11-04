@@ -79,6 +79,7 @@ if [ "$MODE" != "run" ]; then
     case $status in
       33)
         if grep -q "returned from int3" "$WORK/serial.log" &&
+           grep -q "M6 checks passed" "$WORK/serial.log" &&
            grep -q "M5 checks passed" "$WORK/serial.log" &&
            grep -q "M4 checks passed" "$WORK/serial.log" &&
            grep -q "M3 checks passed" "$WORK/serial.log" &&
@@ -91,7 +92,8 @@ if [ "$MODE" != "run" ]; then
            grep -q "scheduler checks passed" "$WORK/serial.log" &&
            grep -q "lifecycle checks passed" "$WORK/serial.log" &&
            grep -q "sleep checks passed" "$WORK/serial.log" &&
-           grep -q "block checks passed" "$WORK/serial.log"; then
+           grep -q "block checks passed" "$WORK/serial.log" &&
+           grep -q "waitq checks passed" "$WORK/serial.log"; then
           exit 0
         fi
         echo "run.sh: selftest exited successfully but the expected log is missing" >&2
