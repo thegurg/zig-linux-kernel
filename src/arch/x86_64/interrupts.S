@@ -112,6 +112,15 @@ isr_common:
     pushq %r14
     pushq %r15
 
+    /* Save the interrupted task's x87/SSE state before any Zig code can use
+     * SIMD registers. The scheduler updates current_fpu_state when it switches
+     * tasks; the matching restore happens immediately before iretq. */
+    movq current_fpu_state(%rip), %rax
+    testq %rax, %rax
+    jz 1f
+    fxsave64 (%rax)
+1:
+
     /* C ABI requires 16-byte stack alignment at the call site. r12 holds the
      * saved-register base, and the dispatcher preserves r12 as a callee-saved
      * register. The frame starts 15 registers (120 bytes) above it. */
@@ -122,8 +131,15 @@ isr_common:
     call isr_dispatch
 
     /* The dispatcher returns the saved-register base to resume. It is the
-     * same base for exceptions, or another task's context for a timer tick. */
+     * same base for exceptions, or another task's context for a timer tick.
+     * Restore the FPU state after the dispatcher has finished using SIMD, so
+     * the next task sees exactly the state saved on its last interrupt. */
     movq %rax, %r12
+    movq current_fpu_state(%rip), %rax
+    testq %rax, %rax
+    jz 2f
+    fxrstor64 (%rax)
+2:
     movq %r12, %rsp
     popq %r15
     popq %r14

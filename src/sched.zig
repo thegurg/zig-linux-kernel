@@ -9,8 +9,10 @@
 //! `waitQueueCurrent`; `int $53` calls `waitTimeoutCurrent`. All return the
 //! saved-register base that the assembly epilogue should resume.
 //!
-//! Every GPR is saved (see `interrupts.S`). FPU/SIMD state is not switched
-//! yet, so M8 tasks must not rely on live XMM registers across a preemption.
+//! Every GPR is saved (see `interrupts.S`). x87/SSE state is saved with
+//! `fxsave64` on interrupt entry and restored with `fxrstor64` just before
+//! `iretq`; `current_fpu_state` points at the active task's 512-byte area and
+//! `switchTask` updates it whenever the scheduler changes tasks.
 
 const gdt = @import("arch/x86_64/gdt.zig");
 const sync = @import("sync.zig");
@@ -26,6 +28,7 @@ pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
 pub const WakeReason = enum { none, signal, timeout };
+pub const FpuState = [512]u8;
 
 pub const Task = struct {
     name: []const u8,
@@ -34,6 +37,7 @@ pub const Task = struct {
     ticks: u64,
     wake_tick: u64,
     wake_reason: WakeReason,
+    fpu_state: FpuState align(16),
     id: u32,
     index: usize,
 };
@@ -272,6 +276,9 @@ var next_id: u32 = 0;
 var enabled = false;
 var initialized = false;
 
+var fpu_template: FpuState align(16) = @splat(0);
+pub export var current_fpu_state: u64 = 0;
+
 var idle_stack: [8 * 1024]u8 align(16) = undefined;
 var task_lock: sync.IrqLock = .{};
 
@@ -279,11 +286,34 @@ pub fn init() void {
     task_lock.acquire();
     defer task_lock.release();
 
-    tasks[0] = .{ .name = "boot", .rsp = 0, .state = .running, .ticks = 0, .wake_tick = 0, .wake_reason = .none, .id = 0, .index = 0 };
+    initFpuTemplate();
+
+    tasks[0] = .{
+        .name = "boot",
+        .rsp = 0,
+        .state = .running,
+        .ticks = 0,
+        .wake_tick = 0,
+        .wake_reason = .none,
+        .fpu_state = fpu_template,
+        .id = 0,
+        .index = 0,
+    };
     const idle_rsp = initialFrame(idle_stack[0..], idleEntry) orelse unreachable;
-    tasks[idle_index] = .{ .name = "idle", .rsp = idle_rsp, .state = .idle, .ticks = 0, .wake_tick = 0, .wake_reason = .none, .id = 1, .index = idle_index };
+    tasks[idle_index] = .{
+        .name = "idle",
+        .rsp = idle_rsp,
+        .state = .idle,
+        .ticks = 0,
+        .wake_tick = 0,
+        .wake_reason = .none,
+        .fpu_state = fpu_template,
+        .id = 1,
+        .index = idle_index,
+    };
     task_count = idle_index + 1;
     current = &tasks[0];
+    current_fpu_state = @intFromPtr(&tasks[0].fpu_state);
     tick_counter = 0;
     finished_counter = 0;
     blocked_counter = 0;
@@ -313,6 +343,7 @@ pub fn create(name: []const u8, entry: Entry, stack: []u8) ?*Task {
         .ticks = 0,
         .wake_tick = 0,
         .wake_reason = .none,
+        .fpu_state = fpu_template,
         .id = id,
         .index = index,
     };
@@ -335,9 +366,7 @@ pub fn tick(saved_rsp: u64) u64 {
 
     const next = nextOtherReady(current_task.index) orelse return saved_rsp;
     park(current_task);
-    next.state = .running;
-    current = next;
-    return next.rsp;
+    return switchTask(next);
 }
 
 pub fn yieldCurrent(saved_rsp: u64) u64 {
@@ -347,9 +376,7 @@ pub fn yieldCurrent(saved_rsp: u64) u64 {
 
     const next = nextOtherReady(current_task.index) orelse return saved_rsp;
     park(current_task);
-    next.state = .running;
-    current = next;
-    return next.rsp;
+    return switchTask(next);
 }
 
 pub fn exitCurrent(saved_rsp: u64) u64 {
@@ -361,16 +388,11 @@ pub fn exitCurrent(saved_rsp: u64) u64 {
     counter.* +%= 1;
 
     if (nextOtherReady(current_task.index)) |next| {
-        next.state = .running;
-        current = next;
-        return next.rsp;
+        return switchTask(next);
     }
 
     if (current_task.index == idle_index) haltForever();
-    const idle = &tasks[idle_index];
-    idle.state = .running;
-    current = idle;
-    return idle.rsp;
+    return switchTask(&tasks[idle_index]);
 }
 
 pub fn sleep(duration: u64) void {
@@ -403,14 +425,9 @@ pub fn sleepCurrent(saved_rsp: u64) u64 {
     blocked.* +%= 1;
 
     if (nextOtherReady(current_task.index)) |next| {
-        next.state = .running;
-        current = next;
-        return next.rsp;
+        return switchTask(next);
     }
-    const idle = &tasks[idle_index];
-    idle.state = .running;
-    current = idle;
-    return idle.rsp;
+    return switchTask(&tasks[idle_index]);
 }
 
 pub fn block() void {
@@ -434,14 +451,9 @@ pub fn blockCurrent(saved_rsp: u64) u64 {
     blocked.* +%= 1;
 
     if (nextOtherReady(current_task.index)) |next| {
-        next.state = .running;
-        current = next;
-        return next.rsp;
+        return switchTask(next);
     }
-    const idle = &tasks[idle_index];
-    idle.state = .running;
-    current = idle;
-    return idle.rsp;
+    return switchTask(&tasks[idle_index]);
 }
 
 pub fn waitQueueCurrent(saved_rsp: u64) u64 {
@@ -480,14 +492,9 @@ pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
     blocked.* +%= 1;
 
     if (nextOtherReady(current_task.index)) |next| {
-        next.state = .running;
-        current = next;
-        return next.rsp;
+        return switchTask(next);
     }
-    const idle = &tasks[idle_index];
-    idle.state = .running;
-    current = idle;
-    return idle.rsp;
+    return switchTask(&tasks[idle_index]);
 }
 
 pub fn wake(task: *Task) bool {
@@ -599,6 +606,89 @@ fn haltForever() noreturn {
     while (true) {
         asm volatile ("cli; hlt");
     }
+}
+
+fn switchTask(next: *Task) u64 {
+    next.state = .running;
+    current = next;
+    current_fpu_state = @intFromPtr(&next.fpu_state);
+    return next.rsp;
+}
+
+fn initFpuTemplate() void {
+    var saved: FpuState align(16) = undefined;
+    saveFpu(&saved);
+    asm volatile (
+        \\fninit
+        \\xorps %%xmm0, %%xmm0
+        \\xorps %%xmm1, %%xmm1
+        \\xorps %%xmm2, %%xmm2
+        \\xorps %%xmm3, %%xmm3
+        \\xorps %%xmm4, %%xmm4
+        \\xorps %%xmm5, %%xmm5
+        \\xorps %%xmm6, %%xmm6
+        \\xorps %%xmm7, %%xmm7
+        \\xorps %%xmm8, %%xmm8
+        \\xorps %%xmm9, %%xmm9
+        \\xorps %%xmm10, %%xmm10
+        \\xorps %%xmm11, %%xmm11
+        \\xorps %%xmm12, %%xmm12
+        \\xorps %%xmm13, %%xmm13
+        \\xorps %%xmm14, %%xmm14
+        \\xorps %%xmm15, %%xmm15
+        ::: .{
+            .xmm0 = true,
+            .xmm1 = true,
+            .xmm2 = true,
+            .xmm3 = true,
+            .xmm4 = true,
+            .xmm5 = true,
+            .xmm6 = true,
+            .xmm7 = true,
+            .xmm8 = true,
+            .xmm9 = true,
+            .xmm10 = true,
+            .xmm11 = true,
+            .xmm12 = true,
+            .xmm13 = true,
+            .xmm14 = true,
+            .xmm15 = true,
+            .memory = true,
+        });
+    saveFpu(&fpu_template);
+    restoreFpu(&saved);
+}
+
+fn saveFpu(state: *FpuState) void {
+    asm volatile ("fxsave64 (%[state])"
+        :
+        : [state] "r" (state),
+        : .{ .memory = true });
+}
+
+fn restoreFpu(state: *FpuState) void {
+    asm volatile ("fxrstor64 (%[state])"
+        :
+        : [state] "r" (state),
+        : .{
+          .xmm0 = true,
+          .xmm1 = true,
+          .xmm2 = true,
+          .xmm3 = true,
+          .xmm4 = true,
+          .xmm5 = true,
+          .xmm6 = true,
+          .xmm7 = true,
+          .xmm8 = true,
+          .xmm9 = true,
+          .xmm10 = true,
+          .xmm11 = true,
+          .xmm12 = true,
+          .xmm13 = true,
+          .xmm14 = true,
+          .xmm15 = true,
+          .memory = true,
+        });
 }
 
 fn initialFrame(stack: []u8, entry: Entry) ?u64 {

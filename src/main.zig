@@ -2,7 +2,7 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M8 then
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M9 then
 //! program the PIT, create tasks and may hand control to the scheduler.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.11.0-m8";
+pub const version = "0.12.0-m9";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -56,6 +56,22 @@ var condition_waiting: u64 = 0;
 var condition_waiter_done: u64 = 0;
 var condition_signaler_done: u64 = 0;
 var condition_signals: u64 = 0;
+
+const fpu_pattern_a = [16]u8{
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f, 0x1e,
+};
+const fpu_pattern_b = [16]u8{
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+    0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90,
+};
+var fpu_result_a: [16]u8 align(16) = @splat(0);
+var fpu_result_b: [16]u8 align(16) = @splat(0);
+var fpu_done: u64 = 0;
+var fpu_entered_a: u64 = 0;
+var fpu_entered_b: u64 = 0;
+var fpu_interleave_a: u64 = 0;
+var fpu_interleave_b: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -181,6 +197,47 @@ fn workerConditionSignaler() callconv(.c) void {
     condition_mutex.unlock();
 
     const done: *volatile u64 = &condition_signaler_done;
+    done.* +%= 1;
+    sched.exit();
+}
+
+fn fpuWorker(pattern: *const [16]u8, result: *[16]u8) void {
+    // The entire yield round trip stays inside one asm block so the compiler
+    // cannot reuse XMM0 between `int $48` and the verification store. If the
+    // scheduler fails to save/restore FPU state, this task reads the other
+    // worker's pattern back.
+    asm volatile (
+        \\movdqu (%[pattern]), %%xmm0
+        \\int $48
+        \\movdqu %%xmm0, (%[result])
+        :
+        : [pattern] "r" (pattern),
+          [result] "r" (result),
+        : .{ .xmm0 = true, .memory = true });
+}
+
+fn workerFpuA() callconv(.c) void {
+    const entered: *volatile u64 = &fpu_entered_a;
+    entered.* = 1;
+    fpuWorker(&fpu_pattern_a, &fpu_result_a);
+    if (@as(*const volatile u64, &fpu_entered_b).* != 0) {
+        const interleave: *volatile u64 = &fpu_interleave_a;
+        interleave.* = 1;
+    }
+    const done: *volatile u64 = &fpu_done;
+    done.* +%= 1;
+    sched.exit();
+}
+
+fn workerFpuB() callconv(.c) void {
+    const entered: *volatile u64 = &fpu_entered_b;
+    entered.* = 1;
+    fpuWorker(&fpu_pattern_b, &fpu_result_b);
+    if (@as(*const volatile u64, &fpu_entered_a).* != 0) {
+        const interleave: *volatile u64 = &fpu_interleave_b;
+        interleave.* = 1;
+    }
+    const done: *volatile u64 = &fpu_done;
     done.* +%= 1;
     sched.exit();
 }
@@ -341,12 +398,21 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: cond checks passed\n");
+        serial.write("selftest: M8 checks passed\n");
+
+        serial.write("selftest: checking FPU context switch\n");
+        if (!selftestFpu()) {
+            stopTimer();
+            serial.write("selftest: fpu checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: fpu checks passed\n");
 
         stopTimer();
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M8 checks passed, exiting QEMU\n");
+        serial.write("selftest: M9 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -864,6 +930,41 @@ fn selftestCondition() bool {
     });
 
     return ready == 0 and waiter_done == 1 and signaler_done == 1 and signals == 1 and finished >= base + 2;
+}
+
+fn selftestFpu() bool {
+    fpu_done = 0;
+    fpu_entered_a = 0;
+    fpu_entered_b = 0;
+    fpu_interleave_a = 0;
+    fpu_interleave_b = 0;
+    fpu_result_a = @splat(0);
+    fpu_result_b = @splat(0);
+
+    if (sched.create("worker-fpu-a", workerFpuA, task_a_stack[0..]) == null) return false;
+    if (sched.create("worker-fpu-b", workerFpuB, task_b_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const base = sched.finishedCount();
+    const start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - start < timer_test_ticks and sched.finishedCount() < base + 2) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const elapsed = sched.ticks() - start;
+    const done = @as(*const volatile u64, &fpu_done).*;
+    const finished = sched.finishedCount();
+    const a_ok = std.mem.eql(u8, &fpu_result_a, &fpu_pattern_a);
+    const b_ok = std.mem.eql(u8, &fpu_result_b, &fpu_pattern_b);
+    const interleaved = @as(*const volatile u64, &fpu_interleave_a).* == 1 and
+        @as(*const volatile u64, &fpu_interleave_b).* == 1;
+    console.print("fpu: done={d}, a_ok={d}, b_ok={d}, interleaved={d}, finished={d}, elapsed={d} ticks\n", .{
+        done, @intFromBool(a_ok), @intFromBool(b_ok), @intFromBool(interleaved), finished, elapsed,
+    });
+
+    return done == 2 and a_ok and b_ok and interleaved and finished >= base + 2;
 }
 
 fn stopTimer() void {
