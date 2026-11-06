@@ -73,6 +73,7 @@ ISR_NOERR 49   /* scheduler exit */
 ISR_NOERR 50   /* scheduler sleep */
 ISR_NOERR 51   /* scheduler block */
 ISR_NOERR 52   /* scheduler wait queue */
+ISR_NOERR 53   /* scheduler timed wait */
 
 IRQ_NOERR 32   /* IRQ0: PIT */
 IRQ_NOERR 33
@@ -159,6 +160,6 @@ irq_stub_table:
 
 .globl sched_stub_table
 sched_stub_table:
-    .quad isr_48, isr_49, isr_50, isr_51, isr_52
+    .quad isr_48, isr_49, isr_50, isr_51, isr_52, isr_53
 
 .section .note.GNU-stack,"",@progbits

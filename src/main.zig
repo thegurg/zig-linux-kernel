@@ -2,7 +2,7 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M6 then
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M7 then
 //! program the PIT, create tasks and may hand control to the scheduler.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.9.0-m6";
+pub const version = "0.10.0-m7";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -38,7 +38,10 @@ var task_c_runs: u64 = 0;
 var task_d_runs: u64 = 0;
 var task_e_runs: u64 = 0;
 var task_f_runs: u64 = 0;
+var task_g_runs: u64 = 0;
 var wait_queue: sched.WaitQueue = .{};
+var timed_wait_ticks: u64 = 0;
+var timed_wait_signaled: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -94,6 +97,15 @@ fn workerWait() callconv(.c) void {
     const counter: *volatile u64 = &task_f_runs;
     counter.* +%= 1;
     wait_queue.wait();
+    counter.* +%= 1;
+    sched.exit();
+}
+
+fn workerTimedWait() callconv(.c) void {
+    const signaled = wait_queue.waitTimeout(timed_wait_ticks);
+    const result: *volatile u64 = &timed_wait_signaled;
+    result.* = if (signaled) 1 else 0;
+    const counter: *volatile u64 = &task_g_runs;
     counter.* +%= 1;
     sched.exit();
 }
@@ -227,13 +239,22 @@ export fn kmain() callconv(.c) noreturn {
             serial.write("selftest: wait queue checks failed\n");
             qemu.exit(qemu.EXIT_FAILURE);
         }
-        stopTimer();
         serial.write("selftest: waitq checks passed\n");
+        serial.write("selftest: M6 checks passed\n");
+
+        serial.write("selftest: checking timed wait\n");
+        if (!selftestTimedWait()) {
+            stopTimer();
+            serial.write("selftest: timed wait checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        stopTimer();
+        serial.write("selftest: timed checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M6 checks passed, exiting QEMU\n");
+        serial.write("selftest: M7 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -603,6 +624,74 @@ fn selftestWaitQueue() bool {
     console.print("waitq: worker-wait={d}, finished={d}, elapsed={d} ticks\n", .{ f, finished, elapsed });
 
     return f == 2 and finished >= 6;
+}
+
+fn selftestTimedWait() bool {
+    // Timeout path: nobody signals the queue, so the worker must be woken by
+    // its deadline and report a timeout to the boot task.
+    task_g_runs = 0;
+    timed_wait_signaled = 0;
+    const timeout_ticks: u64 = 3;
+    timed_wait_ticks = timeout_ticks;
+
+    if (sched.create("worker-timed", workerTimedWait, task_c_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const timeout_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - timeout_start < timer_test_ticks and sched.finishedCount() < 7) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const timeout_elapsed = sched.ticks() - timeout_start;
+    const timeout_runs = @as(*const volatile u64, &task_g_runs).*;
+    const timeout_signaled = @as(*const volatile u64, &timed_wait_signaled).*;
+    const after_timeout = sched.finishedCount();
+    if (timeout_runs != 1 or timeout_signaled != 0 or after_timeout < 7 or timeout_elapsed < timeout_ticks) {
+        console.print("timed: timeout path failed: runs={d}, signaled={d}, finished={d}, elapsed={d}\n", .{
+            timeout_runs, timeout_signaled, after_timeout, timeout_elapsed,
+        });
+        return false;
+    }
+
+    // Signal path: the boot task wakes the waiter well before its deadline,
+    // and the worker must report a normal signal rather than a timeout.
+    task_g_runs = 0;
+    timed_wait_signaled = 0;
+    timed_wait_ticks = timer_test_ticks;
+
+    if (sched.create("worker-timed", workerTimedWait, task_c_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const signal_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - signal_start < timer_test_ticks and sched.blockedCount() == 0) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    if (sched.blockedCount() == 0 or !wait_queue.wakeOne()) {
+        console.write("timed: signal path failed to block/wake\n");
+        return false;
+    }
+
+    const wake_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - wake_start < timer_test_ticks and sched.finishedCount() < 8) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const signal_elapsed = sched.ticks() - signal_start;
+    const signal_runs = @as(*const volatile u64, &task_g_runs).*;
+    const signal_signaled = @as(*const volatile u64, &timed_wait_signaled).*;
+    const finished = sched.finishedCount();
+    console.print("timed: timeout={d} ticks, signaled={d}, finished={d}, elapsed={d} ticks\n", .{
+        timeout_elapsed, signal_signaled, finished, signal_elapsed,
+    });
+
+    return signal_runs == 1 and signal_signaled == 1 and finished >= 8;
 }
 
 fn stopTimer() void {
