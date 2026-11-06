@@ -13,7 +13,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M5 complete:** explicit indefinite blocking (`sched.block`) and wakeup (`sched.wake`) with a blocked-task counter.
 - **M6 complete:** `sched.WaitQueue` with `wait`, `wakeOne` and `wakeAll`, plus pruning of stale waiter entries.
 - **M7 complete:** timed wait queues (`WaitQueue.waitTimeout`) that distinguish an explicit signal from a deadline timeout.
-- **Next:** M8 - condition variables, blocking mutexes and richer event synchronization.
+- **M8 complete:** blocking `sched.Mutex` with ownership transfer, plus `sched.Condition` with `wait`, `signal` and `broadcast`.
+- **Next:** M9 - SMP-safe synchronization and FPU/SIMD context switching.
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -39,8 +40,9 @@ Build options:
   finished-slot reuse, creates a sleeping task and checks that it wakes after
   its deadline, blocks a worker until the boot task wakes it explicitly, puts
   another worker on a wait queue and wakes it with `wakeOne`, verifies both the
-  timeout and signaled paths of `WaitQueue.waitTimeout`, triggers `int3` and
-  must return from the handler (QEMU status 33);
+  timeout and signaled paths of `WaitQueue.waitTimeout`, checks mutex exclusion
+  across a yield and a condition-variable wait/signal handshake, triggers
+  `int3` and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35).
 
@@ -54,11 +56,11 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M2-M7 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M2-M8 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch
   memory/heap.zig  lazily mapped first-fit kernel heap + std.mem.Allocator
-  sched.zig        scheduler, sleep/block/wake, timed wait queues, idle task
+  sched.zig        scheduler, wait queues, mutex/condition, idle task
   sync.zig         interrupt-safe critical-section lock (`IrqLock`)
 tools/run.sh       Build ESP (vvfat) and launch QEMU
 tools/genfont.py   Regenerate src/font.zig from a system font
@@ -77,5 +79,6 @@ third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 - M4 adds software interrupt 50 for `sched.sleep(ticks)`. A sleeping task enters the `blocked` state with a wake tick; the IRQ0 handler marks it ready once the deadline passes, and the idle task covers the case where every other task is asleep. `sync.IrqLock` saves RFLAGS, disables interrupts for a short critical section, and restores the previous interrupt state; it is not reentrant and is only correct on a single CPU.
 - M5 adds software interrupt 51 for `sched.block()` and `sched.wake(*Task)`. An indefinitely blocked task has no wake tick; another task must explicitly mark it ready. `sched.blockedCount()` exposes the number of blocked tasks, which the smoke test uses as a handshake before waking the worker.
 - M6 adds `sched.WaitQueue`. Waiters are stored by task ID, so a reused slot cannot accidentally satisfy an old wakeup. `wakeOne` removes stale or already-ready entries and wakes the first task that is still blocked; `wakeAll` drains the queue.
-- M7 adds software interrupt 53 for `WaitQueue.waitTimeout(ticks)`. A timed waiter is queued exactly like a normal waiter but carries a deadline; the timer tick or an explicit wake records why the task became ready, and `waitTimeout` returns `true` only for an explicit signal. Timed-out IDs stay in the queue until the next `wakeOne` or `compactLocked` pass prunes them. There is no condition-variable or blocking-mutex layer yet.
-- Context switching does not save floating-point/SIMD state yet. M7 tasks must not rely on live XMM registers across a preemption; FPU context switching, condition variables, blocking mutexes and SMP-safe locks are planned for later milestones.
+- M7 adds software interrupt 53 for `WaitQueue.waitTimeout(ticks)`. A timed waiter is queued exactly like a normal waiter but carries a deadline; the timer tick or an explicit wake records why the task became ready, and `waitTimeout` returns `true` only for an explicit signal. Timed-out IDs stay in the queue until the next `wakeOne` or `compactLocked` pass prunes them.
+- M8 adds `sched.Mutex` and `sched.Condition`. Mutex contention blocks on the same task queue used by other waits; `unlock` transfers ownership directly to the next waiter, so a resumed `lock` call already owns the mutex. `Condition.wait` atomically enqueues the waiter and releases the associated mutex, `signal`/`broadcast` wake one or all waiters, and the waiter reacquires the mutex before returning. Signalling without holding the predicate's mutex can still lose a wakeup; callers must follow the usual condition-variable discipline. Neither primitive is reentrant, and both rely on single-CPU interrupt disabling.
+- Context switching does not save floating-point/SIMD state yet. M8 tasks must not rely on live XMM registers across a preemption; FPU context switching and SMP-safe synchronization are planned for later milestones.

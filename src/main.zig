@@ -2,7 +2,7 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M7 then
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M8 then
 //! program the PIT, create tasks and may hand control to the scheduler.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.10.0-m7";
+pub const version = "0.11.0-m8";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -42,6 +42,20 @@ var task_g_runs: u64 = 0;
 var wait_queue: sched.WaitQueue = .{};
 var timed_wait_ticks: u64 = 0;
 var timed_wait_signaled: u64 = 0;
+
+var mutex: sched.Mutex = .{};
+var mutex_value: u64 = 0;
+var mutex_inside: u64 = 0;
+var mutex_overlap: u64 = 0;
+var mutex_done: u64 = 0;
+
+var condition: sched.Condition = .{};
+var condition_mutex: sched.Mutex = .{};
+var condition_ready: u64 = 0;
+var condition_waiting: u64 = 0;
+var condition_waiter_done: u64 = 0;
+var condition_signaler_done: u64 = 0;
+var condition_signals: u64 = 0;
 
 pub const panic = std.debug.FullPanic(kernelPanic);
 
@@ -107,6 +121,67 @@ fn workerTimedWait() callconv(.c) void {
     result.* = if (signaled) 1 else 0;
     const counter: *volatile u64 = &task_g_runs;
     counter.* +%= 1;
+    sched.exit();
+}
+
+fn workerMutex() callconv(.c) void {
+    mutex.lock();
+
+    const inside: *volatile u64 = &mutex_inside;
+    inside.* +%= 1;
+    if (inside.* != 1) {
+        const overlap: *volatile u64 = &mutex_overlap;
+        overlap.* +%= 1;
+    }
+
+    const value: *volatile u64 = &mutex_value;
+    const before = value.*;
+    sched.yield();
+    value.* = before +% 1;
+    inside.* -%= 1;
+    mutex.unlock();
+
+    const done: *volatile u64 = &mutex_done;
+    done.* +%= 1;
+    sched.exit();
+}
+
+fn workerConditionWaiter() callconv(.c) void {
+    condition_mutex.lock();
+
+    while (true) {
+        const ready: *volatile u64 = &condition_ready;
+        if (ready.* != 0) break;
+
+        const waiting: *volatile u64 = &condition_waiting;
+        waiting.* = 1;
+        condition.wait(&condition_mutex);
+    }
+
+    const waiting: *volatile u64 = &condition_waiting;
+    waiting.* = 0;
+    const ready: *volatile u64 = &condition_ready;
+    ready.* = 0;
+    condition_mutex.unlock();
+
+    const done: *volatile u64 = &condition_waiter_done;
+    done.* +%= 1;
+    sched.exit();
+}
+
+fn workerConditionSignaler() callconv(.c) void {
+    condition_mutex.lock();
+
+    const ready: *volatile u64 = &condition_ready;
+    ready.* = 1;
+    if (condition.signal()) {
+        const signals: *volatile u64 = &condition_signals;
+        signals.* +%= 1;
+    }
+    condition_mutex.unlock();
+
+    const done: *volatile u64 = &condition_signaler_done;
+    done.* +%= 1;
     sched.exit();
 }
 
@@ -248,13 +323,30 @@ export fn kmain() callconv(.c) noreturn {
             serial.write("selftest: timed wait checks failed\n");
             qemu.exit(qemu.EXIT_FAILURE);
         }
-        stopTimer();
         serial.write("selftest: timed checks passed\n");
+        serial.write("selftest: M7 checks passed\n");
 
+        serial.write("selftest: checking mutex\n");
+        if (!selftestMutex()) {
+            stopTimer();
+            serial.write("selftest: mutex checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: mutex checks passed\n");
+
+        serial.write("selftest: checking condition variable\n");
+        if (!selftestCondition()) {
+            stopTimer();
+            serial.write("selftest: condition checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: cond checks passed\n");
+
+        stopTimer();
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M7 checks passed, exiting QEMU\n");
+        serial.write("selftest: M8 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -692,6 +784,86 @@ fn selftestTimedWait() bool {
     });
 
     return signal_runs == 1 and signal_signaled == 1 and finished >= 8;
+}
+
+fn selftestMutex() bool {
+    mutex_value = 0;
+    mutex_inside = 0;
+    mutex_overlap = 0;
+    mutex_done = 0;
+
+    if (sched.create("worker-mutex-a", workerMutex, task_a_stack[0..]) == null) return false;
+    if (sched.create("worker-mutex-b", workerMutex, task_b_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const base = sched.finishedCount();
+    const start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - start < timer_test_ticks and sched.finishedCount() < base + 2) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const elapsed = sched.ticks() - start;
+    const value = @as(*const volatile u64, &mutex_value).*;
+    const done = @as(*const volatile u64, &mutex_done).*;
+    const overlap = @as(*const volatile u64, &mutex_overlap).*;
+    const finished = sched.finishedCount();
+    console.print("mutex: value={d}, done={d}, overlap={d}, finished={d}, elapsed={d} ticks\n", .{
+        value, done, overlap, finished, elapsed,
+    });
+
+    return value == 2 and done == 2 and overlap == 0 and finished >= base + 2;
+}
+
+fn selftestCondition() bool {
+    condition_ready = 0;
+    condition_waiting = 0;
+    condition_waiter_done = 0;
+    condition_signaler_done = 0;
+    condition_signals = 0;
+
+    if (sched.create("worker-cond-wait", workerConditionWaiter, task_a_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const wait_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - wait_start < timer_test_ticks and
+        @as(*const volatile u64, &condition_waiting).* == 0)
+    {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    if (@as(*const volatile u64, &condition_waiting).* == 0) {
+        console.write("cond: timed out waiting for waiter\n");
+        return false;
+    }
+
+    // The waiter holds `condition_mutex` across the predicate check and
+    // `wait`, so this signaller cannot run ahead of the enqueue.
+    if (sched.create("worker-cond-signal", workerConditionSignaler, task_b_stack[0..]) == null) return false;
+    if (sched.stats().tasks != 4) return false;
+
+    const base = sched.finishedCount();
+    const signal_start = sched.ticks();
+    asm volatile ("sti");
+    while (sched.ticks() - signal_start < timer_test_ticks and sched.finishedCount() < base + 2) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    const elapsed = sched.ticks() - signal_start;
+    const ready = @as(*const volatile u64, &condition_ready).*;
+    const waiter_done = @as(*const volatile u64, &condition_waiter_done).*;
+    const signaler_done = @as(*const volatile u64, &condition_signaler_done).*;
+    const signals = @as(*const volatile u64, &condition_signals).*;
+    const finished = sched.finishedCount();
+    console.print("cond: ready={d}, waiter={d}, signaler={d}, signals={d}, finished={d}, elapsed={d} ticks\n", .{
+        ready, waiter_done, signaler_done, signals, finished, elapsed,
+    });
+
+    return ready == 0 and waiter_done == 1 and signaler_done == 1 and signals == 1 and finished >= base + 2;
 }
 
 fn stopTimer() void {

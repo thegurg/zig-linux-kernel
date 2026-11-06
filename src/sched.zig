@@ -1,6 +1,6 @@
 //! Round-robin kernel task scheduler: preemption, cooperative yield/exit,
-//! timer-based sleep, explicit block/wake, wait queues, an idle task, and slot
-//! reuse.
+//! timer-based sleep, explicit block/wake, wait queues, mutexes, condition
+//! variables, an idle task, and slot reuse.
 //!
 //! `tasks[0]` is the boot context and `tasks[1]` is the idle task. User tasks
 //! use caller-owned kernel stacks. IRQ0 calls `tick`; `int $48` calls
@@ -10,7 +10,7 @@
 //! saved-register base that the assembly epilogue should resume.
 //!
 //! Every GPR is saved (see `interrupts.S`). FPU/SIMD state is not switched
-//! yet, so M7 tasks must not rely on live XMM registers across a preemption.
+//! yet, so M8 tasks must not rely on live XMM registers across a preemption.
 
 const gdt = @import("arch/x86_64/gdt.zig");
 const sync = @import("sync.zig");
@@ -71,21 +71,37 @@ pub const WaitQueue = struct {
     pub fn wakeOne(self: *WaitQueue) bool {
         task_lock.acquire();
         defer task_lock.release();
-
-        while (self.count > 0) {
-            const id = self.waiters[0];
-            self.removeAt(0);
-            if (findTaskById(id)) |task| {
-                if (wakeLocked(task, .signal)) return true;
-            }
-        }
-        return false;
+        return self.wakeOneTaskLocked() != null;
     }
 
     pub fn wakeAll(self: *WaitQueue) usize {
         task_lock.acquire();
         defer task_lock.release();
+        return self.wakeAllLocked();
+    }
 
+    // These helpers require interrupts to be disabled on the single CPU.
+    fn enqueueCurrentLocked(self: *WaitQueue) bool {
+        const current_task = current orelse return false;
+        self.compactLocked();
+        if (self.count >= self.waiters.len) return false;
+        self.waiters[self.count] = current_task.id;
+        self.count += 1;
+        return true;
+    }
+
+    fn wakeOneTaskLocked(self: *WaitQueue) ?*Task {
+        while (self.count > 0) {
+            const id = self.waiters[0];
+            self.removeAt(0);
+            if (findTaskById(id)) |task| {
+                if (wakeLocked(task, .signal)) return task;
+            }
+        }
+        return null;
+    }
+
+    fn wakeAllLocked(self: *WaitQueue) usize {
         var woken: usize = 0;
         for (self.waiters[0..self.count]) |id| {
             if (findTaskById(id)) |task| {
@@ -115,6 +131,113 @@ pub const WaitQueue = struct {
             self.waiters[cursor] = self.waiters[cursor + 1];
         }
         self.count -= 1;
+    }
+};
+
+/// Single-CPU blocking mutex. Ownership is transferred directly to a waiter on
+/// unlock, and the waiter resumes from `lock` already owning the mutex. It is
+/// not reentrant and cannot be used by the idle task.
+pub const Mutex = struct {
+    locked: bool = false,
+    owner: ?*Task = null,
+    waiters: WaitQueue = .{},
+
+    pub fn lock(self: *Mutex) void {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+
+        const current_task = current orelse {
+            self.locked = true;
+            sync.irqRestore(flags);
+            return;
+        };
+
+        if (!self.locked) {
+            self.locked = true;
+            self.owner = current_task;
+            sync.irqRestore(flags);
+            return;
+        }
+
+        // The idle task cannot block; it never contends for mutexes.
+        if (current_task.index == idle_index) {
+            sync.irqRestore(flags);
+            return;
+        }
+
+        if (!self.waiters.enqueueCurrentLocked()) {
+            sync.irqRestore(flags);
+            return;
+        }
+        asm volatile ("int $51" ::: .{ .memory = true });
+        // `unlockLocked` transferred ownership before waking this task.
+        sync.irqRestore(flags);
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+        self.unlockLocked();
+        sync.irqRestore(flags);
+    }
+
+    fn unlockLocked(self: *Mutex) void {
+        if (self.waiters.wakeOneTaskLocked()) |task| {
+            self.locked = true;
+            self.owner = task;
+        } else {
+            self.locked = false;
+            self.owner = null;
+        }
+    }
+};
+
+/// Condition variable used with `Mutex`. Predicates must be changed and
+/// signalled while the associated mutex is held so that a waiter cannot lose a
+/// wakeup between its predicate check and `wait`.
+pub const Condition = struct {
+    waiters: WaitQueue = .{},
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+
+        const current_task = current orelse {
+            sync.irqRestore(flags);
+            return;
+        };
+        if (current_task.index == idle_index) {
+            sync.irqRestore(flags);
+            return;
+        }
+        if (!self.waiters.enqueueCurrentLocked()) {
+            sync.irqRestore(flags);
+            return;
+        }
+
+        // Enqueueing and releasing the mutex are atomic with respect to a
+        // signaller, which must hold the same mutex while changing the
+        // predicate.
+        mutex.unlockLocked();
+        asm volatile ("int $51" ::: .{ .memory = true });
+        sync.irqRestore(flags);
+        mutex.lock();
+    }
+
+    pub fn signal(self: *Condition) bool {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+        const woke = self.waiters.wakeOneTaskLocked() != null;
+        sync.irqRestore(flags);
+        return woke;
+    }
+
+    pub fn broadcast(self: *Condition) usize {
+        const flags = sync.irqSave();
+        asm volatile ("cli");
+        const woken = self.waiters.wakeAllLocked();
+        sync.irqRestore(flags);
+        return woken;
     }
 };
 
