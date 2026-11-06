@@ -88,6 +88,12 @@ pub fn init() void {
     std.mem.writeInt(u16, idtr[0..2], @sizeOf(@TypeOf(idt)) - 1, .little);
     std.mem.writeInt(u64, idtr[2..10], @intFromPtr(&idt), .little);
 
+    load();
+}
+
+/// Load the shared IDT on the current CPU. The table itself is filled once by
+/// the bootstrap processor; application processors only need `lidt`.
+pub fn load() void {
     asm volatile ("lidt (%[idtr])"
         :
         : [idtr] "r" (&idtr),

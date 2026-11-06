@@ -66,6 +66,27 @@ pub const PagingModeResponse = extern struct {
     mode: u64,
 };
 
+/// x86-64 entry from Limine's MP (multiprocessor) protocol. `reserved` and
+/// `goto_address` are managed by the bootloader until we publish an entry;
+/// `extra_argument` is free for the kernel.
+pub const MpInfo = extern struct {
+    processor_id: u32,
+    lapic_id: u32,
+    reserved: u64,
+    goto_address: u64,
+    extra_argument: u64,
+};
+
+pub const MpResponse = extern struct {
+    revision: u64,
+    flags: u32,
+    bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: [*]?*MpInfo,
+};
+
+pub const mp_x2apic: u32 = 1 << 0;
+
 pub const MemmapEntryType = enum(u64) {
     usable = 0,
     reserved = 1,
@@ -124,6 +145,13 @@ const MemmapRequest = extern struct {
     response: ?*MemmapResponse,
 };
 
+const MpRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*MpResponse,
+    flags: u64,
+};
+
 // Markers delimiting the request section.
 export const requests_start_marker: [4]u64 linksection(".limine_requests_start") = .{
     0xf6b8f4b39de7d1ae, 0xfab91a6940fcb9cf, 0x785c6ed015d3e316, 0x181e920a7852b9d9,
@@ -162,6 +190,15 @@ export var executable_address_request: ExecutableAddressRequest linksection(".li
     .response = null,
 };
 
+/// Ask Limine to bootstrap secondary CPUs and park them until we publish a
+/// per-CPU `goto_address`.
+export var mp_request: MpRequest linksection(".limine_requests") = .{
+    .id = .{ common_magic_0, common_magic_1, 0x95a67b819a1b857e, 0xa0b61b723b6a73e0 },
+    .revision = 0,
+    .response = null,
+    .flags = 0,
+};
+
 /// Force 4-level paging: M1c builds 4-level tables and assumes CR4.LA57 = 0.
 export var paging_mode_request: PagingModeRequest linksection(".limine_requests") = .{
     .id = .{ common_magic_0, common_magic_1, 0x95c1a0edab0944cb, 0xa4e5cb3842f7488a },
@@ -197,6 +234,10 @@ pub fn executableAddress() ?*ExecutableAddressResponse {
 
 pub fn pagingMode() ?*PagingModeResponse {
     return paging_mode_request.response;
+}
+
+pub fn mp() ?*MpResponse {
+    return mp_request.response;
 }
 
 test "base revision marker layout" {

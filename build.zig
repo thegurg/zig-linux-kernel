@@ -21,7 +21,8 @@ pub fn build(b: *std.Build) void {
     // Smoke-test image: exercises the PMM, page tables, heap, PIT/IRQ0,
     // preemptive/cooperative scheduler, task lifecycle, blocking sleep,
     // explicit block/wake, wait queues, timed waits, mutexes, condition
-    // variables, FPU/SIMD context switching and exception path, then reports success to QEMU's
+    // variables, FPU/SIMD context switching, SMP bring-up/spinlocks and
+    // exception path, then reports success to QEMU's
     // isa-debug-exit so CI (and `zig build test`) can assert the exit code.
     const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false);
     const smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
@@ -85,6 +86,7 @@ fn makeKernel(
         },
     });
     mod.addAssemblyFile(b.path("src/arch/x86_64/interrupts.S"));
+    mod.addAssemblyFile(b.path("src/arch/x86_64/smp_entry.S"));
 
     const exe = b.addExecutable(.{ .name = name, .root_module = mod });
     exe.entry = .{ .symbol_name = "_start" };

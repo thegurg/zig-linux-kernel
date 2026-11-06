@@ -13,6 +13,10 @@
 //! `fxsave64` on interrupt entry and restored with `fxrstor64` just before
 //! `iretq`; `current_fpu_state` points at the active task's 512-byte area and
 //! `switchTask` updates it whenever the scheduler changes tasks.
+//!
+//! The scheduler still runs only on the bootstrap processor. Its task lock is
+//! an IRQ-safe atomic spinlock, but per-CPU run queues and cross-CPU wakeups
+//! are not implemented yet.
 
 const gdt = @import("arch/x86_64/gdt.zig");
 const sync = @import("sync.zig");
@@ -280,7 +284,7 @@ var fpu_template: FpuState align(16) = @splat(0);
 pub export var current_fpu_state: u64 = 0;
 
 var idle_stack: [8 * 1024]u8 align(16) = undefined;
-var task_lock: sync.IrqLock = .{};
+var task_lock: sync.IrqSpinLock = .{};
 
 pub fn init() void {
     task_lock.acquire();

@@ -2,8 +2,9 @@
 //!
 //! Limine jumps to `_start` with the Limine stack and interrupts disabled.
 //! `_start` switches to our own kernel stack and calls `kmain`, which brings up
-//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M9 then
-//! program the PIT, create tasks and may hand control to the scheduler.
+//! the GDT/TSS, IDT and PIC before doing anything that may fault. M2-M10 then
+//! program the PIT, bring up application processors and may hand control to
+//! the scheduler.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -20,9 +21,10 @@ const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
 const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
+const smp = @import("smp.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.12.0-m9";
+pub const version = "0.13.0-m10";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -293,6 +295,24 @@ export fn kmain() callconv(.c) noreturn {
     console.init();
     banner();
     reportBootInfo();
+
+    smp.init() catch |err| {
+        console.print("smp: initialization failed: {s}\n", .{@errorName(err)});
+    };
+    if (smp.getStats().cpus != 0) {
+        const smp_stats = smp.getStats();
+        console.print("smp: cpus={d}, aps={d}, bsp_lapic_id={d}, x2apic={d}\n", .{
+            smp_stats.cpus, smp_stats.aps, smp_stats.bsp_lapic_id, @intFromBool(smp_stats.x2apic),
+        });
+        if (!build_options.exit_after_boot and smp_stats.aps != 0) {
+            if (smp.start(false) and smp.waitOnline()) {
+                console.print("smp: {d} APs online, parked\n", .{smp.onlineCount()});
+            } else {
+                console.write("smp: failed to bring APs online\n");
+            }
+        }
+    }
+
     console.write("\nM1c complete. Paging and kernel heap are live.\n");
 
     if (build_options.test_page_fault) {
@@ -407,12 +427,20 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: fpu checks passed\n");
+        serial.write("selftest: M9 checks passed\n");
 
         stopTimer();
+        serial.write("selftest: checking SMP\n");
+        if (!selftestSmp()) {
+            serial.write("selftest: smp checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: smp checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M9 checks passed, exiting QEMU\n");
+        serial.write("selftest: M10 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -965,6 +993,24 @@ fn selftestFpu() bool {
     });
 
     return done == 2 and a_ok and b_ok and interleaved and finished >= base + 2;
+}
+
+fn selftestSmp() bool {
+    const result = smp.runTest() orelse {
+        const stats = smp.getStats();
+        console.print("smp: did not complete: cpus={d}, aps={d}, online={d}\n", .{
+            stats.cpus, stats.aps, smp.onlineCount(),
+        });
+        return false;
+    };
+
+    console.print("smp: cpus={d}, aps={d}, online={d}, counter={d}, expected={d}, overlap={d}\n", .{
+        result.cpus, result.aps, result.online, result.counter, result.expected, result.overlap,
+    });
+
+    return result.online == result.aps and
+        result.counter == result.expected and
+        result.overlap == 0;
 }
 
 fn stopTimer() void {
