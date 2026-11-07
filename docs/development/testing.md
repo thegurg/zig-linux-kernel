@@ -40,7 +40,7 @@ into `zig build test`.
 
 ## QEMU selftest
 
-The selftest image is built with `exit_after_boot = true`. After boot and SMF
+The selftest image is built with `exit_after_boot = true`. After boot and SMP
 initialization, `kmain` runs the checks in this order.
 
 | Check | Log marker(s) | Behavior |

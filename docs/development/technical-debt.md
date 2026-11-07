@@ -52,8 +52,8 @@ migration, and no way to run a task on a specific CPU.
 ### 4. Cross-CPU wakeups are impossible without LAPIC/IPI support
 
 **Status: DEFERRED.** There is no local APIC, IOAPIC, APIC timer, or IPI
-programming. The kernel uses only the legacy PIC and PIT, and APs run with
-interrupts disabled. Waking a task on another CPU would require an IPI
+programming. The kernel uses only the legacy PIC and PIT, and APs never enter
+the scheduler. Waking a task on another CPU would require an IPI
 mechanism that does not exist.
 
 ### 5. AP exception and NMI handling uses BSP/global state
@@ -65,8 +65,8 @@ mechanism that does not exist.
 `isr_common` saves FPU state through the global `current_fpu_state`, which
 points at the BSP's current task. `isr_dispatch` uses the global scheduler and
 console without locks. An exception or NMI on an AP would therefore use the
-wrong FPU area and unsynchronized global state. APs currently run with
-interrupts disabled and do not exercise this path.
+wrong FPU area and unsynchronized global state. APs currently do not enter the
+scheduler or exercise this path.
 
 ### 6. No TLB shootdown
 

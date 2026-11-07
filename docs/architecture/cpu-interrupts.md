@@ -159,8 +159,8 @@ this order:
 The dispatcher uses the global console and global scheduler state. It does not
 take a lock and has no per-CPU dispatch state. On an AP, an exception or NMI
 would therefore use the BSP's `current_fpu_state` and global scheduler/console
-variables. This is a known SMP safety gap; APs currently run with interrupts
-disabled and do not enter the scheduler.
+variables. This is a known SMP safety gap; APs currently do not enter the
+scheduler or take timer interrupts.
 
 ## PIC and PIT
 
@@ -179,7 +179,7 @@ or other interrupt-routing support yet.
 ### 8253/8254 PIT
 
 [`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig) programs PIT channel
-0 as a rate generator (`mode 3`, lobyte/hibyte, binary) with
+0 as a square-wave generator (`mode 3`, lobyte/hibyte, binary) with
 `base_frequency = 1_193_182` and a divisor clamped to `1..0xffff`. The kernel
 uses 100 Hz. The PIT line remains masked until the caller explicitly unmasks
 IRQ0.

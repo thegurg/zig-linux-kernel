@@ -79,7 +79,7 @@ The defect is currently latent because:
 
 - the scheduler's `task_lock` is the main `IrqSpinLock` user;
 - the scheduler runs only on the BSP;
-- APs never take scheduler locks and run with interrupts disabled.
+- APs never take scheduler locks and do not enter the scheduler.
 
 It must be fixed before M11 allows APs to take scheduler or wait-queue locks.
 The intended fix is an acquisition-local guard (save `RFLAGS` in a local or

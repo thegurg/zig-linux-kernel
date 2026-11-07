@@ -147,7 +147,8 @@ If `ap_main` returns, the stub halts in a `cli; hlt` loop.
   flushes global entries during `vmm.init()` before APs are released, so the
   shared mappings are already valid, but this is not a general TLB-shootdown
   mechanism.
-- APs run with interrupts disabled and never install a timer or take IRQs.
+- APs do not install a timer or enter the scheduler; the park loop executes
+  `cli; hlt`. IRQ0 remains a BSP-only path in the current design.
 
 These are tracked in [technical debt](../development/technical-debt.md).
 

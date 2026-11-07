@@ -88,9 +88,9 @@ original state. New tasks and the idle task inherit this clean template.
 5. assigns a fresh ID, writes the task entry, and marks it `ready`.
 
 `initialFrame` requires at least 512 bytes of stack and at least 256 bytes below
-the aligned top. It places an 8-byte fake return address at the top, then an
-`initial_frame_qwords` frame (`15 saved registers + 2 vector/error + 5 iret
-qwords = 22` qwords):
+the aligned top. It sets the entry stack pointer to 8 bytes below the aligned
+top, leaving an 8-byte slot, then builds an `initial_frame_qwords` frame
+(`15 saved registers + 2 vector/error + 5 iret qwords = 22` qwords):
 
 - the 15 register slots are zeroed;
 - `frame[17]` is the entry address (RIP);
