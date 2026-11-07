@@ -26,10 +26,10 @@ raises `#UD`. KVM enforces this strictly; TCG tends to tolerate it.
 SIMD exceptions masked, round to nearest). `ldmxcsr` has been observed to fault
 under KVM on some nested-KVM hosts, so the kernel does not program it.
 
-The BSP calls `enableSse()` at the very start of `kmain`. APs call it in
-`ap_main` after loading the GDT, TSS, and IDT. Note that APs currently execute
-Zig code in `ap_main` before `cpu.enableSse()`; this is recorded as a technical
-debt item because it relies on the compiler not emitting SSE before that call.
+The BSP calls `enableSse()` at the very start of `kmain`. APs enable SSE in the
+assembly entry stub (`smp_entry.S`) before calling any Zig code, because `CR0`
+and `CR4` are per-CPU and the compiler may emit SSE as soon as `ap_main`
+starts. The stub also sets `CR0.WP`, matching the BSP's write-protect policy.
 
 ## GDT and TSS
 
@@ -188,7 +188,7 @@ IRQ0.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| SSE/FPU enablement | **IMPLEMENTED** | BSP before Zig code; APs after GDT/IDT load. |
+| SSE/FPU enablement | **IMPLEMENTED** | BSP in `kmain`; APs in the assembly stub before Zig code. |
 | GDT/TSS with per-CPU #DF IST | **IMPLEMENTED** | `max_cpus = 8`; 8 KiB #DF stacks. |
 | IDT and exception dispatch | **IMPLEMENTED** | Vectors 0-31, CR2 reporting for #PF. |
 | IRQ stubs and full GPR save | **IMPLEMENTED** | 15 GPRs; scheduler resumption via returned base. |

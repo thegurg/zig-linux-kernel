@@ -96,10 +96,12 @@ initialization print an error and exit QEMU with the failure code.
 12. `smp.init()`: record Limine's MP response and per-AP contexts. An
     initialization failure is logged but does not abort boot.
 13. If an MP response exists, print CPU statistics. On a normal boot (not the
-    selftest image), release the APs with `smp.start(false)` and wait for them
-    to come online; they park.
-14. Print the hardcoded `M1c complete. Paging and kernel heap are live.` line.
-15. Branch into the test variant or normal operation.
+    selftest image), release the APs with `smp.start(false)`, wait for them to
+    come online with `waitOnline()`, and wait for them to enter their halt
+    loops with `waitParked()`.
+14. Branch into the test variant or normal operation. The normal path prints
+    the version summary immediately before entering the scheduler; no
+    milestone-specific line is printed unconditionally.
 
 ## Boot variants
 
@@ -115,18 +117,18 @@ The build creates three images from the same source using `build_options` in
 Normal operation after the report is:
 
 ```text
+console.print("\nboot: " ++ version ++ " initialized (memory, scheduler, SMP)\n")
 sched.init()
 pit.init(100)
 pic.unmask(0)
-console.print("timer: PIT 100 Hz, interrupts enabled\n")
-console.write("scheduler: boot task exiting to idle\n")
+console.print("timer: PIT 100 Hz, IRQ0 unmasked\n")
+console.write("scheduler: boot task exiting to idle (interrupts enabled there)\n")
 sched.exit()
 ```
 
-The timer message is printed before `sched.exit()` reaches the idle task, whose
-`idleEntry` executes `sti; hlt`. The wording therefore describes the intended
-state rather than the exact instruction that enabled interrupts; see
-[technical debt](../development/technical-debt.md).
+Unmasking IRQ0 does not enable interrupts by itself. The boot task exits into
+the idle task, whose `idleEntry` executes `sti; hlt`; the log wording reflects
+that exact transition.
 
 In the selftest variant, the normal scheduler/PIT setup is skipped. The tests
 call `sched.init()`, program the PIT, and manage `sti`/`cli` themselves. The

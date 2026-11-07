@@ -305,15 +305,13 @@ export fn kmain() callconv(.c) noreturn {
             smp_stats.cpus, smp_stats.aps, smp_stats.bsp_lapic_id, @intFromBool(smp_stats.x2apic),
         });
         if (!build_options.exit_after_boot and smp_stats.aps != 0) {
-            if (smp.start(false) and smp.waitOnline()) {
-                console.print("smp: {d} APs online, parked\n", .{smp.onlineCount()});
+            if (smp.start(false) and smp.waitOnline() and smp.waitParked()) {
+                console.print("smp: {d} APs online, parked\n", .{smp.parkedCount()});
             } else {
                 console.write("smp: failed to bring APs online\n");
             }
         }
     }
-
-    console.write("\nM1c complete. Paging and kernel heap are live.\n");
 
     if (build_options.test_page_fault) {
         serial.write("selftest: triggering page fault\n");
@@ -444,11 +442,12 @@ export fn kmain() callconv(.c) noreturn {
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
+    console.print("\nboot: {s} initialized (memory, scheduler, SMP)\n", .{version});
     sched.init();
     pit.init(timer_hz);
     pic.unmask(0);
-    console.print("timer: PIT {d} Hz, interrupts enabled\n", .{timer_hz});
-    console.write("scheduler: boot task exiting to idle\n");
+    console.print("timer: PIT {d} Hz, IRQ0 unmasked\n", .{timer_hz});
+    console.write("scheduler: boot task exiting to idle (interrupts enabled there)\n");
     sched.exit();
 }
 

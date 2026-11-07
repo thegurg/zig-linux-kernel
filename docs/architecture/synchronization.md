@@ -4,10 +4,11 @@
 mutexes, and condition variables, including their current single-CPU
 assumptions and known hazards.
 
-**Implementation status:** `SpinLock` is **IMPLEMENTED** and SMP-safe.
-`IrqSpinLock` and `IrqLock` are **IMPLEMENTED** but have a shared-flags defect
-that makes them unsafe for multiple concurrent users. Wait queues, mutexes, and
-condition variables are **IMPLEMENTED** for the single-CPU scheduler only.
+**Implementation status:** `SpinLock`, `IrqSpinLock`, and `IrqLock` are
+**IMPLEMENTED**. `IrqSpinLock` and `IrqLock` now return a per-acquisition guard
+that carries the saved interrupt state on the caller's stack, so concurrent and
+nested acquisitions cannot corrupt each other. Wait queues, mutexes, and
+condition variables are **IMPLEMENTED** for the single-CPU scheduler only;
 SMP-aware versions are **PLANNED** for M11.
 
 ## Primitives at a glance
@@ -15,8 +16,8 @@ SMP-aware versions are **PLANNED** for M11.
 | Primitive | Source | Scope | Status |
 | --- | --- | --- | --- |
 | `SpinLock` | [`src/sync.zig`](../../src/sync.zig) | Atomic lock shared across CPUs | **IMPLEMENTED** |
-| `IrqSpinLock` | [`src/sync.zig`](../../src/sync.zig) | Atomic lock plus interrupt masking | **PARTIAL** (shared-flags defect) |
-| `IrqLock` | [`src/sync.zig`](../../src/sync.zig) | Interrupt masking only | **PARTIAL** (single-CPU helper, shared flags) |
+| `IrqSpinLock` | [`src/sync.zig`](../../src/sync.zig) | Atomic lock plus interrupt masking | **IMPLEMENTED** |
+| `IrqLock` | [`src/sync.zig`](../../src/sync.zig) | Interrupt masking only | **IMPLEMENTED** (single-CPU; no cross-CPU serialization) |
 | `irqSave` / `irqRestore` | [`src/sync.zig`](../../src/sync.zig) | Save/restore `RFLAGS` | **IMPLEMENTED** |
 | `WaitQueue` | [`src/sched.zig`](../../src/sched.zig) | Task wait list | **PARTIAL** (single-CPU only) |
 | `Mutex` | [`src/sched.zig`](../../src/sched.zig) | Blocking ownership lock | **PARTIAL** (single-CPU only) |
@@ -46,57 +47,66 @@ pub const SpinLock = struct {
 `SpinLock` does not disable interrupts. A lock shared with an interrupt handler
 must use interrupt masking as well, which is the purpose of `IrqSpinLock`.
 
-## `IrqSpinLock` and the shared-flags defect
+## `IrqSpinLock` and acquisition guards
 
-`IrqSpinLock` wraps a `SpinLock` and disables interrupts while held:
+`IrqSpinLock` wraps a `SpinLock` and disables interrupts while held. `acquire`
+returns a guard by value; the saved `RFLAGS` value is a field of that guard, so
+it lives in the caller's stack frame rather than in the shared lock object:
 
 ```zig
 pub const IrqSpinLock = struct {
     lock: SpinLock = .{},
-    flags: u64 = 0,
 
-    pub fn acquire(self: *IrqSpinLock) void {
-        self.flags = irqSave();
+    pub const Guard = struct {
+        owner: *IrqSpinLock,
+        flags: u64,
+
+        pub fn release(self: Guard) void {
+            self.owner.lock.release();
+            irqRestore(self.flags);
+        }
+    };
+
+    pub fn acquire(self: *IrqSpinLock) Guard {
+        const flags = irqSave();
         asm volatile ("cli");
         self.lock.acquire();
-    }
-
-    pub fn release(self: *IrqSpinLock) void {
-        self.lock.release();
-        irqRestore(self.flags);
+        return .{ .owner = self, .flags = flags };
     }
 };
 ```
 
-**Known defect (critical):** the saved `RFLAGS` value lives in the lock object,
-not in a per-acquisition guard. If two CPUs contend for the same lock, the
-second CPU overwrites `self.flags` before it acquires the lock. When the first
-CPU releases, it restores the second CPU's flags instead of its own. Nested
-acquisition has the same problem. The lock is also not reentrant: acquiring it
-twice on one CPU deadlocks before the flags issue is reached.
+Callers bind the guard and release it with `defer`:
 
-The defect is currently latent because:
+```zig
+const guard = task_lock.acquire();
+defer guard.release();
+```
 
-- the scheduler's `task_lock` is the main `IrqSpinLock` user;
-- the scheduler runs only on the BSP;
-- APs never take scheduler locks and do not enter the scheduler.
+This fixes the pre-M11 shared-flags defect: two CPUs contending for the same
+lock each retain their own saved interrupt state, and nesting different
+`IrqSpinLock` objects restores state in the correct order. Guards must still be
+released by the same CPU and in LIFO order. `IrqSpinLock` is **not reentrant**:
+acquiring the same lock twice on one CPU deadlocks in the underlying
+`SpinLock`.
 
-It must be fixed before M11 allows APs to take scheduler or wait-queue locks.
-The intended fix is an acquisition-local guard (save `RFLAGS` in a local or
-returned token and pass it to release) rather than storing it in the shared lock
-object. This fix is **PLANNED**, not implemented.
+`IrqLock` uses the same guard shape but contains no atomic lock. It disables
+interrupts and restores the previous state, so it is only suitable for
+single-CPU state or for callers that already serialize themselves. It does not
+serialize against other CPUs; use `IrqSpinLock` for state shared across CPUs.
 
-`IrqLock` has the same shared `flags` field and is explicitly an older
-single-CPU helper: it disables interrupts and restores the previous state but
-does not serialize against other CPUs. It should not be used for locks shared
-across CPUs.
+The scheduler's `task_lock` is an `IrqSpinLock`; all of its call sites use the
+guard form. `smp.test_lock` remains a plain `SpinLock`, because the stress
+workload does not need interrupt masking.
 
 ## Interrupt save/restore
 
 `irqSave()` reads `RFLAGS` with `pushfq; popq`. `irqRestore(flags)` writes it
 back with `pushq; popfq` and a memory clobber. These are raw helpers; they do not
-nest by themselves. Callers must keep the saved value local to the acquisition
-or use a guard object.
+nest by themselves. `IrqSpinLock` and `IrqLock` wrap them in guards. The
+single-CPU wait/sleep/mutex/condition paths still keep a local `flags` variable
+in the calling function, which is correct as long as those paths remain
+single-CPU and are not re-entered.
 
 ## `WaitQueue`
 
@@ -199,19 +209,19 @@ interrupt disabling alone. For example, `Mutex.lock`/`unlock` and
 `Condition.signal`/`broadcast` do not take `task_lock`; they call the
 `*Locked` helpers with interrupts disabled.
 
-For M11, the audit recommends defining an explicit order before APs take
-scheduler locks, for example: task/run-queue lock before wait-queue lock before
-any allocator or console lock. That ordering is **PLANNED**, not implemented.
-The `IrqSpinLock` fix should land first, because the current shared-flags
-behavior makes any cross-CPU lock ordering unreliable.
+The per-acquisition guard fix has landed, so cross-CPU interrupt-state
+restoration is no longer the blocker. For M11, an explicit order still needs to
+be defined before APs take scheduler locks, for example: task/run-queue lock
+before wait-queue lock before any allocator or console lock. That ordering is
+**PLANNED**, not implemented.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Atomic `SpinLock` | **IMPLEMENTED** | Acquire/release ordering and `pause` spin. |
-| `IrqSpinLock` | **PARTIAL** | Shared saved-flags field; unsafe under contention/nesting. |
-| `IrqLock` | **PARTIAL** | Single-CPU interrupt masking only. |
+| `IrqSpinLock` | **IMPLEMENTED** | Per-acquisition guard; safe under contention and nested use of distinct locks. |
+| `IrqLock` | **IMPLEMENTED** | Per-acquisition guard; single-CPU interrupt masking only. |
 | Wait queue with signal/timeout | **IMPLEMENTED** | Task-ID based; single-CPU. |
 | Blocking mutex with ownership transfer | **IMPLEMENTED** | Not reentrant; idle cannot block. |
 | Condition variable | **IMPLEMENTED** | Requires predicate mutex discipline. |

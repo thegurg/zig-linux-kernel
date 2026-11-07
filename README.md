@@ -9,13 +9,14 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M1c complete:** own 4-level page tables, higher-half kernel mapping, 4 GiB HHDM direct map, and a 64 MiB lazily-mapped kernel heap with `std.mem.Allocator` support.
 - **M2 complete:** IRQ gates/stubs, 100 Hz PIT on IRQ0, full 15-GPR interrupt context save/restore, and a preemptive round-robin kernel task scheduler with per-task stacks.
 - **M3 complete:** cooperative `yield`/`exit` software interrupts, an idle task that runs when no other task is ready, and reuse of finished task slots.
-- **M4 complete:** timer-based blocking sleep (`sched.sleep`), deadline wakeups in the timer tick, and a small interrupt-safe lock (`sync.IrqLock`).
+- **M4 complete:** timer-based blocking sleep (`sched.sleep`), deadline wakeups in the timer tick, and interrupt-safe lock guards (`sync.IrqLock`, `sync.IrqSpinLock`).
 - **M5 complete:** explicit indefinite blocking (`sched.block`) and wakeup (`sched.wake`) with a blocked-task counter.
 - **M6 complete:** `sched.WaitQueue` with `wait`, `wakeOne` and `wakeAll`, plus pruning of stale waiter entries.
 - **M7 complete:** timed wait queues (`WaitQueue.waitTimeout`) that distinguish an explicit signal from a deadline timeout.
 - **M8 complete:** blocking `sched.Mutex` with ownership transfer, plus `sched.Condition` with `wait`, `signal` and `broadcast`.
 - **M9 complete:** FPU/SIMD context switching with per-task `FXSAVE`/`FXRSTOR` areas.
 - **M10 complete:** Limine MP bring-up with per-CPU stacks/TSS, atomic spinlocks, and an SMP stress test.
+- **Pre-M11 bugfix pass complete:** per-acquisition interrupt guards, AP SSE/`CR0.WP`/global-TLB setup ordering, accurate diagnostics, a task return trampoline, and a dynamic SMP test assertion.
 - **Next:** M11 - per-CPU scheduling and SMP-aware wait queues.
 
 ## Requirements

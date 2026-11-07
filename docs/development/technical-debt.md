@@ -1,42 +1,38 @@
 # Technical debt and known issues
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
-limitations that are visible in the source. This document describes the state of
-M10; it does not claim that any listed fix is implemented.
+limitations that are visible in the source. This document describes the state
+after the pre-M11 bugfix pass; **RESOLVED** entries are kept so the audit trail
+and the remaining work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
-> milestone and is tracked in the [roadmap](roadmap.md).
+> milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
+> issue was fixed in the pre-M11 bugfix pass.
 
 ## Critical
 
-### 1. `IrqSpinLock` stores saved flags in the shared lock object
+### 1. `IrqSpinLock` stored saved flags in the shared lock object
 
-**Status: OPEN.** **Source:** [`src/sync.zig`](../../src/sync.zig).
+**Status: RESOLVED.** **Source:** [`src/sync.zig`](../../src/sync.zig).
 
-`IrqSpinLock` has a single `flags: u64` field. `acquire` writes the current
-`RFLAGS` into that field before spinning, and `release` restores it after
-unlocking. Under contention, another CPU overwrites `self.flags` before the
-first CPU releases, so the first release restores the wrong interrupt state.
-Nested acquisition on one CPU has the same problem, and the lock is not
-reentrant.
+The old implementation kept a single `flags: u64` field in the lock object, so
+contending CPUs overwrote each other's saved `RFLAGS`, and nested acquisitions
+had the same problem. `acquire` now returns a `Guard` value carrying the saved
+flags on the caller's stack; `release` takes that guard by value. All
+`task_lock` call sites in [`src/sched.zig`](../../src/sched.zig) use
+`const guard = task_lock.acquire(); defer guard.release();`.
 
-This is currently latent because the scheduler is BSP-only, the main
-`IrqSpinLock` user is the scheduler's `task_lock`, and APs do not take
-scheduler locks. It becomes a real hazard as soon as APs enter the scheduler or
-share a lock with an interrupt handler.
+Guards must still be released on the same CPU and in LIFO order, and
+`IrqSpinLock` remains non-reentrant.
 
-**Recommended direction:** use an acquisition-local guard or a returned token
-that carries the saved `RFLAGS` per acquisition, and define a lock ordering
-before enabling cross-CPU use.
+### 2. The `IrqSpinLock` fix had to precede M11 scheduler work
 
-### 2. The `IrqSpinLock` fix must precede M11 scheduler work
-
-**Status: OPEN (ordering constraint).** The audit concluded that the
-`IrqSpinLock` shared-flags problem must be fixed before APs are allowed to take
-scheduler locks. Per-CPU scheduling, cross-CPU wakeups, and SMP-aware wait
-queues depend on reliable interrupt-state restoration.
+**Status: RESOLVED (ordering constraint satisfied).** The per-acquisition guard
+fix landed before any AP was allowed to take scheduler locks. Per-CPU
+scheduling, cross-CPU wakeups, and SMP-aware wait queues can now rely on
+reliable interrupt-state restoration.
 
 ## High
 
@@ -100,19 +96,26 @@ race. Console output from APs would also interleave.
 
 ## Medium
 
-### 8. AP setup gaps
+### 8. AP setup ordering and remaining AP integration
 
-**Status: OPEN.** **Sources:**
+**Status: PARTIAL (setup ordering resolved).** **Sources:**
 [`src/smp.zig`](../../src/smp.zig),
 [`src/arch/x86_64/smp_entry.S`](../../src/arch/x86_64/smp_entry.S).
 
-- `ap_main` calls Zig code before `cpu.enableSse()`. If the compiler emits an
-  SSE instruction before that call, the AP can fault.
-- APs do not set `CR0.WP`, unlike the BSP during `vmm.init()`.
-- The AP stub switches `CR3` without flushing global TLB entries. The BSP has
-  already flushed them before releasing APs, so the shared mappings work, but
-  this is not a general solution after later mapping changes.
+The pre-Zig setup gaps are fixed in `smp_entry.S`:
+
+- SSE is enabled (CR0.EM/TS clear, CR0.MP/NE set, CR4.OSFXSR/OSXMMEXCPT set,
+  `fninit`) before the stub calls `ap_main`, so no compiler-generated SSE
+  instruction can fault on an AP.
+- APs set `CR0.WP`, matching the BSP and enforcing read-only mappings in ring 0.
+- The AP stub clears `CR4.PGE` across the `CR3` write and restores the original
+  CR4 value, flushing global translations as well as non-global ones.
+
+What remains is AP integration, not setup ordering:
+
 - APs do not install a per-CPU scheduler entry, timer, or idle loop.
+- There is still no general TLB-shootdown mechanism for mapping changes made
+  after an AP is running; the stub only flushes at the initial `CR3` switch.
 
 ### 9. No APIC support beyond recording the x2APIC flag
 
@@ -122,38 +125,46 @@ remain the only interrupt sources.
 
 ### 10. Stale or misleading log messages
 
-**Status: OPEN.** **Source:** [`src/main.zig`](../../src/main.zig).
+**Status: RESOLVED.** **Source:** [`src/main.zig`](../../src/main.zig),
+[`src/smp.zig`](../../src/smp.zig).
 
-- The line `M1c complete. Paging and kernel heap are live.` is printed
-  unconditionally, even after later milestones have run and even though it is
-  not tied to a specific check.
-- `timer: PIT 100 Hz, interrupts enabled` is printed before `sched.exit()`
-  reaches the idle task, which is where `sti` actually executes. The message
-  describes the intended state, not the exact moment interrupts are enabled.
-- `smp: N APs online, parked` is printed after `online_count` reaches the
-  target, but an AP may still be between that increment and its `hlt`.
-- `ap_contexts[*].online` and `.done` fields exist but are not used by the
-  current code; the global counters are used instead.
+- The unconditional `M1c complete` line was removed. The normal boot path now
+  prints `boot: <version> initialized (memory, scheduler, SMP)` immediately
+  before entering the scheduler; the selftest image keeps its explicit
+  `M1c checks passed` marker.
+- `timer: PIT 100 Hz, IRQ0 unmasked` replaces the premature "interrupts
+  enabled" wording. The following line states that interrupts are enabled in
+  the idle task, which is where `sti` actually executes.
+- The normal-boot AP message now waits for `smp.waitParked()`, which is backed
+  by a `parked_count` incremented at the top of the AP park loop. The log is
+  therefore printed only after every AP has entered its final `hlt` loop.
 
-These logs are useful diagnostics, but tests should not treat them as precise
-synchronization points.
+`ap_contexts[*].online` and `.done` fields remain unused (the global counters
+are authoritative); they are harmless reserved fields for M11 per-CPU state.
 
 ### 11. Test coverage gaps
 
-**Status: OPEN.** **Sources:**
+**Status: PARTIAL.** **Sources:**
 [`src/test_root.zig`](../../src/test_root.zig),
 [`src/limine.zig`](../../src/limine.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-- The host test root contains only a trivial test.
-- The `limine.zig` `base revision marker layout` test is not wired into
+Resolved in the pre-M11 bugfix pass:
+
+- [`src/test_root.zig`](../../src/test_root.zig) imports `limine.zig` from a
+  test block, so the `base revision marker layout` test is part of
   `zig build test`.
+- The smoke assertion builds its expected `smp: cpus=<N>` string from
+  `ZIG_KERNEL_SMP` (default 4), so non-default CPU counts no longer cause a
+  false failure.
+
+Still open:
+
 - There is no AP exception, NMI, or AP FPU-state test.
 - There is no TLB-shootdown test (the feature is absent).
-- There is no nested or cross-CPU `IrqSpinLock` test; the shared-flags defect
-  is latent.
-- The smoke test hardcodes `grep -q "smp: cpus=4"`, so any
-  `ZIG_KERNEL_SMP` value other than 4 can cause a false failure.
+- There is no automated nested or cross-CPU `IrqSpinLock` test. The guard
+  implementation is covered indirectly by every scheduler/wait-queue test, but
+  contention is latent until M11.
 
 ### 12. Fixed resource limits
 
@@ -199,24 +210,25 @@ priority levels, no task migration, and no join/wait-for-exit API; tests poll
 **Status: PARTIAL.** Tasks use stacks supplied to `sched.create`. There is no
 guard page, automatic stack allocation, or stack-overflow detection.
 
-### 18. `IrqLock` shares the same saved-flags pattern
+### 18. `IrqLock` shared saved flags
 
-**Status: OPEN.** `IrqLock` also stores `flags` in the lock object. It is
-explicitly a single-CPU helper and does not serialize across CPUs, but the
-shared-flags pattern has the same nesting hazard as `IrqSpinLock`.
+**Status: RESOLVED.** `IrqLock.acquire` now returns a guard carrying the saved
+flags, so it no longer stores state in the lock object. It remains a single-CPU
+interrupt-masking helper and does not serialize across CPUs.
 
 ## Implementation status summary
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| `IrqSpinLock` correctness | **OPEN / critical** | Shared flags; fix before M11. |
+| `IrqSpinLock` correctness | **IMPLEMENTED** | Per-acquisition guard; verified by the full scheduler suite. |
+| `IrqLock` correctness | **IMPLEMENTED** | Per-acquisition guard; single-CPU semantics unchanged. |
 | SMP scheduling | **DEFERRED** | BSP-only scheduler. |
 | Cross-CPU wakeups / IPIs | **DEFERRED** | No LAPIC/IPI support. |
 | AP exception/FPU safety | **OPEN** | Uses global BSP state. |
-| TLB shootdown | **DEFERRED** | Local `invlpg` only. |
+| TLB shootdown | **DEFERRED** | Local `invlpg` only; AP boot switch now flushes globals. |
 | Allocator/console/serial thread safety | **OPEN** | Global state without locks. |
-| AP setup ordering | **OPEN** | Zig before `enableSse`, no `CR0.WP`, no global TLB flush. |
-| Test coverage | **PARTIAL** | Smoke/fault tests exist; gaps listed above. |
+| AP setup ordering | **RESOLVED** | SSE and `CR0.WP` set in the assembly stub; global TLB flushed after `CR3`. |
+| Test coverage | **PARTIAL** | Host Limine test and dynamic SMP assertion added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 8 tasks, 8 CPUs. |
 
 ## Related documentation

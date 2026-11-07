@@ -158,13 +158,19 @@ Force TCG with `ZIG_KERNEL_NO_KVM=1` to reproduce emulator-only behavior. On
 some nested-KVM hosts, `ldmxcsr` has been observed to fault; the kernel leaves
 `MXCSR` at its reset value rather than programming it.
 
-### Smoke test fails with a non-4 CPU count
+### Exercising a non-default CPU count
 
-The smoke assertion currently greps for the literal string `smp: cpus=4` in
-[`tools/run.sh`](../../tools/run.sh). Setting `ZIG_KERNEL_SMP` to anything other
-than 4 can therefore produce a false smoke failure even when the kernel is
-correct. This is documented in [technical debt](technical-debt.md); until the
-assertion is made dynamic, use `ZIG_KERNEL_SMP=4` for `zig build test`.
+[`tools/run.sh`](../../tools/run.sh) reads `ZIG_KERNEL_SMP` (default 4) and uses
+the same value for QEMU's `-smp` argument and for the expected
+`smp: cpus=<N>` smoke marker. For example:
+
+```bash
+ZIG_KERNEL_SMP=2 zig build test
+ZIG_KERNEL_SMP=1 zig build test
+```
+
+Both were verified during the pre-M11 bugfix pass. `ZIG_KERNEL_SMP=1` exercises
+the no-AP path; `2` through `8` exercise AP bring-up and the SMP stress test.
 
 ### Interactive run appears to hang
 
@@ -181,7 +187,7 @@ turns a hang into status 124.
 | Normal/selftest/fault variants | **IMPLEMENTED** | Built from the same root. |
 | UEFI QEMU harness without root | **IMPLEMENTED** | `vvfat` ESP; no mtools/xorriso/losetup. |
 | KVM with TCG fallback | **IMPLEMENTED** | Selected from `/dev/kvm` access. |
-| Dynamic smoke-test CPU assertion | **PLANNED** | Current assertion hardcodes `cpus=4`. |
+| Dynamic smoke-test CPU assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | BIOS image | **PLANNED** | Not produced. |
 
 ## Related documentation

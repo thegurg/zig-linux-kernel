@@ -4,9 +4,10 @@
 processor entry, per-CPU stacks/TSS, the SMP stress test, and what "SMP
 support" does and does not mean in M10.
 
-**Implementation status:** AP bring-up, per-CPU stacks/TSS, atomic spinlocks,
-and the SMP stress test are **IMPLEMENTED**. Per-CPU scheduling, LAPIC/IPI
-support, cross-CPU wakeups, and SMP-aware wait queues are **PLANNED** for M11.
+**Implementation status:** AP bring-up, per-CPU stacks/TSS, pre-Zig AP setup
+(SSE, `CR0.WP`, global TLB flush), atomic spinlocks, and the SMP stress test are
+**IMPLEMENTED**. Per-CPU scheduling, LAPIC/IPI support, cross-CPU wakeups, and
+SMP-aware wait queues are **PLANNED** for M11.
 
 ## Scope: SMP bring-up is not SMP scheduling
 
@@ -102,13 +103,15 @@ boot.
 `smp.start(run_test)`:
 
 1. refuses if not initialized or already started;
-2. records `test_mode = run_test`, sets `started`, and updates statistics;
+2. records `test_mode = run_test`, sets `started`, updates statistics, and
+   resets `parked_count`;
 3. takes the address of `ap_entry`;
 4. for each AP, refreshes `extra_argument` and atomically stores the entry
    address into `info.goto_address` with sequential consistency.
 
 `smp.waitOnline()` spins until `online_count >= stats.aps`, with a limit of
-50,000,000 `pause` iterations.
+50,000,000 `pause` iterations. `smp.waitParked()` applies the same wait to
+`parked_count`, which each AP increments at the top of its final `hlt` loop.
 
 ## AP entry path
 
@@ -120,9 +123,17 @@ assembly entry:
 2. move the `limine_mp_info` pointer into `RSI` (second argument);
 3. load the private stack top from the first field of the context (`RSP`);
 4. move the context pointer into `RDI` (first argument);
-5. load `ap_kernel_cr3` into `RAX` and write it to `CR3`;
-6. execute `cld`;
-7. call `ap_main`.
+5. enable SSE: clear `CR0.EM`/`CR0.TS`, set `CR0.MP`/`CR0.NE`, set
+   `CR4.OSFXSR`/`CR4.OSXMMEXCPT`, and execute `fninit`;
+6. set `CR0.WP` so ring-0 writes honor read-only mappings;
+7. clear `CR4.PGE`, load `ap_kernel_cr3` into `CR3`, and restore the original
+   `CR4` value; clearing PGE flushes global TLB entries that a `CR3` write
+   alone would preserve;
+8. execute `cld`;
+9. call `ap_main`.
+
+Steps 5-7 happen in assembly before any Zig code, because `CR0`/`CR4` are
+per-CPU and the compiler may emit SSE as soon as `ap_main` starts.
 
 If `ap_main` returns, the stub halts in a `cli; hlt` loop.
 
@@ -131,24 +142,22 @@ If `ap_main` returns, the stub halts in a `cli; hlt` loop.
 1. calls `gdt.setKernelStack(ctx.gdt_cpu, ctx.stack_top)`;
 2. loads the shared GDT and this CPU's TSS with `gdt.load(ctx.gdt_cpu)`;
 3. loads the shared IDT with `idt.load()`;
-4. calls `cpu.enableSse()`;
-5. increments `online_count` with an atomic add;
-6. if not in test mode, parks immediately;
-7. otherwise spins until `test_go` is set;
-8. runs the stress workload;
-9. increments `done_count` and parks.
+4. increments `online_count` with an atomic add;
+5. if not in test mode, parks immediately;
+6. otherwise spins until `test_go` is set;
+7. runs the stress workload;
+8. increments `done_count` and parks.
 
-### Known AP setup gaps
+`park()` increments `parked_count` before entering the `cli; hlt` loop, so the
+BSP can distinguish "AP reached `ap_main`" from "AP reached its final halt".
 
-- `ap_main` executes Zig code before `cpu.enableSse()`; this relies on the
-  compiler not emitting SSE instructions before that point.
-- APs do not set `CR0.WP`.
-- The AP stub switches `CR3` but does not flush global TLB entries. The BSP
-  flushes global entries during `vmm.init()` before APs are released, so the
-  shared mappings are already valid, but this is not a general TLB-shootdown
-  mechanism.
+### Remaining AP integration gaps
+
 - APs do not install a timer or enter the scheduler; the park loop executes
   `cli; hlt`. IRQ0 remains a BSP-only path in the current design.
+- The boot-time global TLB flush is not a general TLB-shootdown mechanism for
+  mappings changed after APs are running.
+- AP exception and NMI paths still use global BSP FPU/scheduler state.
 
 These are tracked in [technical debt](../development/technical-debt.md).
 
@@ -191,21 +200,21 @@ and passes when `online == aps`, `counter == expected`, and `overlap == 0`.
 
 | Mode | AP behavior |
 | --- | --- |
-| Normal kernel | `kmain` calls `smp.start(false)` and `waitOnline()` when APs exist. APs increment `online_count`, then park. The log is `smp: 3 APs online, parked`. |
+| Normal kernel | `kmain` calls `smp.start(false)`, `waitOnline()`, and `waitParked()` when APs exist. APs increment `online_count`, enter `park()`, increment `parked_count`, and halt. The log is `smp: 3 APs online, parked`. |
 | Selftest kernel | `kmain` skips the normal release because `exit_after_boot` is true. `selftestSmp()` calls `smp.runTest()`, which releases the APs in test mode. |
 | Fault-test kernel | `kmain` follows the normal release path (it only checks `exit_after_boot`), so APs come online and park before the deliberate NULL dereference. |
 
-The normal-run log after M10 validation was:
+The normal-run log is:
 
 ```text
 smp: cpus=4, aps=3, bsp_lapic_id=..., x2apic=0
 smp: 3 APs online, parked
 ```
 
-The `parked` log is printed after `online_count` reaches the target; the AP may
-still be between the increment and its `hlt`, so the message describes the
-intended end state rather than a confirmed halted state. This is a diagnostic
-nuance, not a scheduling guarantee.
+The `parked` log is printed only after `parked_count` reaches the AP count, so
+every AP has executed the increment at the top of its halt loop. The AP may not
+yet have retired the following `hlt`, but it can no longer touch shared kernel
+state.
 
 ## Recorded validation
 
@@ -223,12 +232,24 @@ M10 validation reported:
 The later documentation audit re-ran the default KVM `zig build test` and saw
 exit code 0 with no test failures.
 
+The pre-M11 bugfix pass re-ran the full flow after adding the AP setup changes:
+
+- default KVM `zig build test`: passed, `counter=400000, overlap=0`;
+- TCG `ZIG_KERNEL_NO_KVM=1 zig build test`: passed;
+- `-Doptimize=Debug` `zig build test`: passed;
+- `ZIG_KERNEL_SMP=2` and `ZIG_KERNEL_SMP=1` smoke/fault runs: passed with the
+  dynamic `smp: cpus=<N>` assertion;
+- a normal kernel run printed `smp: 3 APs online, parked`, then
+  `boot: 0.13.0-m10 initialized`, `timer: PIT 100 Hz, IRQ0 unmasked`, and the
+  idle-task transition.
+
 ## Limitations and deferred work
 
 | Item | Status | Notes |
 | --- | --- | --- |
 | Limine MP bring-up | **IMPLEMENTED** | APs released through `goto_address`. |
 | Per-CPU stacks and TSS | **IMPLEMENTED** | 16 KiB AP stacks; per-CPU #DF IST. |
+| Pre-Zig AP setup | **IMPLEMENTED** | SSE, `CR0.WP`, and global TLB flush in `smp_entry.S`. |
 | Atomic spinlock stress test | **IMPLEMENTED** | 100,000 iterations per CPU. |
 | Per-CPU scheduler/run queues | **PLANNED** | M11. |
 | Local APIC / IOAPIC / APIC timer | **PLANNED** | None programmed; PIC/PIT only. |

@@ -28,6 +28,9 @@ pub const sleep_vector: u8 = 50;
 pub const block_vector: u8 = 51;
 pub const wait_vector: u8 = 52;
 pub const wait_timeout_vector: u8 = 53;
+
+/// Task entry point. Entries normally call `sched.exit()` themselves; one that
+/// returns anyway lands in `taskReturn`, which exits through the scheduler.
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
@@ -77,14 +80,14 @@ pub const WaitQueue = struct {
     }
 
     pub fn wakeOne(self: *WaitQueue) bool {
-        task_lock.acquire();
-        defer task_lock.release();
+        const guard = task_lock.acquire();
+        defer guard.release();
         return self.wakeOneTaskLocked() != null;
     }
 
     pub fn wakeAll(self: *WaitQueue) usize {
-        task_lock.acquire();
-        defer task_lock.release();
+        const guard = task_lock.acquire();
+        defer guard.release();
         return self.wakeAllLocked();
     }
 
@@ -287,8 +290,8 @@ var idle_stack: [8 * 1024]u8 align(16) = undefined;
 var task_lock: sync.IrqSpinLock = .{};
 
 pub fn init() void {
-    task_lock.acquire();
-    defer task_lock.release();
+    const guard = task_lock.acquire();
+    defer guard.release();
 
     initFpuTemplate();
 
@@ -332,8 +335,8 @@ pub fn init() void {
 pub fn create(name: []const u8, entry: Entry, stack: []u8) ?*Task {
     if (!initialized) return null;
 
-    task_lock.acquire();
-    defer task_lock.release();
+    const guard = task_lock.acquire();
+    defer guard.release();
 
     const index = findSlot() orelse return null;
     const rsp = initialFrame(stack, entry) orelse return null;
@@ -502,8 +505,8 @@ pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
 }
 
 pub fn wake(task: *Task) bool {
-    task_lock.acquire();
-    defer task_lock.release();
+    const guard = task_lock.acquire();
+    defer guard.release();
     return wakeLocked(task, .signal);
 }
 
@@ -526,8 +529,8 @@ pub fn exit() noreturn {
 }
 
 pub fn stop() void {
-    task_lock.acquire();
-    defer task_lock.release();
+    const guard = task_lock.acquire();
+    defer guard.release();
     enabled = false;
 }
 
@@ -604,6 +607,19 @@ fn idleEntry() callconv(.c) void {
     while (true) {
         asm volatile ("sti; hlt");
     }
+}
+
+/// Return trampoline for task entries. Reached by `ret` when an entry returns
+/// instead of calling `sched.exit()`. Unlike a normal callee, it starts with
+/// `RSP % 16 == 0` (the entry consumed its call-frame slot), so it is naked
+/// and enters the scheduler directly instead of calling a Zig function.
+fn taskReturn() callconv(.naked) noreturn {
+    asm volatile (
+        \\int $49
+        \\1: cli
+        \\hlt
+        \\jmp 1b
+    );
 }
 
 fn haltForever() noreturn {
@@ -706,6 +722,11 @@ fn initialFrame(stack: []u8, entry: Entry) ?u64 {
     const base = entry_rsp - initial_frame_qwords * @sizeOf(u64);
     const frame: [*]u64 = @ptrFromInt(base);
     @memset(frame[0..initial_frame_qwords], 0);
+
+    // A C-ABI function expects a return address at its initial RSP. Point it
+    // at the exit trampoline so a returning entry cannot `ret` into garbage.
+    const return_slot: *u64 = @ptrFromInt(entry_rsp);
+    return_slot.* = @intFromPtr(&taskReturn);
 
     frame[saved_registers + 2] = @intCast(@intFromPtr(entry));
     frame[saved_registers + 3] = @as(u64, gdt.kernel_code_selector);

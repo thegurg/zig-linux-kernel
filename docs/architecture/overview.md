@@ -72,6 +72,7 @@ _start -> kernel stack -> kmain
     +-- PMM -> VMM -> heap
     +-- framebuffer console + boot report
     +-- SMP init (Limine MP request)
+    +-- AP entry: kernel stack, SSE, CR0.WP, CR3 + global TLB flush
     +-- selftest / fault-test variant, or normal boot
     |
     v
@@ -81,7 +82,8 @@ normal boot: sched.init -> PIT 100 Hz -> IRQ0 -> idle
 The scheduler owns the only run queue today. IRQ0 drives preemption on the BSP;
 the APs load the shared GDT/IDT, run the SMP stress workload or park, and never
 enter the scheduler. Synchronization primitives provide atomic spinlocks and
-interrupt-safe locking, but the SMP-aware wait-queue redesign is M11 work.
+per-acquisition interrupt guards, but the SMP-aware wait-queue redesign is M11
+work.
 
 ## Source layout
 

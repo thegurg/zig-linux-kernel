@@ -16,7 +16,6 @@ const limine = @import("limine.zig");
 const vmm = @import("memory/vmm.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
-const cpu = @import("arch/x86_64/cpu.zig");
 const sync = @import("sync.zig");
 
 pub const max_cpus = gdt.max_cpus;
@@ -65,6 +64,7 @@ var started = false;
 var test_mode = false;
 
 var online_count: u64 = 0;
+var parked_count: u64 = 0;
 var done_count: u64 = 0;
 
 var test_go: u64 = 0;
@@ -121,6 +121,10 @@ pub fn onlineCount() u32 {
     return @intCast(@atomicLoad(u64, &online_count, .acquire));
 }
 
+pub fn parkedCount() u32 {
+    return @intCast(@atomicLoad(u64, &parked_count, .acquire));
+}
+
 /// Release every parked AP. `test` selects whether the APs wait for the stress
 /// workload or immediately park in `hlt`.
 pub fn start(run_test: bool) bool {
@@ -128,6 +132,7 @@ pub fn start(run_test: bool) bool {
     test_mode = run_test;
     started = true;
     stats.started = true;
+    parked_count = 0;
 
     const entry = @intFromPtr(&ap_entry);
     var index: usize = 0;
@@ -142,6 +147,11 @@ pub fn start(run_test: bool) bool {
 /// Wait until every released AP has reached `ap_main`.
 pub fn waitOnline() bool {
     return waitCounter(&online_count, stats.aps);
+}
+
+/// Wait until every released AP has entered its final `hlt` loop.
+pub fn waitParked() bool {
+    return waitCounter(&parked_count, stats.aps);
 }
 
 fn waitCounter(counter: *u64, target: u32) bool {
@@ -204,10 +214,10 @@ fn runWorkload() void {
 export fn ap_main(ctx: *ApContext, info: *limine.MpInfo) callconv(.c) noreturn {
     _ = info;
 
+    // SSE and CR0.WP were enabled by `ap_entry` before this Zig code started.
     gdt.setKernelStack(ctx.gdt_cpu, ctx.stack_top);
     gdt.load(ctx.gdt_cpu);
     idt.load();
-    cpu.enableSse();
 
     _ = @atomicRmw(u64, &online_count, .Add, 1, .seq_cst);
 
@@ -223,6 +233,7 @@ export fn ap_main(ctx: *ApContext, info: *limine.MpInfo) callconv(.c) noreturn {
 }
 
 fn park() noreturn {
+    _ = @atomicRmw(u64, &parked_count, .Add, 1, .seq_cst);
     while (true) {
         asm volatile ("cli; hlt");
     }

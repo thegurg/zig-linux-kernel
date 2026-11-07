@@ -4,8 +4,30 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M10 are complete. M11 is the next milestone.
-No M11 code has been started at the time of this documentation update.
+**Current status:** M0-M10 are complete, and the pre-M11 bugfix pass has
+landed. M11 is the next milestone. No M11 code has been started at the time of
+this documentation update.
+
+## Pre-M11 bugfix pass (complete)
+
+The architecture audit findings were fixed before starting M11:
+
+- `sync.IrqSpinLock` and `sync.IrqLock` return per-acquisition guards; the
+  scheduler's `task_lock` call sites use the guard form.
+- AP setup ordering: `smp_entry.S` enables SSE and sets `CR0.WP` before Zig
+  code, then flushes global translations across the `CR3` switch.
+- Diagnostics: the unconditional `M1c complete` line was removed, the timer
+  message no longer claims interrupts are enabled early, and the AP `parked`
+  message waits on an explicit `parked_count`.
+- `src/test_root.zig` imports the Limine binding test, and `tools/run.sh`
+  derives the expected CPU count from `ZIG_KERNEL_SMP`.
+- `initialFrame` stores a return trampoline in the task's initial return slot so
+  a returning entry exits through the scheduler instead of `ret`-ing into
+  garbage.
+
+Validation: default KVM, TCG, and Debug `zig build test` runs pass; the smoke
+flow also passes with `ZIG_KERNEL_SMP=1` and `=2`. See
+[testing](testing.md) for the recorded results.
 
 ## M11: per-CPU scheduling and SMP-aware wait queues
 
@@ -31,27 +53,25 @@ state.
 
 ### Ordered implementation plan
 
-The order below follows the audit recommendation. The `IrqSpinLock` fix comes
-first because every later lock depends on reliable interrupt-state restoration.
+The order below follows the audit recommendation. The `IrqSpinLock` guard fix
+is already complete, so the remaining M11 work starts with lock ordering.
 
-1. **Fix `sync.IrqSpinLock`** — replace the shared `flags` field with a
-   per-acquisition guard/token, and audit `IrqLock` for the same pattern.
-2. **Define lock ordering** — document and enforce the order among task/run-queue
+1. **Define lock ordering** — document and enforce the order among task/run-queue
    locks, wait-queue locks, and any allocator/console locks.
-3. **Per-CPU scheduler state** — introduce per-CPU `current`, run queues, idle
+2. **Per-CPU scheduler state** — introduce per-CPU `current`, run queues, idle
    tasks, counters, and an AP scheduler entry. Keep the BSP as CPU 0.
-4. **AP scheduler entry** — let APs leave the park loop and enter a scheduler
+3. **AP scheduler entry** — let APs leave the park loop and enter a scheduler
    idle loop instead of halting permanently.
-5. **LAPIC/IPI support** — discover and map the local APIC, add an IPI send
+4. **LAPIC/IPI support** — discover and map the local APIC, add an IPI send
    path, and use it for cross-CPU wakeups and TLB shootdown.
-6. **SMP-aware wait queues, mutex, and condition** — make enqueue/wake operate
+5. **SMP-aware wait queues, mutex, and condition** — make enqueue/wake operate
    on the correct CPU's run queue, preserve signal-vs-timeout semantics, and
    avoid lost wakeups.
-7. **TLB shootdown** — invalidate remote TLB entries after `vmm.unmapPage` or
+6. **TLB shootdown** — invalidate remote TLB entries after `vmm.unmapPage` or
    mapping changes that affect other CPUs.
-8. **AP exception and FPU state** — replace global `current_fpu_state` use in
+7. **AP exception and FPU state** — replace global `current_fpu_state` use in
    the interrupt path with per-CPU state, and make the dispatcher safe on APs.
-9. **Expanded tests** — add KVM, TCG, and Debug runs covering AP scheduling,
+8. **Expanded tests** — add KVM, TCG, and Debug runs covering AP scheduling,
    cross-CPU wakeups, nested/contended locks, TLB shootdown, and AP exceptions.
 
 ### M11 acceptance criteria (planned)
@@ -89,7 +109,6 @@ not by priority.
 | NX-bit policy | **PLANNED** | No executable/non-executable split yet. |
 | User mode and address-space isolation | **PLANNED** | All tasks share kernel page tables. |
 | Priorities, migration, join | **PLANNED** | Round-robin only; tests poll counters. |
-| Dynamic smoke-test CPU assertion | **PLANNED** | `tools/run.sh` hardcodes `smp: cpus=4`. |
 | AP exception/NMI tests | **PLANNED** | Depends on per-CPU interrupt state. |
 | Thread-safe PMM/VMM/heap/console/serial | **PLANNED** | Current global state is not locked. |
 
@@ -110,6 +129,7 @@ not by priority.
 | M8 | **IMPLEMENTED** | Mutex with ownership transfer and condition variables. |
 | M9 | **IMPLEMENTED** | FPU/SIMD context switching. |
 | M10 | **IMPLEMENTED** | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test. |
+| Pre-M11 | **IMPLEMENTED** | Interrupt-safe guards, AP setup ordering, accurate diagnostics, task return trampoline, host SMP/test harness fixes. |
 | M11 | **PLANNED** | Per-CPU scheduling and SMP-aware wait queues. |
 
 ## Related documentation

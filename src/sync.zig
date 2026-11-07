@@ -5,6 +5,11 @@
 //! with interrupt disabling, which is required when the same lock can also be
 //! taken from an interrupt handler on the same CPU.
 //!
+//! Both `IrqSpinLock` and `IrqLock` return a guard from `acquire`. The saved
+//! interrupt state lives in the guard on the caller's stack, not in the lock
+//! object, so concurrent and nested acquisitions cannot overwrite each other's
+//! flags. `release` takes the guard by value.
+//!
 //! `IrqLock` is the older single-CPU helper. It only disables interrupts and
 //! restores the previous state; it does not serialize against other CPUs.
 
@@ -31,30 +36,48 @@ pub const SpinLock = struct {
 
 pub const IrqSpinLock = struct {
     lock: SpinLock = .{},
-    flags: u64 = 0,
 
-    pub fn acquire(self: *IrqSpinLock) void {
-        self.flags = irqSave();
+    pub const Guard = struct {
+        owner: *IrqSpinLock,
+        flags: u64,
+
+        /// Release the lock and restore the interrupt state saved by the
+        /// matching `acquire`.
+        pub fn release(self: Guard) void {
+            self.owner.lock.release();
+            irqRestore(self.flags);
+        }
+    };
+
+    /// Acquire the lock with interrupts disabled. The returned guard must be
+    /// released exactly once, by the same CPU and on the same stack frame that
+    /// acquired it.
+    pub fn acquire(self: *IrqSpinLock) Guard {
+        const flags = irqSave();
         asm volatile ("cli" ::: .{ .memory = true });
         self.lock.acquire();
-    }
-
-    pub fn release(self: *IrqSpinLock) void {
-        self.lock.release();
-        irqRestore(self.flags);
+        return .{ .owner = self, .flags = flags };
     }
 };
 
 pub const IrqLock = struct {
-    flags: u64 = 0,
+    pub const Guard = struct {
+        flags: u64,
 
-    pub fn acquire(self: *IrqLock) void {
-        self.flags = irqSave();
+        /// Restore the interrupt state saved by the matching `acquire`.
+        pub fn release(self: Guard) void {
+            irqRestore(self.flags);
+        }
+    };
+
+    /// Disable interrupts and return a guard carrying the previous state.
+    /// `IrqLock` does not serialize against other CPUs; use `IrqSpinLock`
+    /// whenever the protected state can be touched concurrently.
+    pub fn acquire(self: *IrqLock) Guard {
+        _ = self;
+        const flags = irqSave();
         asm volatile ("cli" ::: .{ .memory = true });
-    }
-
-    pub fn release(self: *IrqLock) void {
-        irqRestore(self.flags);
+        return .{ .flags = flags };
     }
 };
 

@@ -21,6 +21,7 @@ case "${2:-}" in
 esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SMP="${ZIG_KERNEL_SMP:-4}"
 LIMINE_BIN="${LIMINE_BIN:-$ROOT/third_party/limine}"
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
@@ -53,7 +54,7 @@ QEMU=(
   qemu-system-x86_64
   -machine q35
   "${ACCEL[@]}"
-  -smp "${ZIG_KERNEL_SMP:-4}"
+  -smp "$SMP"
   -m 256M
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd"
@@ -103,7 +104,7 @@ if [ "$MODE" != "run" ]; then
            grep -q "mutex checks passed" "$WORK/serial.log" &&
            grep -q "cond checks passed" "$WORK/serial.log" &&
            grep -q "fpu checks passed" "$WORK/serial.log" &&
-           grep -q "smp: cpus=4" "$WORK/serial.log" &&
+           grep -q "smp: cpus=$SMP" "$WORK/serial.log" &&
            grep -q "smp checks passed" "$WORK/serial.log"; then
           exit 0
         fi

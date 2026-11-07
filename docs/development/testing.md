@@ -1,7 +1,8 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-harness assertions, and the results recorded for M10.
+harness assertions, and the results recorded for M10 and the pre-M11 bugfix
+pass.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -11,7 +12,7 @@ verification path for each milestone. Coverage gaps are documented below and in
 
 | Layer | Command | What it proves |
 | --- | --- | --- |
-| Host unit tests | part of `zig build test` | The host test harness runs. Current coverage is a trivial pure test. |
+| Host unit tests | part of `zig build test` | The host harness and the pure Limine binding test run. |
 | QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, scheduler, synchronization, FPU, and SMP bring-up work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
 
@@ -25,18 +26,20 @@ The host test root is [`src/test_root.zig`](../../src/test_root.zig):
 ```zig
 const std = @import("std");
 
+test {
+    _ = @import("limine.zig");
+}
+
 test "host test harness works" {
     try std.testing.expectEqual(@as(u32, 42), 40 + 2);
 }
 ```
 
-Only pure, platform-independent modules may be imported there. Kernel
-subsystems are exercised through QEMU because they depend on x86_64 state and
-devices.
-
-`src/limine.zig` contains a `test "base revision marker layout"` block, but that
-module is not currently part of the host test root, so the block is not wired
-into `zig build test`.
+Importing `limine.zig` from a test block pulls its
+`test "base revision marker layout"` into the same test binary. Only pure,
+platform-independent modules may be imported there; kernel subsystems are
+exercised through QEMU because they depend on x86_64 state and devices. The
+host test run currently executes three tests.
 
 ## QEMU selftest
 
@@ -58,7 +61,7 @@ initialization, `kmain` runs the checks in this order.
 | M8 mutex | `mutex checks passed` | Two workers serialize a critical section across a yield; checks value, completion count, and zero overlap. |
 | M8 condition | `cond checks passed`, `M8 checks passed` | A waiter and signaller handshake through a condition variable and associated mutex. |
 | M9 FPU | `fpu checks passed`, `M9 checks passed` | Two tasks keep distinct XMM0 patterns across a cooperative yield and interleave. |
-| SMP | `smp: cpus=4`, `smp checks passed` | Releases the APs, runs the 100,000-iteration-per-CPU spinlock workload, and checks online count, counter total, and zero overlap. |
+| SMP | `smp: cpus=<ZIG_KERNEL_SMP>`, `smp checks passed` | Releases the APs, runs the 100,000-iteration-per-CPU spinlock workload, and checks online count, counter total, and zero overlap. |
 | `int3` | `returned from int3`, `M10 checks passed` | Triggers a breakpoint and proves the handler resumes. |
 | Success | `M10 checks passed` | Exits QEMU successfully. |
 
@@ -108,7 +111,9 @@ lines are present.
 
 ### Selftest mode
 
-The harness requires QEMU status 33 and greps for all of these markers:
+The harness requires QEMU status 33 and greps for all of these markers. The
+expected SMP marker is generated from `ZIG_KERNEL_SMP` (default 4), so the
+example below shows the default:
 
 ```text
 returned from int3
@@ -175,16 +180,28 @@ M10 validation recorded:
 The documentation audit later re-ran the default KVM `zig build test` and
 observed exit code 0 with no test failures.
 
+The pre-M11 bugfix pass re-ran the full flow after the guard, AP setup, log,
+trampoline, and harness changes:
+
+- default KVM `zig build test`: 9/9 build steps and 3/3 host tests passed;
+- TCG `ZIG_KERNEL_NO_KVM=1 zig build test`: passed;
+- `-Doptimize=Debug zig build test`: passed;
+- `ZIG_KERNEL_SMP=2` and `ZIG_KERNEL_SMP=1` runs: passed, proving the smoke
+  assertion follows the configured CPU count;
+- normal kernel run: `smp: 3 APs online, parked`,
+  `boot: 0.13.0-m10 initialized (memory, scheduler, SMP)`,
+  `timer: PIT 100 Hz, IRQ0 unmasked`, and
+  `scheduler: boot task exiting to idle (interrupts enabled there)`;
+- SMP stress result remained `counter=400000, expected=400000, overlap=0`;
+- `zig fmt --check build.zig src` and `git diff --check`: passed.
+
 ## Coverage gaps
 
-- The host test root contains only a trivial test; the Limine test block is not
-  wired in.
 - There is no automated test for AP exceptions, NMI handling, or AP FPU state.
 - There is no test for TLB shootdown because it is not implemented.
-- There is no test for nested or cross-CPU `IrqSpinLock` acquisition; the
-  shared-flags defect is currently untested and latent.
-- The harness hardcodes `smp: cpus=4`, so non-default `ZIG_KERNEL_SMP` values
-  can cause false smoke failures.
+- There is no automated nested or cross-CPU `IrqSpinLock` test. The guard form
+  is exercised by every scheduler/wait-queue test, but contention remains a
+  latent case until APs enter the scheduler in M11.
 - There is no test that starts a task on an AP or wakes a task across CPUs,
   because the scheduler is BSP-only.
 - Debug builds are validated by running the same test flow with
@@ -194,11 +211,11 @@ observed exit code 0 with no test failures.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Host test harness | **IMPLEMENTED** | Trivial coverage only. |
+| Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
 | QEMU selftest | **IMPLEMENTED** | Checks M1c-M10 behavior and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2. |
-| Log-marker assertions | **IMPLEMENTED** | Hardcoded marker list. |
-| Dynamic SMP assertion | **PLANNED** | `cpus=4` is hardcoded. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>`. |
+| Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU tests | **PLANNED** | No AP exception test yet. |
 | TLB-shootdown tests | **PLANNED** | Feature not implemented. |
 | Nested/cross-CPU lock tests | **PLANNED** | Needed after the `IrqSpinLock` fix. |

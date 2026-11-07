@@ -80,7 +80,7 @@ original state. New tasks and the idle task inherit this clean template.
 `sched.create(name, entry, stack)`:
 
 1. rejects calls before initialization;
-2. acquires the task lock;
+2. acquires the task lock through its per-acquisition `IrqSpinLock` guard;
 3. finds a finished slot above `idle_index`, or appends a new slot if
    `task_count < max_tasks`;
 4. builds an initial interrupt frame at the top of the caller-owned stack with
@@ -89,18 +89,26 @@ original state. New tasks and the idle task inherit this clean template.
 
 `initialFrame` requires at least 512 bytes of stack and at least 256 bytes below
 the aligned top. It sets the entry stack pointer to 8 bytes below the aligned
-top, leaving an 8-byte slot, then builds an `initial_frame_qwords` frame
+top, then builds an `initial_frame_qwords` frame
 (`15 saved registers + 2 vector/error + 5 iret qwords = 22` qwords):
 
 - the 15 register slots are zeroed;
 - `frame[17]` is the entry address (RIP);
 - `frame[18]` is the kernel code selector;
 - `frame[19]` is `0x202` (interrupts enabled);
-- `frame[20]` is the aligned entry stack pointer;
+- `frame[20]` is the entry stack pointer;
 - `frame[21]` is the kernel data selector.
 
 The normal `isr_common` epilogue can therefore enter the task with `iretq`
 without a separate task-start trampoline.
+
+The 8-byte slot at the entry stack pointer is initialized to the address of
+`taskReturn`, a naked trampoline that executes `int $49` (the scheduler exit
+vector). A task entry that returns instead of calling `sched.exit()` therefore
+exits cleanly instead of `ret`-ing into uninitialized stack memory. The
+trampoline starts with `RSP % 16 == 0` rather than the usual callee alignment,
+so it is assembly-only and does not call Zig code before entering the
+scheduler.
 
 ### Slot reuse
 
