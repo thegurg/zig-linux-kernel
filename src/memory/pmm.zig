@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const limine = @import("../limine.zig");
+const sync = @import("../sync.zig");
 
 pub const page_size: u64 = 4096;
 
@@ -31,6 +32,10 @@ var total_pages: usize = 0;
 var free_pages: usize = 0;
 var next_hint_word: usize = 0;
 var initialized = false;
+
+/// Serializes bitmap mutation. Allocation and freeing are short, so a single
+/// IRQ-safe spinlock is enough for the current allocator.
+var lock: sync.IrqSpinLock = .{};
 
 pub const InitError = error{
     NoMemoryMap,
@@ -82,6 +87,12 @@ pub fn init() InitError!void {
 pub fn allocPage() ?u64 {
     if (!initialized) return null;
 
+    const guard = lock.acquire();
+    defer guard.release();
+    return allocPageLocked();
+}
+
+fn allocPageLocked() ?u64 {
     var scanned: usize = 0;
     while (scanned < bitmap_words) : (scanned += 1) {
         const word = (next_hint_word + scanned) % bitmap_words;
@@ -105,6 +116,13 @@ pub fn allocPage() ?u64 {
 
 pub fn freePage(address: u64) bool {
     if (!initialized) return false;
+
+    const guard = lock.acquire();
+    defer guard.release();
+    return freePageLocked(address);
+}
+
+fn freePageLocked(address: u64) bool {
     if (address % page_size != 0) return false;
 
     const page64 = address / page_size;
@@ -128,6 +146,8 @@ pub fn freePage(address: u64) bool {
 }
 
 pub fn stats() Stats {
+    const guard = lock.acquire();
+    defer guard.release();
     return .{
         .total_pages = total_pages,
         .free_pages = free_pages,
@@ -136,11 +156,11 @@ pub fn stats() Stats {
 }
 
 pub fn totalBytes() u64 {
-    return @as(u64, @intCast(total_pages)) * page_size;
+    return @as(u64, @intCast(stats().total_pages)) * page_size;
 }
 
 pub fn freeBytes() u64 {
-    return @as(u64, @intCast(free_pages)) * page_size;
+    return @as(u64, @intCast(stats().free_pages)) * page_size;
 }
 
 fn markFree(page: usize) void {

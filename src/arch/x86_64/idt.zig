@@ -10,6 +10,7 @@ const console = @import("../../console.zig");
 const sched = @import("../../sched.zig");
 const gdt = @import("gdt.zig");
 const pic = @import("pic.zig");
+const lapic = @import("lapic.zig");
 const qemu = @import("qemu.zig");
 
 const gate_count = 256;
@@ -23,6 +24,7 @@ var idtr: [10]u8 align(8) = @splat(0);
 extern const isr_stub_table: [32]u64;
 extern const irq_stub_table: [16]u64;
 extern const sched_stub_table: [6]u64;
+extern const ipi_stub_table: [3]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
 /// In long mode the CPU pushes a full five-qword frame (RIP, CS, RFLAGS, RSP,
@@ -84,6 +86,10 @@ pub fn init() void {
         setGate(@as(usize, sched.yield_vector) + index, sched_stub_table[index], 0);
     }
 
+    setGate(sched.reschedule_vector, ipi_stub_table[0], 0);
+    setGate(sched.tlb_vector, ipi_stub_table[1], 0);
+    setGate(255, ipi_stub_table[2], 0); // LAPIC spurious
+
     idtr = @splat(0);
     std.mem.writeInt(u16, idtr[0..2], @sizeOf(@TypeOf(idt)) - 1, .little);
     std.mem.writeInt(u64, idtr[2..10], @intFromPtr(&idt), .little);
@@ -123,9 +129,24 @@ fn setGate(vector: usize, handler: u64, ist: u8) void {
 export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
     const vector: u8 = @intCast(frame.vector & 0xff);
 
+    if (vector == sched.reschedule_vector) {
+        lapic.eoi();
+        return sched.rescheduleInterrupt(saved_rsp);
+    }
+    if (vector == sched.tlb_vector) {
+        lapic.eoi();
+        sched.tlbInterrupt();
+        return saved_rsp;
+    }
+    if (vector == 255) {
+        // LAPIC spurious interrupt: it must be ignored and needs no EOI.
+        return saved_rsp;
+    }
+
     if (vector >= 32 and vector < 48) {
         const irq = vector - 32;
         pic.sendEoi(irq);
+        lapic.eoi();
         if (irq == 0) return sched.tick(saved_rsp);
         return saved_rsp;
     }

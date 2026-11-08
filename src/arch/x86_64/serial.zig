@@ -1,8 +1,13 @@
 //! COM1 serial port (16550 UART). Used for early boot logs and QEMU tests.
 
 const port = @import("port.zig");
+const sync = @import("../../sync.zig");
 
 const com1: u16 = 0x3f8;
+
+/// Serializes complete message writes across CPUs. `writeByte` itself stays
+/// unlocked; only the public whole-message entry points take the lock.
+var lock: sync.IrqSpinLock = .{};
 
 pub fn init() void {
     port.outb(com1 + 1, 0x00); // disable interrupts
@@ -27,6 +32,8 @@ pub fn writeByte(byte: u8) void {
 }
 
 pub fn write(bytes: []const u8) void {
+    const guard = lock.acquire();
+    defer guard.release();
     for (bytes) |byte| {
         if (byte == '\n') writeByte('\r');
         writeByte(byte);
@@ -34,6 +41,8 @@ pub fn write(bytes: []const u8) void {
 }
 
 pub fn writeHex(value: u64) void {
+    const guard = lock.acquire();
+    defer guard.release();
     const digits = "0123456789abcdef";
     var started = false;
     var shift: u6 = 60;

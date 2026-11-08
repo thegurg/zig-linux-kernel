@@ -14,6 +14,7 @@
 const std = @import("std");
 const limine = @import("../limine.zig");
 const pmm = @import("pmm.zig");
+const sync = @import("../sync.zig");
 
 pub const page_size: u64 = 4096;
 pub const huge_page_size: u64 = 2 * 1024 * 1024;
@@ -73,6 +74,20 @@ var kernel_phys_base: u64 = 0;
 var kernel_virt_base: u64 = 0;
 var kernel_bytes: u64 = 0;
 var initialized = false;
+
+/// Serializes page-table mutation once the APs can touch the VMM. The lock is
+/// not taken during `init`, because the tables are still private to the BSP.
+var table_lock: sync.IrqSpinLock = .{};
+
+/// Called after a mapping is removed so the scheduler can invalidate remote
+/// TLBs. The hook is invoked after `table_lock` is released, so a remote CPU
+/// spinning on the VMM lock can still take the shootdown IPI.
+pub const TlbShootdownFn = *const fn (virt: u64) void;
+var tlb_shootdown_handler: ?TlbShootdownFn = null;
+
+pub fn setTlbShootdownHandler(handler: TlbShootdownFn) void {
+    tlb_shootdown_handler = handler;
+}
 
 pub fn init() InitError!void {
     if (initialized) return;
@@ -159,6 +174,14 @@ pub fn kernelPhysical(virt: u64) ?u64 {
 }
 
 pub fn mapPage(virt: u64, phys: u64, flags: u64) bool {
+    if (!initialized) return mapPageLocked(virt, phys, flags);
+
+    const guard = table_lock.acquire();
+    defer guard.release();
+    return mapPageLocked(virt, phys, flags);
+}
+
+fn mapPageLocked(virt: u64, phys: u64, flags: u64) bool {
     if (pml4_phys == 0) return false;
     if (virt % page_size != 0 or phys % page_size != 0) return false;
     if ((phys & ~address_mask) != 0) return false;
@@ -185,6 +208,22 @@ pub fn mapPage(virt: u64, phys: u64, flags: u64) bool {
 }
 
 pub fn unmapPage(virt: u64) bool {
+    var removed = false;
+    if (initialized) {
+        const guard = table_lock.acquire();
+        removed = unmapPageLocked(virt);
+        guard.release();
+    } else {
+        removed = unmapPageLocked(virt);
+    }
+
+    if (removed) {
+        if (tlb_shootdown_handler) |handler| handler(virt);
+    }
+    return removed;
+}
+
+fn unmapPageLocked(virt: u64) bool {
     if (pml4_phys == 0 or virt % page_size != 0) return false;
 
     const pml4 = tableAt(pml4_phys);
@@ -273,6 +312,54 @@ fn mapKernelRange(start: u64, end: u64, flags: u64) bool {
         const phys = kernel_phys_base + (virt - kernel_virt_base);
         if (!mapPage(virt, phys, flags)) return false;
     }
+    return true;
+}
+
+/// Mark the 2 MiB HHDM chunk(s) covering `[phys, phys + size)` uncached.
+///
+/// The HHDM is built from 2 MiB pages, so the whole chunk containing the LAPIC
+/// window is marked with PCD. This is only called while the mapping is still
+/// local to the bootstrap processor (LAPIC init), but it also handles already
+/// split page tables for completeness.
+pub fn markUncached(phys: u64, size: u64) bool {
+    if (pml4_phys == 0 or size == 0) return false;
+    if (phys >= pmm.max_physical_address) return false;
+
+    const first = std.mem.alignBackward(u64, phys, huge_page_size);
+    const last = std.mem.alignForward(u64, phys +| size, huge_page_size);
+    var changed = false;
+
+    var chunk = first;
+    while (chunk < last and chunk < pmm.max_physical_address) : (chunk += huge_page_size) {
+        const virt = hhdm_offset + chunk;
+        const pml4 = tableAt(pml4_phys);
+        const pml4e = pml4[pml4Index(virt)];
+        if ((pml4e & present) == 0) continue;
+
+        const pdpt = tableAt(pml4e & address_mask);
+        const pdpte = pdpt[pdptIndex(virt)];
+        if ((pdpte & present) == 0 or (pdpte & huge) != 0) continue;
+
+        const pd = tableAt(pdpte & address_mask);
+        const pde = &pd[pdIndex(virt)];
+        if ((pde.* & present) == 0) continue;
+
+        if ((pde.* & huge) != 0) {
+            pde.* |= cache_disable;
+            changed = true;
+            continue;
+        }
+
+        const pt = tableAt(pde.* & address_mask);
+        for (pt[0..]) |*pte| {
+            if ((pte.* & present) != 0) {
+                pte.* |= cache_disable;
+                changed = true;
+            }
+        }
+    }
+
+    if (changed and initialized) invlpg(hhdm_offset + phys);
     return true;
 }
 

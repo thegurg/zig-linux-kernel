@@ -1,27 +1,31 @@
-//! Round-robin kernel task scheduler: preemption, cooperative yield/exit,
-//! timer-based sleep, explicit block/wake, wait queues, mutexes, condition
-//! variables, an idle task, and slot reuse.
+//! Per-CPU round-robin kernel task scheduler.
 //!
-//! `tasks[0]` is the boot context and `tasks[1]` is the idle task. User tasks
-//! use caller-owned kernel stacks. IRQ0 calls `tick`; `int $48` calls
-//! `yieldCurrent`; `int $49` calls `exitCurrent`; `int $50` calls
-//! `sleepCurrent`; `int $51` calls `blockCurrent`; `int $52` calls
-//! `waitQueueCurrent`; `int $53` calls `waitTimeoutCurrent`. All return the
-//! saved-register base that the assembly epilogue should resume.
+//! CPU 0 is the bootstrap processor; every CPU owns a `CpuState` with its
+//! current task, idle task, and pending sleep/wait request. Tasks are assigned
+//! to a CPU at creation time and run only on that CPU. A single global
+//! `task_lock` protects the task table, wait queues, and scheduling decisions;
+//! it never covers task execution, so CPUs run tasks in parallel.
 //!
-//! Every GPR is saved (see `interrupts.S`). x87/SSE state is saved with
-//! `fxsave64` on interrupt entry and restored with `fxrstor64` just before
-//! `iretq`; `current_fpu_state` points at the active task's 512-byte area and
-//! `switchTask` updates it whenever the scheduler changes tasks.
+//! IRQ0 on the bootstrap processor increments the global tick counter and
+//! wakes timed sleepers on every CPU. Cross-CPU wakeups use LAPIC IPIs:
+//! `reschedule_vector` (240) makes the target CPU re-evaluate its run queue and
+//! `tlb_vector` (241) invalidates a page that another CPU just unmapped.
 //!
-//! The scheduler still runs only on the bootstrap processor. Its task lock is
-//! an IRQ-safe atomic spinlock, but per-CPU run queues and cross-CPU wakeups
-//! are not implemented yet.
+//! The interrupt entry stub saves x87/SSE state to the address in `%gs:0`. The
+//! scheduler updates that per-CPU pointer in `switchTaskLocked`, so no global
+//! FPU pointer is shared between CPUs.
 
 const gdt = @import("arch/x86_64/gdt.zig");
+const cpu = @import("arch/x86_64/cpu.zig");
+const lapic = @import("arch/x86_64/lapic.zig");
 const sync = @import("sync.zig");
 
-pub const max_tasks = 8;
+pub const max_tasks = 32;
+pub const max_cpus = cpu.max_cpus;
+
+pub const reschedule_vector: u8 = 240;
+pub const tlb_vector: u8 = 241;
+
 pub const yield_vector: u8 = 48;
 pub const exit_vector: u8 = 49;
 pub const sleep_vector: u8 = 50;
@@ -29,8 +33,6 @@ pub const block_vector: u8 = 51;
 pub const wait_vector: u8 = 52;
 pub const wait_timeout_vector: u8 = 53;
 
-/// Task entry point. Entries normally call `sched.exit()` themselves; one that
-/// returns anyway lands in `taskReturn`, which exits through the scheduler.
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
@@ -47,30 +49,51 @@ pub const Task = struct {
     fpu_state: FpuState align(16),
     id: u32,
     index: usize,
+    cpu: u32,
+    is_idle: bool,
+};
+
+const WaitTimeoutRequest = struct {
+    queue: *WaitQueue,
+    ticks: u64,
+};
+
+const CpuState = struct {
+    current: ?*Task = null,
+    idle: ?*Task = null,
+    next_scan: usize = 0,
+    sleep_request: u64 = 0,
+    wait_request: ?*WaitQueue = null,
+    wait_timeout_request: ?WaitTimeoutRequest = null,
 };
 
 pub const WaitQueue = struct {
     waiters: [max_tasks]u32 = @splat(0),
     count: usize = 0,
 
+    /// Block the current task on this queue. The queue insertion and the
+    /// transition to `blocked` happen atomically in `waitQueueCurrent`.
     pub fn wait(self: *WaitQueue) void {
         const flags = sync.irqSave();
         asm volatile ("cli");
-        wait_request = self;
+        cpu_state[cpu.currentIndex()].wait_request = self;
         asm volatile ("int $52" ::: .{ .memory = true });
         sync.irqRestore(flags);
     }
 
+    /// Block until signalled or until `duration` ticks have elapsed. Returns
+    /// true only for a signal; a timeout returns false.
     pub fn waitTimeout(self: *WaitQueue, duration: u64) bool {
         if (duration == 0) return false;
 
         const flags = sync.irqSave();
         asm volatile ("cli");
-        if (current) |task| task.wake_reason = .none;
-        wait_timeout_request = .{ .queue = self, .ticks = duration };
+        const index = cpu.currentIndex();
+        if (cpu_state[index].current) |task| task.wake_reason = .none;
+        cpu_state[index].wait_timeout_request = .{ .queue = self, .ticks = duration };
         asm volatile ("int $53" ::: .{ .memory = true });
 
-        const current_task = current orelse {
+        const current_task = cpu_state[index].current orelse {
             sync.irqRestore(flags);
             return false;
         };
@@ -91,9 +114,10 @@ pub const WaitQueue = struct {
         return self.wakeAllLocked();
     }
 
-    // These helpers require interrupts to be disabled on the single CPU.
+    // The helpers below require `task_lock` (which also disables interrupts on
+    // the calling CPU).
     fn enqueueCurrentLocked(self: *WaitQueue) bool {
-        const current_task = current orelse return false;
+        const current_task = currentTask() orelse return false;
         self.compactLocked();
         if (self.count >= self.waiters.len) return false;
         self.waiters[self.count] = current_task.id;
@@ -145,20 +169,23 @@ pub const WaitQueue = struct {
     }
 };
 
-/// Single-CPU blocking mutex. Ownership is transferred directly to a waiter on
-/// unlock, and the waiter resumes from `lock` already owning the mutex. It is
-/// not reentrant and cannot be used by the idle task.
+/// Blocking mutex. Ownership is transferred directly to a waiter on unlock,
+/// and the waiter resumes from `lock` already owning the mutex.
 pub const Mutex = struct {
     locked: bool = false,
     owner: ?*Task = null,
     waiters: WaitQueue = .{},
 
     pub fn lock(self: *Mutex) void {
+        // Keep interrupts disabled across the enqueue-and-block sequence so a
+        // preemptive reschedule cannot run between the two steps.
         const flags = sync.irqSave();
         asm volatile ("cli");
+        const guard = task_lock.acquire();
 
-        const current_task = current orelse {
+        const current_task = currentTask() orelse {
             self.locked = true;
+            guard.release();
             sync.irqRestore(flags);
             return;
         };
@@ -166,30 +193,30 @@ pub const Mutex = struct {
         if (!self.locked) {
             self.locked = true;
             self.owner = current_task;
+            guard.release();
             sync.irqRestore(flags);
             return;
         }
 
-        // The idle task cannot block; it never contends for mutexes.
-        if (current_task.index == idle_index) {
+        if (current_task.is_idle or !self.waiters.enqueueCurrentLocked()) {
+            guard.release();
             sync.irqRestore(flags);
             return;
         }
 
-        if (!self.waiters.enqueueCurrentLocked()) {
-            sync.irqRestore(flags);
-            return;
-        }
+        // Mark the task blocked before releasing the scheduler lock: another
+        // CPU's unlock can now wake it without losing the wakeup. The block
+        // handler notices the pre-marked state and only switches stacks.
+        blockCurrentLocked(current_task, ~@as(u64, 0));
+        guard.release();
         asm volatile ("int $51" ::: .{ .memory = true });
-        // `unlockLocked` transferred ownership before waking this task.
         sync.irqRestore(flags);
     }
 
     pub fn unlock(self: *Mutex) void {
-        const flags = sync.irqSave();
-        asm volatile ("cli");
+        const guard = task_lock.acquire();
+        defer guard.release();
         self.unlockLocked();
-        sync.irqRestore(flags);
     }
 
     fn unlockLocked(self: *Mutex) void {
@@ -204,51 +231,46 @@ pub const Mutex = struct {
 };
 
 /// Condition variable used with `Mutex`. Predicates must be changed and
-/// signalled while the associated mutex is held so that a waiter cannot lose a
-/// wakeup between its predicate check and `wait`.
+/// signalled while the associated mutex is held.
 pub const Condition = struct {
     waiters: WaitQueue = .{},
 
     pub fn wait(self: *Condition, mutex: *Mutex) void {
         const flags = sync.irqSave();
         asm volatile ("cli");
+        const guard = task_lock.acquire();
 
-        const current_task = current orelse {
+        const current_task = currentTask() orelse {
+            guard.release();
             sync.irqRestore(flags);
             return;
         };
-        if (current_task.index == idle_index) {
-            sync.irqRestore(flags);
-            return;
-        }
-        if (!self.waiters.enqueueCurrentLocked()) {
+        if (current_task.is_idle or !self.waiters.enqueueCurrentLocked()) {
+            guard.release();
             sync.irqRestore(flags);
             return;
         }
 
-        // Enqueueing and releasing the mutex are atomic with respect to a
-        // signaller, which must hold the same mutex while changing the
-        // predicate.
+        // Enqueue, pre-mark blocked, and release the mutex under the same
+        // scheduler lock so no signaller can run ahead of the enqueue.
+        blockCurrentLocked(current_task, ~@as(u64, 0));
         mutex.unlockLocked();
+        guard.release();
         asm volatile ("int $51" ::: .{ .memory = true });
         sync.irqRestore(flags);
         mutex.lock();
     }
 
     pub fn signal(self: *Condition) bool {
-        const flags = sync.irqSave();
-        asm volatile ("cli");
-        const woke = self.waiters.wakeOneTaskLocked() != null;
-        sync.irqRestore(flags);
-        return woke;
+        const guard = task_lock.acquire();
+        defer guard.release();
+        return self.waiters.wakeOneTaskLocked() != null;
     }
 
     pub fn broadcast(self: *Condition) usize {
-        const flags = sync.irqSave();
-        asm volatile ("cli");
-        const woken = self.waiters.wakeAllLocked();
-        sync.irqRestore(flags);
-        return woken;
+        const guard = task_lock.acquire();
+        defer guard.release();
+        return self.waiters.wakeAllLocked();
     }
 };
 
@@ -259,41 +281,62 @@ pub const Stats = struct {
     blocked: u64,
     current_id: u32,
     enabled: bool,
+    online_cpus: u64,
 };
 
 const saved_registers = 15;
 const iret_frame_qwords = 5;
 const initial_frame_qwords = saved_registers + 2 + iret_frame_qwords;
-const idle_index: usize = 1;
+const idle_stack_size = 8 * 1024;
 
 var tasks: [max_tasks]Task = undefined;
 var task_count: usize = 0;
-var current: ?*Task = null;
 var tick_counter: u64 = 0;
 var finished_counter: u64 = 0;
 var blocked_counter: u64 = 0;
-var sleep_request: u64 = 0;
-var wait_request: ?*WaitQueue = null;
-const WaitTimeoutRequest = struct {
-    queue: *WaitQueue,
-    ticks: u64,
-};
-var wait_timeout_request: ?WaitTimeoutRequest = null;
 var next_id: u32 = 0;
 var enabled = false;
 var initialized = false;
 
-var fpu_template: FpuState align(16) = @splat(0);
-pub export var current_fpu_state: u64 = 0;
+var cpu_state: [max_cpus]CpuState = @splat(.{});
+var idle_stacks: [max_cpus][idle_stack_size]u8 align(16) = undefined;
 
-var idle_stack: [8 * 1024]u8 align(16) = undefined;
+var fpu_template: FpuState align(16) = @splat(0);
+
 var task_lock: sync.IrqSpinLock = .{};
+
+/// Bit N is set once CPU N has reached its scheduler idle loop.
+var online_mask: u64 = 0;
+
+/// Serializes TLB shootdown requests. This is a plain spinlock, not an
+/// IRQ-safe lock: a CPU waiting for it must still be able to take the remote
+/// shootdown IPI that the holder is waiting for. The caller may already have
+/// interrupts disabled, in which case only its own acknowledgements matter.
+var tlb_lock: sync.SpinLock = .{};
+var tlb_virt: u64 = 0;
+var tlb_acks: u64 = 0;
+var tlb_requests: u64 = 0;
+var reschedule_count: u64 = 0;
+
+extern fn sched_resume(rsp: u64) callconv(.c) noreturn;
 
 pub fn init() void {
     const guard = task_lock.acquire();
     defer guard.release();
 
     initFpuTemplate();
+
+    task_count = 0;
+    tick_counter = 0;
+    finished_counter = 0;
+    blocked_counter = 0;
+    next_id = 2;
+    enabled = true;
+    initialized = true;
+    cpu_state = @splat(.{});
+    online_mask = 0;
+    tlb_acks = 0;
+    tlb_requests = 0;
 
     tasks[0] = .{
         .name = "boot",
@@ -305,40 +348,34 @@ pub fn init() void {
         .fpu_state = fpu_template,
         .id = 0,
         .index = 0,
+        .cpu = 0,
+        .is_idle = false,
     };
-    const idle_rsp = initialFrame(idle_stack[0..], idleEntry) orelse unreachable;
-    tasks[idle_index] = .{
-        .name = "idle",
-        .rsp = idle_rsp,
-        .state = .idle,
-        .ticks = 0,
-        .wake_tick = 0,
-        .wake_reason = .none,
-        .fpu_state = fpu_template,
-        .id = 1,
-        .index = idle_index,
-    };
-    task_count = idle_index + 1;
-    current = &tasks[0];
-    current_fpu_state = @intFromPtr(&tasks[0].fpu_state);
-    tick_counter = 0;
-    finished_counter = 0;
-    blocked_counter = 0;
-    sleep_request = 0;
-    wait_request = null;
-    wait_timeout_request = null;
-    next_id = 2;
-    enabled = true;
-    initialized = true;
+    task_count = 1;
+    cpu_state[0] = .{ .current = &tasks[0] };
+    _ = @atomicRmw(u64, &online_mask, .Or, 1, .release);
+
+    _ = ensureIdleLocked(0) orelse unreachable;
+    cpu_state[0].next_scan = 1;
+    cpu.setFpuState(@intFromPtr(&tasks[0].fpu_state));
 }
 
 pub fn create(name: []const u8, entry: Entry, stack: []u8) ?*Task {
-    if (!initialized) return null;
+    return createOn(cpu.currentIndex(), name, entry, stack);
+}
+
+/// Create a task pinned to `target_cpu`. A remote target receives a
+/// reschedule IPI so it enters its run queue promptly.
+pub fn createOn(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*Task {
+    if (!initialized or target_cpu >= max_cpus) return null;
 
     const guard = task_lock.acquire();
     defer guard.release();
+    return createLocked(target_cpu, name, entry, stack);
+}
 
-    const index = findSlot() orelse return null;
+fn createLocked(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*Task {
+    const index = findSlotLocked() orelse return null;
     const rsp = initialFrame(stack, entry) orelse return null;
     const id = next_id;
     next_id +%= 1;
@@ -346,95 +383,179 @@ pub fn create(name: []const u8, entry: Entry, stack: []u8) ?*Task {
     tasks[index] = .{
         .name = name,
         .rsp = rsp,
-        .state = .finished,
+        .state = .ready,
         .ticks = 0,
         .wake_tick = 0,
         .wake_reason = .none,
         .fpu_state = fpu_template,
         .id = id,
         .index = index,
+        .cpu = target_cpu,
+        .is_idle = false,
     };
     if (index == task_count) task_count += 1;
-    tasks[index].state = .ready;
+
+    if (target_cpu != cpu.currentIndex()) sendRescheduleLocked(target_cpu);
     return &tasks[index];
 }
 
+/// Install scheduler state for an application processor and mark it online.
+/// The caller then invokes `enterScheduler`, which switches to the idle frame.
+pub fn initCpu(index: u32, lapic_id: u32) bool {
+    _ = lapic_id;
+    if (!initialized or index == 0 or index >= max_cpus) return false;
+
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const idle = ensureIdleLocked(index) orelse return false;
+    cpu_state[index].current = idle;
+    cpu_state[index].next_scan = idle.index;
+    idle.state = .running;
+    _ = @atomicRmw(u64, &online_mask, .Or, @as(u64, 1) << @intCast(index), .release);
+    cpu.setFpuState(@intFromPtr(&idle.fpu_state));
+    return true;
+}
+
+/// Leave the AP's boot stack and resume the idle task's initial frame. Called
+/// with interrupts disabled; the idle frame enables them on `iretq`.
+pub fn enterScheduler() noreturn {
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    const state = &cpu_state[index];
+    const idle = state.idle orelse {
+        guard.release();
+        haltForever();
+    };
+    state.current = idle;
+    idle.state = .running;
+    const rsp = idle.rsp;
+    cpu.setFpuState(@intFromPtr(&idle.fpu_state));
+    guard.release();
+    sched_resume(rsp);
+}
+
 pub fn tick(saved_rsp: u64) u64 {
-    const counter: *volatile u64 = &tick_counter;
-    counter.* +%= 1;
+    _ = @atomicRmw(u64, &tick_counter, .Add, 1, .monotonic);
     if (!initialized) return saved_rsp;
 
-    wakeBlocked();
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
 
-    const current_task = current orelse return saved_rsp;
+    const now = @atomicLoad(u64, &tick_counter, .monotonic);
+    wakeBlockedLocked(now);
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
     current_task.rsp = saved_rsp;
     current_task.ticks +%= 1;
     if (!enabled) return saved_rsp;
 
-    const next = nextOtherReady(current_task.index) orelse return saved_rsp;
-    park(current_task);
-    return switchTask(next);
+    if (current_task.state == .ready) current_task.state = .running;
+    if (current_task.state != .running) return saved_rsp;
+
+    if (pickNextLocked(index)) |next| {
+        if (current_task.is_idle) {
+            current_task.state = .idle;
+        } else {
+            current_task.state = .ready;
+        }
+        return switchTaskLocked(index, next);
+    }
+    return saved_rsp;
+}
+
+/// IPI handler: another CPU queued a task for this one, or a blocked task was
+/// made ready. Re-evaluate the run queue without advancing the tick counter.
+pub fn rescheduleInterrupt(saved_rsp: u64) u64 {
+    if (!initialized) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    _ = @atomicRmw(u64, &reschedule_count, .Add, 1, .monotonic);
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.state == .ready) current_task.state = .running;
+    current_task.rsp = saved_rsp;
+    if (!enabled) return saved_rsp;
+
+    if (pickNextLocked(index)) |next| {
+        if (current_task.is_idle) {
+            current_task.state = .idle;
+        } else {
+            current_task.state = .ready;
+        }
+        return switchTaskLocked(index, next);
+    }
+    return saved_rsp;
 }
 
 pub fn yieldCurrent(saved_rsp: u64) u64 {
     if (!initialized) return saved_rsp;
-    const current_task = current orelse return saved_rsp;
-    current_task.rsp = saved_rsp;
 
-    const next = nextOtherReady(current_task.index) orelse return saved_rsp;
-    park(current_task);
-    return switchTask(next);
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle) return saved_rsp;
+    if (current_task.state == .ready) current_task.state = .running;
+    current_task.rsp = saved_rsp;
+    if (!enabled) return saved_rsp;
+
+    if (pickNextLocked(index)) |next| {
+        current_task.state = .ready;
+        return switchTaskLocked(index, next);
+    }
+    return saved_rsp;
 }
 
 pub fn exitCurrent(saved_rsp: u64) u64 {
     if (!initialized) return saved_rsp;
-    const current_task = current orelse return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
     current_task.rsp = saved_rsp;
+    if (current_task.is_idle) haltForever();
+
     current_task.state = .finished;
-    const counter: *volatile u64 = &finished_counter;
-    counter.* +%= 1;
+    _ = @atomicRmw(u64, &finished_counter, .Add, 1, .monotonic);
 
-    if (nextOtherReady(current_task.index)) |next| {
-        return switchTask(next);
-    }
-
-    if (current_task.index == idle_index) haltForever();
-    return switchTask(&tasks[idle_index]);
+    if (pickNextLocked(index)) |next| return switchTaskLocked(index, next);
+    const idle = cpu_state[index].idle orelse haltForever();
+    return switchTaskLocked(index, idle);
 }
 
 pub fn sleep(duration: u64) void {
     if (duration == 0) return;
+
     const flags = sync.irqSave();
     asm volatile ("cli");
-    sleep_request = duration;
+    cpu_state[cpu.currentIndex()].sleep_request = duration;
     asm volatile ("int $50" ::: .{ .memory = true });
     sync.irqRestore(flags);
 }
 
 pub fn sleepCurrent(saved_rsp: u64) u64 {
     if (!initialized) return saved_rsp;
-    if (!enabled) {
-        sleep_request = 0;
-        return saved_rsp;
-    }
-    const current_task = current orelse return saved_rsp;
-    if (current_task.index == idle_index) return saved_rsp;
 
-    const duration = sleep_request;
-    sleep_request = 0;
-    if (duration == 0) return saved_rsp;
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    const duration = cpu_state[index].sleep_request;
+    cpu_state[index].sleep_request = 0;
+    if (current_task.is_idle or duration == 0 or !enabled) return saved_rsp;
 
     current_task.rsp = saved_rsp;
-    current_task.state = .blocked;
-    current_task.wake_tick = tick_counter +% duration;
-    current_task.wake_reason = .none;
-    const blocked: *volatile u64 = &blocked_counter;
-    blocked.* +%= 1;
-
-    if (nextOtherReady(current_task.index)) |next| {
-        return switchTask(next);
-    }
-    return switchTask(&tasks[idle_index]);
+    const now = @atomicLoad(u64, &tick_counter, .monotonic);
+    blockCurrentLocked(current_task, now +% duration);
+    return switchBlockedLocked(index, current_task);
 }
 
 pub fn block() void {
@@ -446,45 +567,63 @@ pub fn block() void {
 
 pub fn blockCurrent(saved_rsp: u64) u64 {
     if (!initialized) return saved_rsp;
-    if (!enabled) return saved_rsp;
-    const current_task = current orelse return saved_rsp;
-    if (current_task.index == idle_index) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle or !enabled) return saved_rsp;
+
+    // A remote wake may have marked us ready between enqueueing and entering
+    // this handler. In that case the wakeup must not be lost.
+    if (current_task.state == .ready) {
+        current_task.state = .running;
+        return saved_rsp;
+    }
+    if (current_task.state != .blocked) {
+        blockCurrentLocked(current_task, ~@as(u64, 0));
+    }
 
     current_task.rsp = saved_rsp;
-    current_task.state = .blocked;
-    current_task.wake_tick = ~@as(u64, 0);
-    current_task.wake_reason = .none;
-    const blocked: *volatile u64 = &blocked_counter;
-    blocked.* +%= 1;
-
-    if (nextOtherReady(current_task.index)) |next| {
-        return switchTask(next);
-    }
-    return switchTask(&tasks[idle_index]);
+    return switchBlockedLocked(index, current_task);
 }
 
 pub fn waitQueueCurrent(saved_rsp: u64) u64 {
-    const queue = wait_request orelse return saved_rsp;
-    wait_request = null;
     if (!initialized) return saved_rsp;
-    if (!enabled) return saved_rsp;
-    const current_task = current orelse return saved_rsp;
-    if (current_task.index == idle_index) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const queue = cpu_state[index].wait_request orelse return saved_rsp;
+    cpu_state[index].wait_request = null;
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle or !enabled) return saved_rsp;
 
     queue.compactLocked();
     if (queue.count >= queue.waiters.len) return saved_rsp;
     queue.waiters[queue.count] = current_task.id;
     queue.count += 1;
-    return blockCurrent(saved_rsp);
+
+    if (current_task.state != .blocked) blockCurrentLocked(current_task, ~@as(u64, 0));
+    current_task.rsp = saved_rsp;
+    return switchBlockedLocked(index, current_task);
 }
 
 pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
-    const request = wait_timeout_request orelse return saved_rsp;
-    wait_timeout_request = null;
     if (!initialized) return saved_rsp;
-    if (!enabled) return saved_rsp;
-    const current_task = current orelse return saved_rsp;
-    if (current_task.index == idle_index) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const request = cpu_state[index].wait_timeout_request orelse return saved_rsp;
+    cpu_state[index].wait_timeout_request = null;
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle or !enabled) return saved_rsp;
 
     request.queue.compactLocked();
     if (request.queue.count >= request.queue.waiters.len) return saved_rsp;
@@ -492,19 +631,13 @@ pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
     request.queue.count += 1;
 
     current_task.rsp = saved_rsp;
-    current_task.state = .blocked;
-    current_task.wake_tick = tick_counter +% request.ticks;
-    current_task.wake_reason = .none;
-    const blocked: *volatile u64 = &blocked_counter;
-    blocked.* +%= 1;
-
-    if (nextOtherReady(current_task.index)) |next| {
-        return switchTask(next);
-    }
-    return switchTask(&tasks[idle_index]);
+    const now = @atomicLoad(u64, &tick_counter, .monotonic);
+    blockCurrentLocked(current_task, now +% request.ticks);
+    return switchBlockedLocked(index, current_task);
 }
 
 pub fn wake(task: *Task) bool {
+    if (!initialized) return false;
     const guard = task_lock.acquire();
     defer guard.release();
     return wakeLocked(task, .signal);
@@ -514,8 +647,8 @@ fn wakeLocked(task: *Task, reason: WakeReason) bool {
     if (task.state != .blocked) return false;
     task.state = .ready;
     task.wake_reason = reason;
-    const blocked: *volatile u64 = &blocked_counter;
-    blocked.* -%= 1;
+    _ = @atomicRmw(u64, &blocked_counter, .Sub, 1, .monotonic);
+    if (task.cpu != cpu.currentIndex()) sendRescheduleLocked(task.cpu);
     return true;
 }
 
@@ -534,51 +667,174 @@ pub fn stop() void {
     enabled = false;
 }
 
+pub fn resumeScheduling() void {
+    const guard = task_lock.acquire();
+    defer guard.release();
+    enabled = true;
+}
+
 pub fn ticks() u64 {
-    const counter: *const volatile u64 = &tick_counter;
-    return counter.*;
+    return @atomicLoad(u64, &tick_counter, .monotonic);
 }
 
 pub fn finishedCount() u64 {
-    const counter: *const volatile u64 = &finished_counter;
-    return counter.*;
+    return @atomicLoad(u64, &finished_counter, .monotonic);
 }
 
 pub fn blockedCount() u64 {
-    const counter: *const volatile u64 = &blocked_counter;
-    return counter.*;
+    return @atomicLoad(u64, &blocked_counter, .monotonic);
+}
+
+pub fn onlineCount() u64 {
+    return @popCount(@atomicLoad(u64, &online_mask, .acquire));
+}
+
+pub fn tlbShootdownCount() u64 {
+    return @atomicLoad(u64, &tlb_requests, .monotonic);
+}
+
+pub fn rescheduleCount() u64 {
+    return @atomicLoad(u64, &reschedule_count, .monotonic);
 }
 
 pub fn stats() Stats {
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
     return .{
         .ticks = ticks(),
         .tasks = task_count,
         .finished = finishedCount(),
         .blocked = blockedCount(),
-        .current_id = if (current) |task| task.id else 0,
+        .current_id = if (cpu_state[index].current) |task| task.id else 0,
         .enabled = enabled,
+        .online_cpus = @popCount(@atomicLoad(u64, &online_mask, .acquire)),
     };
 }
 
-fn wakeBlocked() void {
-    var index: usize = 0;
-    while (index < task_count) : (index += 1) {
-        if (index == idle_index) continue;
-        const task = &tasks[index];
-        if (task.state == .blocked and tick_counter >= task.wake_tick) {
-            _ = wakeLocked(task, .timeout);
-        }
+/// Invalidate `virt` on every other online CPU. Called by the VMM after
+/// releasing its page-table lock. The local CPU has already executed `invlpg`.
+pub fn shootdownTlb(virt: u64) void {
+    tlb_lock.acquire();
+    defer tlb_lock.release();
+
+    const me: u6 = @intCast(cpu.currentIndex());
+    const targets = @atomicLoad(u64, &online_mask, .acquire) & ~(@as(u64, 1) << me);
+
+    _ = @atomicRmw(u64, &tlb_requests, .Add, 1, .monotonic);
+    if (targets == 0) return;
+
+    @atomicStore(u64, &tlb_virt, virt, .release);
+    @atomicStore(u64, &tlb_acks, 0, .release);
+
+    var index: u32 = 0;
+    while (index < max_cpus) : (index += 1) {
+        if ((targets & (@as(u64, 1) << @intCast(index))) == 0) continue;
+        lapic.sendIpi(cpu.per_cpu[index].lapic_id, tlb_vector);
+    }
+
+    var spin: u64 = 0;
+    while ((@atomicLoad(u64, &tlb_acks, .acquire) & targets) != targets) {
+        if (spin >= 50_000_000) break;
+        spin += 1;
+        asm volatile ("pause");
     }
 }
 
-fn nextOtherReady(start: usize) ?*Task {
-    var offset: usize = 1;
+/// IPI handler: invalidate the page recorded by `shootdownTlb` and acknowledge.
+pub fn tlbInterrupt() void {
+    const me: u6 = @intCast(cpu.currentIndex());
+    const virt = @atomicLoad(u64, &tlb_virt, .acquire);
+    asm volatile ("invlpg (%[virt])"
+        :
+        : [virt] "r" (virt),
+        : .{ .memory = true });
+    _ = @atomicRmw(u64, &tlb_acks, .Or, @as(u64, 1) << me, .release);
+}
+
+fn currentTask() ?*Task {
+    return cpu_state[cpu.currentIndex()].current;
+}
+
+fn blockCurrentLocked(task: *Task, wake_tick: u64) void {
+    task.state = .blocked;
+    task.wake_tick = wake_tick;
+    task.wake_reason = .none;
+    _ = @atomicRmw(u64, &blocked_counter, .Add, 1, .monotonic);
+}
+
+/// Switch away from a task that has just been marked blocked or finished.
+fn switchBlockedLocked(index: u32, task: *Task) u64 {
+    if (tasksBlockedNext(index)) |next| return switchTaskLocked(index, next);
+    const idle = cpu_state[index].idle orelse return task.rsp;
+    if (idle == task) return task.rsp;
+    return switchTaskLocked(index, idle);
+}
+
+fn tasksBlockedNext(index: u32) ?*Task {
+    return pickNextLocked(index);
+}
+
+fn pickNextLocked(index: u32) ?*Task {
+    if (task_count == 0) return null;
+    var start = cpu_state[index].next_scan;
+    if (start >= task_count) start = 0;
+
+    var offset: usize = 0;
     while (offset < task_count) : (offset += 1) {
-        const index = (start + offset) % task_count;
-        const task = &tasks[index];
-        if (task.state == .ready) return task;
+        const slot = (start + offset) % task_count;
+        const task = &tasks[slot];
+        if (task.state == .ready and task.cpu == index and !task.is_idle) {
+            cpu_state[index].next_scan = (slot + 1) % task_count;
+            return task;
+        }
     }
     return null;
+}
+
+fn switchTaskLocked(index: u32, next: *Task) u64 {
+    next.state = .running;
+    cpu_state[index].current = next;
+    cpu.setFpuState(@intFromPtr(&next.fpu_state));
+    return next.rsp;
+}
+
+fn ensureIdleLocked(index: u32) ?*Task {
+    if (cpu_state[index].idle) |idle| return idle;
+
+    const slot = findSlotLocked() orelse return null;
+    const rsp = initialFrame(idle_stacks[index][0..], idleEntry) orelse return null;
+    const id = next_id;
+    next_id +%= 1;
+
+    tasks[slot] = .{
+        .name = "idle",
+        .rsp = rsp,
+        .state = .idle,
+        .ticks = 0,
+        .wake_tick = 0,
+        .wake_reason = .none,
+        .fpu_state = fpu_template,
+        .id = id,
+        .index = slot,
+        .cpu = index,
+        .is_idle = true,
+    };
+    if (slot == task_count) task_count += 1;
+
+    const idle = &tasks[slot];
+    cpu_state[index].idle = idle;
+    return idle;
+}
+
+fn wakeBlockedLocked(now: u64) void {
+    var index: usize = 0;
+    while (index < task_count) : (index += 1) {
+        const task = &tasks[index];
+        if (task.state == .blocked and now >= task.wake_tick) {
+            _ = wakeLocked(task, .timeout);
+        }
+    }
 }
 
 fn findTaskById(id: u32) ?*Task {
@@ -589,8 +845,8 @@ fn findTaskById(id: u32) ?*Task {
     return null;
 }
 
-fn findSlot() ?usize {
-    var index: usize = idle_index + 1;
+fn findSlotLocked() ?usize {
+    var index: usize = 1;
     while (index < task_count) : (index += 1) {
         if (tasks[index].state == .finished) return index;
     }
@@ -598,9 +854,11 @@ fn findSlot() ?usize {
     return null;
 }
 
-fn park(task: *Task) void {
-    if (task.state != .running) return;
-    task.state = if (task.index == idle_index) .idle else .ready;
+fn sendRescheduleLocked(target_cpu: u32) void {
+    if (target_cpu >= max_cpus) return;
+    const bit = @as(u64, 1) << @intCast(target_cpu);
+    if ((@atomicLoad(u64, &online_mask, .acquire) & bit) == 0) return;
+    lapic.sendIpi(cpu.per_cpu[target_cpu].lapic_id, reschedule_vector);
 }
 
 fn idleEntry() callconv(.c) void {
@@ -610,9 +868,7 @@ fn idleEntry() callconv(.c) void {
 }
 
 /// Return trampoline for task entries. Reached by `ret` when an entry returns
-/// instead of calling `sched.exit()`. Unlike a normal callee, it starts with
-/// `RSP % 16 == 0` (the entry consumed its call-frame slot), so it is naked
-/// and enters the scheduler directly instead of calling a Zig function.
+/// instead of calling `sched.exit()`.
 fn taskReturn() callconv(.naked) noreturn {
     asm volatile (
         \\int $49
@@ -626,13 +882,6 @@ fn haltForever() noreturn {
     while (true) {
         asm volatile ("cli; hlt");
     }
-}
-
-fn switchTask(next: *Task) u64 {
-    next.state = .running;
-    current = next;
-    current_fpu_state = @intFromPtr(&next.fpu_state);
-    return next.rsp;
 }
 
 fn initFpuTemplate() void {
@@ -723,8 +972,6 @@ fn initialFrame(stack: []u8, entry: Entry) ?u64 {
     const frame: [*]u64 = @ptrFromInt(base);
     @memset(frame[0..initial_frame_qwords], 0);
 
-    // A C-ABI function expects a return address at its initial RSP. Point it
-    // at the exit trampoline so a returning entry cannot `ret` into garbage.
     const return_slot: *u64 = @ptrFromInt(entry_rsp);
     return_slot.* = @intFromPtr(&taskReturn);
 

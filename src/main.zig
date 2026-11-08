@@ -16,15 +16,17 @@ const vmm = @import("memory/vmm.zig");
 const heap = @import("memory/heap.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
+const lapic = @import("arch/x86_64/lapic.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
 const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const smp = @import("smp.zig");
+const sync = @import("sync.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.13.0-m10";
+pub const version = "0.14.0-m11";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -270,6 +272,10 @@ export fn kmain() callconv(.c) noreturn {
     idt.init();
     pic.remap(0x20, 0x28);
 
+    // Install the per-CPU block early so the interrupt entry path always has a
+    // valid `%gs:0` FPU pointer, even before the scheduler exists.
+    cpu.initPerCpu(0, 0);
+
     if (!limine.baseRevisionSupported()) {
         serial.write("zig-kernel: unsupported Limine base revision: ");
         serial.writeHex(limine.base_revision[2]);
@@ -299,14 +305,22 @@ export fn kmain() callconv(.c) noreturn {
     smp.init() catch |err| {
         console.print("smp: initialization failed: {s}\n", .{@errorName(err)});
     };
+
+    const lapic_ready = lapic.init();
+    if (!lapic_ready) console.write("lapic: initialization failed\n");
+    const bsp_lapic_id = if (lapic_ready) lapic.id() else smp.getStats().bsp_lapic_id;
+    cpu.initPerCpu(0, bsp_lapic_id);
+    sched.init();
+    vmm.setTlbShootdownHandler(&sched.shootdownTlb);
+
     if (smp.getStats().cpus != 0) {
         const smp_stats = smp.getStats();
         console.print("smp: cpus={d}, aps={d}, bsp_lapic_id={d}, x2apic={d}\n", .{
-            smp_stats.cpus, smp_stats.aps, smp_stats.bsp_lapic_id, @intFromBool(smp_stats.x2apic),
+            smp_stats.cpus, smp_stats.aps, smp_stats.bsp_lapic_id, @intFromBool(lapic.isX2apic()),
         });
         if (!build_options.exit_after_boot and smp_stats.aps != 0) {
-            if (smp.start(false) and smp.waitOnline() and smp.waitParked()) {
-                console.print("smp: {d} APs online, parked\n", .{smp.parkedCount()});
+            if (smp.start() and smp.waitOnline()) {
+                console.print("smp: {d} APs online, scheduler idle\n", .{smp.onlineCount()});
             } else {
                 console.write("smp: failed to bring APs online\n");
             }
@@ -438,12 +452,11 @@ export fn kmain() callconv(.c) noreturn {
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M10 checks passed, exiting QEMU\n");
+        serial.write("selftest: M11 checks passed, exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
-    console.print("\nboot: {s} initialized (memory, scheduler, SMP)\n", .{version});
-    sched.init();
+    console.print("\nboot: {s} initialized (memory, per-CPU scheduler, SMP)\n", .{version});
     pit.init(timer_hz);
     pic.unmask(0);
     console.print("timer: PIT {d} Hz, IRQ0 unmasked\n", .{timer_hz});
@@ -668,7 +681,6 @@ fn selftestTimerScheduler() bool {
     task_a_runs = 0;
     task_b_runs = 0;
 
-    sched.init();
     if (sched.stats().tasks != 2) return false; // boot + idle
     if (sched.create("worker-a", workerA, task_a_stack[0..]) == null) return false;
     if (sched.create("worker-b", workerB, task_b_stack[0..]) == null) return false;
@@ -995,21 +1007,85 @@ fn selftestFpu() bool {
 }
 
 fn selftestSmp() bool {
+    const smp_stats = smp.getStats();
+    if (!smp.start()) {
+        console.print("smp: start failed: cpus={d}, aps={d}\n", .{ smp_stats.cpus, smp_stats.aps });
+        return false;
+    }
+    if (!smp.waitOnline()) {
+        console.write("smp: timed out waiting for APs\n");
+        return false;
+    }
+    if (smp_stats.aps != 0) {
+        console.print("smp: {d} APs online for scheduler tests\n", .{smp.onlineCount()});
+    }
+
+    // `stopTimer` disabled scheduling for the earlier BSP-only tests. AP tasks
+    // need the scheduler (and blocking) enabled again.
+    sched.resumeScheduling();
+
     const result = smp.runTest() orelse {
-        const stats = smp.getStats();
         console.print("smp: did not complete: cpus={d}, aps={d}, online={d}\n", .{
-            stats.cpus, stats.aps, smp.onlineCount(),
+            smp_stats.cpus, smp_stats.aps, smp.onlineCount(),
         });
         return false;
     };
-
     console.print("smp: cpus={d}, aps={d}, online={d}, counter={d}, expected={d}, overlap={d}\n", .{
         result.cpus, result.aps, result.online, result.counter, result.expected, result.overlap,
     });
 
+    const cross_cpu = smp.runCrossCpuWakeTest() orelse return false;
+    const ap_exception = smp.runApExceptionTest() orelse return false;
+    const tlb = selftestTlbShootdown();
+    const locks = selftestLockGuards();
+    console.print("smp: cross-cpu wake={d}, ap exception={d}, tlb={d}, nested locks={d}\n", .{
+        @intFromBool(cross_cpu), @intFromBool(ap_exception), @intFromBool(tlb), @intFromBool(locks),
+    });
+
     return result.online == result.aps and
         result.counter == result.expected and
-        result.overlap == 0;
+        result.overlap == 0 and
+        cross_cpu and ap_exception and tlb and locks;
+}
+
+/// Verify that an unmap after the APs are running triggers a TLB shootdown that
+/// every online CPU acknowledges.
+fn selftestTlbShootdown() bool {
+    if (smp.getStats().aps == 0) return true;
+
+    const before = sched.tlbShootdownCount();
+    const phys = pmm.allocPage() orelse return false;
+    defer _ = pmm.freePage(phys);
+
+    const virt: u64 = 0xffff_ffff_c000_0000;
+    if (vmm.translate(virt) != null) return false;
+    if (!vmm.mapPage(virt, phys, vmm.kernel_rw)) return false;
+    if (!vmm.unmapPage(virt)) return false;
+
+    const after = sched.tlbShootdownCount();
+    console.print("tlb: shootdowns={d}\n", .{after - before});
+    return after > before;
+}
+
+/// Check that nested IRQ-safe lock acquisitions save and restore interrupt
+/// state independently.
+fn selftestLockGuards() bool {
+    var outer: sync.IrqSpinLock = .{};
+    var inner: sync.IrqSpinLock = .{};
+
+    const original = sync.irqSave();
+    asm volatile ("sti");
+
+    const first = outer.acquire();
+    const second = inner.acquire();
+    const disabled_while_held = (sync.irqSave() & (@as(u64, 1) << 9)) == 0;
+    second.release();
+    first.release();
+    const restored_after_release = (sync.irqSave() & (@as(u64, 1) << 9)) != 0;
+
+    asm volatile ("cli");
+    sync.irqRestore(original);
+    return disabled_while_held and restored_after_release;
 }
 
 fn stopTimer() void {

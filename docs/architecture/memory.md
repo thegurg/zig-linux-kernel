@@ -3,9 +3,10 @@
 **Purpose:** describe the three memory layers in zig-kernel: the physical page
 allocator (PMM), the virtual memory manager (VMM), and the kernel heap.
 
-**Implementation status:** all three layers are **IMPLEMENTED** for the
-bootstrap processor. None of them is currently thread-safe, and the PMM does
-not manage physical memory above 4 GiB.
+**Implementation status:** all three layers are **IMPLEMENTED**. The PMM and VMM
+are protected by IRQ-safe locks and the VMM issues a TLB shootdown after
+unmapping a page. The heap is **PARTIAL**: its free list is not locked. The PMM
+does not manage physical memory above 4 GiB.
 
 ## Layer overview
 
@@ -65,8 +66,9 @@ page, then returns the free count to its starting value.
 ### Limitations
 
 - Physical memory above 4 GiB is not managed.
-- The allocator is not protected by a lock and is not safe for concurrent use
-  from multiple CPUs.
+- The allocator is serialized by an IRQ-safe `sync.IrqSpinLock`; allocation and
+  freeing are safe from multiple CPUs, but the lock is global rather than
+  per-zone.
 - The bitmap is statically sized for the 4 GiB cap.
 
 ## Virtual memory manager (VMM)
@@ -98,13 +100,15 @@ that the HHDM offset translates to physical 0; a bad mapping returns
 | Function | Behavior |
 | --- | --- |
 | `init() InitError!void` | Builds the PML4, HHDM, and kernel mappings; validates them; marks the framebuffer uncached; enables `CR0.WP`; loads `CR3`. |
-| `mapPage(virt, phys, flags) bool` | Maps one 4 KiB page, allocating intermediate tables as needed. Rejects misalignment, out-of-range physical addresses, huge-page conflicts, and an already-present PTE. Invalidates the local TLB entry when active. |
-| `unmapPage(virt) bool` | Clears a present 4 KiB PTE and invalidates the local TLB entry. Rejects missing or huge-page mappings. |
+| `mapPage(virt, phys, flags) bool` | Maps one 4 KiB page, allocating intermediate tables as needed. Takes the IRQ-safe page-table lock. Rejects misalignment, out-of-range physical addresses, huge-page conflicts, and an already-present PTE. Invalidates the local TLB entry when active. |
+| `unmapPage(virt) bool` | Clears a present 4 KiB PTE under the page-table lock, invalidates the local TLB entry, then invokes the registered TLB-shootdown callback after releasing the lock. Rejects missing or huge-page mappings. |
 | `translate(virt) ?u64` | Walks the page tables manually and returns the physical address, including 1 GiB and 2 MiB huge-page offsets. |
 | `stats() Stats` | Reports PML4 physical address, HHDM offset, kernel bases, kernel bytes, and HHDM bytes. |
 | `currentPml4() u64` | Reads and masks `CR3`. |
 | `hhdmOffset() u64` | Returns the cached Limine HHDM offset. |
 | `kernelPhysical(virt) ?u64` | Converts a kernel-image virtual address to its physical address; only valid inside the image range. |
+| `markUncached(phys, size) bool` | Sets `cache_disable` on the HHDM 2 MiB chunk(s) covering a physical range. Used for framebuffer and LAPIC MMIO. |
+| `setTlbShootdownHandler(fn)` | Registers the scheduler callback invoked after an unmap releases the page-table lock. |
 
 ### Mapping layout
 
@@ -121,13 +125,16 @@ managed limit.
 
 ### Limitations
 
-- `unmapPage` invalidates only the local CPU's TLB. There is no TLB shootdown,
-  so unmapping a page that another CPU may have translated is unsafe.
+- TLB shootdown waits for acknowledgements with a bounded spin. A target CPU
+  that runs with interrupts disabled for a long time can delay completion; the
+  shooter proceeds best-effort after the limit. See
+  [technical debt](../development/technical-debt.md).
 - There is no user-space mapping support, no copy-on-write, and no demand
   paging. The VMM maps and unmaps explicit pages only.
 - The NX bit is not used; executable permissions are not separated beyond the
   read-only/read-write distinction.
-- Page-table mutation is not locked and is not safe for concurrent use.
+- Page-table mutation is serialized by one IRQ-safe spinlock; there is no
+  per-address-space or per-range locking.
 - The HHDM covers only the first 4 GiB because the PMM manages only that range.
 
 ## Kernel heap
@@ -170,7 +177,8 @@ and checks the final free/mapped counters.
 
 ### Limitations
 
-- The heap is not thread-safe.
+- The heap is not thread-safe; the PMM, VMM, console, and serial drivers use
+  IRQ-safe locks.
 - The reserved range is fixed at 64 MiB; there is no remapping or shrinking.
 - There are no per-CPU arenas or size classes.
 - `free` silently ignores unknown or corrupted pointers rather than reporting an
@@ -185,8 +193,9 @@ and checks the final free/mapped counters.
 | Kernel text/rodata read-only | **IMPLEMENTED** | `CR0.WP` enabled. |
 | Lazy kernel heap with allocator adapter | **IMPLEMENTED** | First-fit, coalescing, alignment. |
 | Heap `resize`/`remap` | **PLANNED** | Not implemented; `noResize`/`noRemap` are used. |
-| TLB shootdown | **PLANNED** | Unmap invalidates only the local CPU. |
-| Thread-safe memory allocators | **PLANNED** | PMM, VMM, and heap have no locking. |
+| TLB shootdown | **IMPLEMENTED** | IPI 241 after `unmapPage`; bounded acknowledgement wait. |
+| PMM/VMM locking | **IMPLEMENTED** | IRQ-safe allocator and page-table locks. |
+| Heap locking | **PLANNED** | Free list is not safe for concurrent use. |
 | Physical memory above 4 GiB | **PLANNED** | Not managed. |
 | User-space mappings / demand paging | **PLANNED** | Not implemented. |
 

@@ -1,12 +1,14 @@
 # CPU and interrupts
 
-**Purpose:** document x86_64 CPU mode setup, descriptor tables, interrupt and
-exception handling, the legacy PIC/PIT, and the interrupt-facing FPU state.
+**Purpose:** document x86_64 CPU mode setup, per-CPU state, descriptor tables,
+interrupt and exception handling, the legacy PIC/PIT, the local APIC/IPIs, and
+the interrupt-facing FPU state.
 
 **Implementation status:** CPU bring-up, GDT/TSS, IDT, exception dispatch,
-PIC/PIT, and interrupt-time FPU save/restore are **IMPLEMENTED** on the
-bootstrap processor. APs load the shared GDT/IDT but do not take timer
-interrupts, and the AP exception path is not yet SMP-safe.
+PIC/PIT, LAPIC/x2APIC, IPI dispatch, and per-CPU interrupt-time FPU
+save/restore are **IMPLEMENTED** on every online CPU. The timer remains a
+BSP-only PIT interrupt; APs receive reschedule and TLB IPIs. See
+[technical debt](../development/technical-debt.md).
 
 ## SSE and FPU enablement
 
@@ -30,6 +32,34 @@ The BSP calls `enableSse()` at the very start of `kmain`. APs enable SSE in the
 assembly entry stub (`smp_entry.S`) before calling any Zig code, because `CR0`
 and `CR4` are per-CPU and the compiler may emit SSE as soon as `ap_main`
 starts. The stub also sets `CR0.WP`, matching the BSP's write-protect policy.
+
+## Per-CPU state and the GS base
+
+Every CPU installs a `cpu.PerCpu` block and points `IA32_GS_BASE`
+(MSR `0xc0000101`) at it:
+
+```zig
+pub const PerCpu = extern struct {
+    fpu_state: u64 = 0,  // offset 0:  %gs:0
+    index: u32 = 0,      // offset 8:  %gs:8
+    lapic_id: u32 = 0,   // offset 12: %gs:12
+    online: u64 = 0,
+};
+```
+
+`extern struct` and compile-time offset checks are required: Zig's automatic
+layout now reorders fields, and the assembly depends on these exact offsets.
+
+- The BSP calls `cpu.initPerCpu(0, bsp_lapic_id)` after loading the GDT and
+  after LAPIC discovery.
+- Each AP calls `cpu.initPerCpu` after `gdt.load` and before any code that can
+  fault.
+- `%gs:0` initially points at `boot_fpu_state`, a scratch FXSAVE area.
+  `sched.init` and `sched.initCpu` replace it with the current task's FPU area.
+- `cpu.currentIndex()` and `cpu.lapicId()` are `movl %gs:8` / `movl %gs:12`.
+
+The GS base is not changed by `iretq` or by task switches; only the pointer at
+`%gs:0` changes per task.
 
 ## GDT and TSS
 
@@ -56,12 +86,10 @@ long-mode GDT:
 `gdt.init()` fills all per-CPU TSS descriptors, computes the GDTR, and calls
 `gdt.load(0)`. `gdt.load(cpu)` reloads the shared GDT, far-returns through
 `0x08` to reload `CS`, reloads `SS/DS/ES/FS/GS` with `0x10`, and executes
-`ltr` with that CPU's TSS selector. `gdt.setKernelStack(cpu, top)` updates the
-TSS `RSP0` field; APs use it to install their private stack.
-
-The AP stub switches to the private stack in [`smp_entry.S`](../../src/arch/x86_64/smp_entry.S)
-before calling `ap_main`, which then installs that stack as the CPU's TSS
-`RSP0`.
+`ltr` with that CPU's TSS selector. Because loading a data-segment selector
+changes the GS base state in long mode, callers must install the per-CPU block
+with `cpu.initPerCpu` **after** `gdt.load`. `gdt.setKernelStack(cpu, top)`
+updates the TSS `RSP0` field; APs use it to install their private stack.
 
 ## IDT and gate layout
 
@@ -73,10 +101,12 @@ of 16-byte gates. `idt.init()` installs:
 | 0-31 | `isr_stub_table` | CPU exceptions; vector 8 uses IST1 for `#DF`. |
 | 32-47 | `irq_stub_table` | PIC IRQs; only IRQ0 is unmasked. |
 | 48-53 | `sched_stub_table` | Scheduler software interrupts. |
+| 240, 241 | `ipi_stub_table[0..2]` | Reschedule and TLB-shootdown IPIs. |
+| 255 | `ipi_stub_table[2]` | LAPIC spurious-interrupt gate. |
 
 Every gate is a present, DPL0, 64-bit interrupt gate (`type_attr = 0x8e`).
-`idt.load()` executes `lidt`; the BSP fills the table, and APs only need to
-load it because the table is shared.
+`idt.load()` executes `lidt`; the BSP fills the table, and APs load the same
+shared table.
 
 ### Scheduler software interrupts
 
@@ -108,19 +138,22 @@ Each stub normalizes the stack to:
 
 1. executes `cld`;
 2. pushes all 15 general-purpose registers;
-3. reads `current_fpu_state`; if non-zero, executes `fxsave64` into that
-   512-byte area;
+3. reads `%gs:0`; if non-zero, executes `fxsave64` into that 512-byte area;
 4. aligns `RSP` to 16 bytes, passes the frame pointer and saved-register base to
    `isr_dispatch`, and calls it;
-5. takes the returned saved-register base, restores the selected
-   `current_fpu_state` with `fxrstor64`, pops the 15 registers, drops the vector
-   and error code, and executes `iretq`.
+5. takes the returned saved-register base, re-reads `%gs:0`, restores that FPU
+   area with `fxrstor64`, pops the 15 registers, drops the vector and error
+   code, and executes `iretq`.
 
 The FPU save happens before the dispatcher can use SIMD registers. The restore
-happens immediately before `iretq`, after the dispatcher has finished, so the
-resumed task sees the state saved on its last interrupt. If
-`current_fpu_state` is zero, both operations are skipped; this lets pre-scheduler
-exceptions use the fault-test path before any task owns an FPU area.
+happens immediately before `iretq`, after the dispatcher has finished. Because
+the address lives in `%gs:0`, each CPU saves and restores its own task's state,
+including when an exception occurs on an AP. If the pointer is zero, both
+operations are skipped.
+
+`sched_resume(rsp)` is the non-interrupt counterpart used to enter an AP's first
+idle frame. It restores the FPU area from `%gs:0`, pops the saved registers,
+drops vector/error, and executes `iretq`.
 
 The `Frame` structure in `idt.zig` mirrors the CPU frame plus the two values
 pushed by the stubs:
@@ -143,24 +176,46 @@ const Frame = extern struct {
 [`src/arch/x86_64/idt.zig`](../../src/arch/x86_64/idt.zig) handles vectors in
 this order:
 
-1. **IRQ 32-47**: send EOI to the PIC. IRQ0 returns
+1. **Reschedule IPI 240**: send LAPIC EOI and return
+   `sched.rescheduleInterrupt(saved_rsp)`.
+2. **TLB IPI 241**: send LAPIC EOI, call `sched.tlbInterrupt()`, and return
+   `saved_rsp` unchanged.
+3. **Spurious vector 255**: return `saved_rsp` without an EOI.
+4. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
    `sched.tick(saved_rsp)`; all other IRQs return `saved_rsp` unchanged.
-2. **Scheduler vectors 48-53**: call the matching scheduler entry and return
+5. **Scheduler vectors 48-53**: call the matching scheduler entry and return
    the saved-register base it selects.
-3. **Other exceptions**: print vector number and name, error code, RIP, CS,
+6. **Other exceptions**: print vector number and name, error code, RIP, CS,
    RFLAGS, and (for user-mode frames) RSP/SS.
-4. For vector 14 (`#PF`), read `CR2` and print it.
-5. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
-   `saved_rsp`; this is the path the smoke test uses to prove the handler
-   returns.
-6. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
+7. For vector 14 (`#PF`), read `CR2` and print it.
+8. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
+   `saved_rsp`; this is the path both the BSP smoke test and the AP exception
+   test use.
+9. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
    with the failure code.
 
-The dispatcher uses the global console and global scheduler state. It does not
-take a lock and has no per-CPU dispatch state. On an AP, an exception or NMI
-would therefore use the BSP's `current_fpu_state` and global scheduler/console
-variables. This is a known SMP safety gap; APs currently do not enter the
-scheduler or take timer interrupts.
+The dispatcher uses the global console, which has its own IRQ-safe message
+lock, and the scheduler's `task_lock`. Exceptions on an AP therefore save and
+restore the correct FPU area, but they still run through the shared IDT and
+console paths.
+
+## Local APIC and IPIs
+
+[`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) detects xAPIC or
+x2APIC from `IA32_APIC_BASE` (MSR `0x1b`). It sets the enable bit on every CPU
+before accessing APIC registers.
+
+- xAPIC mode uses a 4 KiB MMIO window reached through the HHDM. The covering
+  2 MiB chunk is marked uncached with `vmm.markUncached`.
+- x2APIC mode uses MSRs for ID, EOI, TPR, SPIV, and ICR.
+- `init()` programs spurious vector `0xff` with the software-enable bit and
+  clears TPR.
+- `eoi()` acknowledges the current interrupt.
+- `sendIpi(destination, vector)` sends a fixed-delivery edge IPI.
+- `sendIpiAllButSelf(vector)` uses the all-but-self shorthand.
+
+The scheduler uses vector 240 for reschedule and 241 for TLB shootdown. See
+[SMP](smp.md) and [synchronization](synchronization.md) for the protocols.
 
 ## PIC and PIT
 
@@ -173,8 +228,8 @@ the master at `0x20`, the slave at `0x28`, the cascade through master IRQ2, and
 data ports as appropriate. Unmasking an IRQ 8-15 also unmasks the master
 cascade line.
 
-The kernel unmasks only IRQ0 for the PIT. There is no IOAPIC, MSI, APIC timer,
-or other interrupt-routing support yet.
+The kernel unmasks only IRQ0 for the PIT. The PIC and PIT are the only timer
+source; there is no APIC timer or IOAPIC routing yet. APs receive only IPIs.
 
 ### 8253/8254 PIT
 
@@ -189,14 +244,15 @@ IRQ0.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | SSE/FPU enablement | **IMPLEMENTED** | BSP in `kmain`; APs in the assembly stub before Zig code. |
+| Per-CPU GS-based state | **IMPLEMENTED** | Extern layout with `%gs:0/8/12` offsets checked at compile time. |
 | GDT/TSS with per-CPU #DF IST | **IMPLEMENTED** | `max_cpus = 8`; 8 KiB #DF stacks. |
 | IDT and exception dispatch | **IMPLEMENTED** | Vectors 0-31, CR2 reporting for #PF. |
 | IRQ stubs and full GPR save | **IMPLEMENTED** | 15 GPRs; scheduler resumption via returned base. |
-| Interrupt-time FPU save/restore | **IMPLEMENTED** | `fxsave64`/`fxrstor64` around the dispatcher. |
+| Interrupt-time FPU save/restore | **IMPLEMENTED** | Per-CPU `%gs:0`; AP `int3` test. |
 | PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled. |
-| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3. |
-| LAPIC/IOAPIC/APIC timer/IPI | **PLANNED** | No local APIC programming exists. |
-| Per-CPU exception/NMI handling | **PLANNED** | AP exception path uses global BSP state. |
+| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; BSP only. |
+| LAPIC/x2APIC and IPIs | **IMPLEMENTED** | Vectors 240/241; spurious gate 255. |
+| APIC timer / IOAPIC routing | **PLANNED** | No per-CPU timer or IOAPIC yet. |
 | User-mode interrupt frames | **PLANNED** | `from_user` reporting exists, but user mode is not implemented. |
 
 ## Related documentation

@@ -81,7 +81,7 @@ if [ "$MODE" != "run" ]; then
     case $status in
       33)
         if grep -q "returned from int3" "$WORK/serial.log" &&
-           grep -q "M10 checks passed" "$WORK/serial.log" &&
+           grep -q "M11 checks passed" "$WORK/serial.log" &&
            grep -q "M9 checks passed" "$WORK/serial.log" &&
            grep -q "M8 checks passed" "$WORK/serial.log" &&
            grep -q "M7 checks passed" "$WORK/serial.log" &&
@@ -105,6 +105,9 @@ if [ "$MODE" != "run" ]; then
            grep -q "cond checks passed" "$WORK/serial.log" &&
            grep -q "fpu checks passed" "$WORK/serial.log" &&
            grep -q "smp: cpus=$SMP" "$WORK/serial.log" &&
+           grep -q "cross-cpu wake=1" "$WORK/serial.log" &&
+           grep -q "ap exception=1" "$WORK/serial.log" &&
+           grep -q "nested locks=1" "$WORK/serial.log" &&
            grep -q "smp checks passed" "$WORK/serial.log"; then
           exit 0
         fi

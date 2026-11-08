@@ -4,6 +4,7 @@ const std = @import("std");
 const limine = @import("limine.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const font = @import("font.zig");
+const sync = @import("sync.zig");
 
 const max_cols = 256;
 const max_rows = 128;
@@ -19,6 +20,10 @@ const Rgb = struct {
 };
 
 var active = false;
+
+/// Serializes complete console operations. An IRQ-safe lock prevents a timer
+/// interrupt on the same CPU from re-entering the console mid-message.
+var lock: sync.IrqSpinLock = .{};
 
 var base: [*]u8 = undefined;
 var fb_width: u64 = 0;
@@ -91,6 +96,8 @@ pub fn clear() void {
 }
 
 pub fn write(bytes: []const u8) void {
+    const guard = lock.acquire();
+    defer guard.release();
     serial.write(bytes);
     if (!active) return;
     for (bytes) |byte| putc(byte);
@@ -106,6 +113,8 @@ pub fn print(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn writeHex(value: u64) void {
+    const guard = lock.acquire();
+    defer guard.release();
     serial.writeHex(value);
     if (!active) return;
     const digits = "0123456789abcdef";
@@ -166,6 +175,8 @@ fn redrawAll() void {
 
 /// Print a string in the accent color on a fresh line. Used for banners.
 pub fn banner(text: []const u8) void {
+    const guard = lock.acquire();
+    defer guard.release();
     serial.write(text);
     serial.write("\n");
     if (!active) return;

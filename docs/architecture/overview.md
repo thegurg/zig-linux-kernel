@@ -3,8 +3,8 @@
 **Purpose:** describe what zig-kernel is, the constraints it is built under,
 which milestones are implemented, and how the source tree is organized.
 
-**Implementation status:** M0-M10 are implemented and validated through the
-QEMU test flow. M11 is planned. See the per-subsystem documents for the exact
+**Implementation status:** M0-M11 are implemented and validated through the
+QEMU test flow. M12 is planned. See the per-subsystem documents for the exact
 status of individual features.
 
 ## Project facts
@@ -16,7 +16,7 @@ status of individual features.
 | Boot path | Limine 12.9.4, UEFI, Limine boot protocol base revision 3 | [`src/limine.zig`](../../src/limine.zig) |
 | Kernel base | `0xffffffff80000000` (higher half) | [`linker.ld`](../../linker.ld) |
 | Default build | `ReleaseSafe` with LLVM (`exe.use_llvm = true`) | [`build.zig`](../../build.zig) |
-| Current version string | `0.13.0-m10` | [`src/main.zig`](../../src/main.zig) |
+| Current version string | `0.14.0-m11` | [`src/main.zig`](../../src/main.zig) |
 | Primary test platform | QEMU with KVM when available, TCG as fallback | [`tools/run.sh`](../../tools/run.sh) |
 
 ## Design constraints
@@ -33,8 +33,10 @@ status of individual features.
 - Every milestone must be verifiable with an automated QEMU smoke test, in
   addition to host-side tests where applicable.
 - Default builds keep safety checks enabled (`ReleaseSafe`).
-- The scheduler is currently bootstrap-processor-only (BSP-only). SMP bring-up
-  exists, but per-CPU scheduling is not implemented.
+- The scheduler is per-CPU: every online CPU has its own current task, idle
+  task, and run state. Tasks are pinned to the CPU chosen at creation. The
+  legacy PIT timer still delivers IRQ0 to the BSP only; APs are switched by
+  scheduler calls and reschedule IPIs.
 
 ## Milestone status
 
@@ -53,7 +55,8 @@ status of individual features.
 | M8 | Blocking `sched.Mutex` with ownership transfer and `sched.Condition` with `wait`, `signal`, `broadcast` | **IMPLEMENTED** |
 | M9 | FPU/SIMD context switching with per-task `FXSAVE`/`FXRSTOR` areas | **IMPLEMENTED** |
 | M10 | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test | **IMPLEMENTED** |
-| M11 | Per-CPU scheduling and SMP-aware wait queues | **PLANNED** |
+| M11 | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition, TLB shootdown, AP exception/FPU state | **IMPLEMENTED** |
+| M12 | Next milestone; not yet scoped or started | **PLANNED** |
 
 Detailed milestone behavior is documented in the subsystem pages:
 [memory](memory.md), [CPU and interrupts](cpu-interrupts.md),
@@ -68,22 +71,23 @@ Limine (UEFI)
     v
 _start -> kernel stack -> kmain
     |
-    +-- SSE enable, serial, GDT/TSS, IDT, PIC remap
+    +-- SSE enable, serial, GDT/TSS, IDT, PIC remap, per-CPU block
     +-- PMM -> VMM -> heap
     +-- framebuffer console + boot report
     +-- SMP init (Limine MP request)
-    +-- AP entry: kernel stack, SSE, CR0.WP, CR3 + global TLB flush
-    +-- selftest / fault-test variant, or normal boot
+    +-- LAPIC/x2APIC init, scheduler init, TLB-shootdown hook
+    +-- normal boot: start APs -> per-CPU scheduler idle
+    +-- selftest / fault-test variant
     |
     v
-normal boot: sched.init -> PIT 100 Hz -> IRQ0 -> idle
+normal boot: PIT 100 Hz -> IRQ0 on BSP -> per-CPU idle tasks
 ```
 
-The scheduler owns the only run queue today. IRQ0 drives preemption on the BSP;
-the APs load the shared GDT/IDT, run the SMP stress workload or park, and never
-enter the scheduler. Synchronization primitives provide atomic spinlocks and
-per-acquisition interrupt guards, but the SMP-aware wait-queue redesign is M11
-work.
+Every CPU runs its own scheduler state. IRQ0 drives preemption on the BSP; APs
+enter their idle tasks, switch tasks on explicit scheduler calls, and receive
+reschedule (240) and TLB-shootdown (241) IPIs. Blocking primitives wake tasks
+across CPUs, and `unmapPage` issues a shootdown after releasing the page-table
+lock. The heap remains unlocked and is documented as partial.
 
 ## Source layout
 
@@ -91,17 +95,18 @@ work.
 | --- | --- |
 | [`boot/limine.conf`](../../boot/limine.conf) | Limine menu and kernel path. |
 | [`linker.ld`](../../linker.ld) | Higher-half layout and page-aligned `PT_LOAD` segments. |
-| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M10 self-tests. |
+| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M11 self-tests. |
 | [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests. |
 | [`src/console.zig`](../../src/console.zig) | Framebuffer text console with serial mirroring. |
 | [`src/font.zig`](../../src/font.zig) | 8x16 bitmap font. |
-| [`src/sched.zig`](../../src/sched.zig) | Scheduler, wait queues, mutex/condition, FPU state, idle task. |
+| [`src/sched.zig`](../../src/sched.zig) | Per-CPU scheduler, wait queues, mutex/condition, FPU state, idle tasks, IPIs, TLB shootdown. |
 | [`src/sync.zig`](../../src/sync.zig) | Spinlocks and interrupt save/restore helpers. |
-| [`src/smp.zig`](../../src/smp.zig) | Limine MP bring-up, AP contexts, SMP stress test. |
+| [`src/smp.zig`](../../src/smp.zig) | Limine MP bring-up, AP contexts, AP scheduler entry, SMP tests. |
 | [`src/memory/pmm.zig`](../../src/memory/pmm.zig) | Bitmap physical page allocator. |
 | [`src/memory/vmm.zig`](../../src/memory/vmm.zig) | 4-level page tables, kernel/HHDM mappings, CR3 switch. |
 | [`src/memory/heap.zig`](../../src/memory/heap.zig) | Lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
-| [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement. |
+| [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement and GS-based per-CPU state. |
+| [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, and IPIs. |
 | [`src/arch/x86_64/gdt.zig`](../../src/arch/x86_64/gdt.zig) | GDT, per-CPU TSS, #DF IST stacks. |
 | [`src/arch/x86_64/idt.zig`](../../src/arch/x86_64/idt.zig) | IDT, exception dispatch, IRQ dispatch. |
 | [`src/arch/x86_64/interrupts.S`](../../src/arch/x86_64/interrupts.S) | Exception/IRQ/scheduler stubs and FPU save/restore. |

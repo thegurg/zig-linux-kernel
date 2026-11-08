@@ -84,24 +84,28 @@ initialization print an error and exit QEMU with the failure code.
 3. Initialize COM1 and print `zig-kernel: early boot`.
 4. `gdt.init()`: build the GDT, per-CPU TSS descriptors, and #DF IST stacks;
    load CPU 0's GDT/TSS.
-5. `idt.init()`: install exception, IRQ, and scheduler gates; load the IDT.
+5. `idt.init()`: install exception, IRQ, scheduler, and IPI gates; load the IDT.
 6. `pic.remap(0x20, 0x28)`: remap the 8259 PIC to vectors 32-47 and mask all
    lines.
-7. Check `limine.baseRevisionSupported()`.
-8. `pmm.init()`: build the physical page bitmaps from the Limine memory map.
-9. `vmm.init()`: build the kernel PML4, map the kernel and the 4 GiB HHDM,
-   mark the framebuffer uncached, enable `CR0.WP`, and switch `CR3`.
-10. `heap.init()`: reset the heap free list and break to the reserved base.
-11. `console.init()`, `banner()`, and `reportBootInfo()`.
-12. `smp.init()`: record Limine's MP response and per-AP contexts. An
+7. `cpu.initPerCpu(0, 0)`: install the boot per-CPU block so `%gs:0` always
+   points at a scratch FXSAVE area, even before the scheduler exists.
+8. Check `limine.baseRevisionSupported()`.
+9. `pmm.init()`: build the physical page bitmaps from the Limine memory map.
+10. `vmm.init()`: build the kernel PML4, map the kernel and the 4 GiB HHDM,
+    mark the framebuffer uncached, enable `CR0.WP`, and switch `CR3`.
+11. `heap.init()`: reset the heap free list and break to the reserved base.
+12. `console.init()`, `banner()`, and `reportBootInfo()`.
+13. `smp.init()`: record Limine's MP response and per-AP contexts. An
     initialization failure is logged but does not abort boot.
-13. If an MP response exists, print CPU statistics. On a normal boot (not the
-    selftest image), release the APs with `smp.start(false)`, wait for them to
-    come online with `waitOnline()`, and wait for them to enter their halt
-    loops with `waitParked()`.
-14. Branch into the test variant or normal operation. The normal path prints
-    the version summary immediately before entering the scheduler; no
-    milestone-specific line is printed unconditionally.
+14. `lapic.init()`, read the BSP LAPIC ID, reinstall the per-CPU block with that
+    ID, call `sched.init()`, and register `vmm.setTlbShootdownHandler`.
+15. If an MP response exists, print CPU statistics (`cpus`, `aps`,
+    `bsp_lapic_id`, `x2apic`). On a normal boot with APs, release them with
+    `smp.start()` and wait with `waitOnline()`. Each AP installs its per-CPU
+    state and enters its scheduler idle loop.
+16. Branch into the test variant or normal operation. The normal path prints
+    the version summary immediately before initializing the PIT and entering
+    the scheduler; no milestone-specific line is printed unconditionally.
 
 ## Boot variants
 
@@ -110,9 +114,9 @@ The build creates three images from the same source using `build_options` in
 
 | Variant | Options | Behavior |
 | --- | --- | --- |
-| Normal kernel | `exit_after_boot = false`, `test_page_fault = false` | Reports boot information, initializes the scheduler and PIT, unmasks IRQ0, and exits the boot task into the idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false` | Runs the M1c-M10 self-tests after boot, triggers `int3`, and exits QEMU with success. |
-| Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true` | Starts and parks APs, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
+| Normal kernel | `exit_after_boot = false`, `test_page_fault = false` | Reports boot information, starts the APs into their scheduler idle loops, initializes the PIT, unmasks IRQ0, and exits the boot task into the BSP idle task. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false` | Skips the early AP release, runs the M1c-M11 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP checks, triggers `int3`, and exits QEMU with success. |
+| Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
 
 Normal operation after the report is:
 
@@ -127,8 +131,8 @@ sched.exit()
 ```
 
 Unmasking IRQ0 does not enable interrupts by itself. The boot task exits into
-the idle task, whose `idleEntry` executes `sti; hlt`; the log wording reflects
-that exact transition.
+the BSP idle task, whose `idleEntry` executes `sti; hlt`; the log wording
+reflects that exact transition.
 
 In the selftest variant, the normal scheduler/PIT setup is skipped. The tests
 call `sched.init()`, program the PIT, and manage `sti`/`cli` themselves. The

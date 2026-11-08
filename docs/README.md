@@ -19,7 +19,7 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.13.0-m10`. Milestones M0 through M10 are implemented; M11 is planned.
+`0.14.0-m11`. Milestones M0 through M11 are implemented; M12 is planned.
 
 ## Architecture
 
@@ -28,10 +28,10 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | [Overview](architecture/overview.md) | Goals, constraints, milestone status, source layout, and how the subsystems fit together. |
 | [Boot and early bring-up](architecture/boot.md) | Limine/UEFI handoff, linker layout, `_start`, `kmain`, boot variants, and the console. |
 | [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, and the kernel heap. |
-| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, GDT/TSS, IDT, exception/IRQ entry, PIC, and PIT. |
-| [Scheduling](architecture/scheduling.md) | Task model, round-robin scheduler, task lifecycle, idle task, and FPU context switching. |
-| [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, and condition variables. |
-| [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, and the SMP stress test. |
+| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, and the LAPIC. |
+| [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
+| [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
+| [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs, and the M11 SMP tests. |
 
 ## Development
 
@@ -40,7 +40,7 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | [Building](development/building.md) | Toolchain requirements, build options, kernel variants, and the QEMU harness. |
 | [Testing](development/testing.md) | Host tests, QEMU smoke and fault tests, assertions, exit codes, and recorded results. |
 | [Technical debt and known issues](development/technical-debt.md) | Correctness hazards, unsafe assumptions, and current limitations. |
-| [Roadmap](development/roadmap.md) | Planned M11 work and later items, kept separate from implemented features. |
+| [Roadmap](development/roadmap.md) | M11 results and the deferred work planned beyond it. |
 
 ## Suggested reading paths
 

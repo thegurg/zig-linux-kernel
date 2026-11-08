@@ -4,9 +4,9 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M10 are complete, and the pre-M11 bugfix pass has
-landed. M11 is the next milestone. No M11 code has been started at the time of
-this documentation update.
+**Current status:** M0-M11 are complete and validated through the QEMU test
+flow. The pre-M11 bugfix pass and M11 landed before this documentation update.
+M12 is the next milestone and has not been started.
 
 ## Pre-M11 bugfix pass (complete)
 
@@ -29,71 +29,75 @@ Validation: default KVM, TCG, and Debug `zig build test` runs pass; the smoke
 flow also passes with `ZIG_KERNEL_SMP=1` and `=2`. See
 [testing](testing.md) for the recorded results.
 
-## M11: per-CPU scheduling and SMP-aware wait queues
+## M11: per-CPU scheduling and SMP-aware wait queues (complete)
 
 ### Goal
 
 Move scheduling from a single global BSP scheduler to per-CPU scheduler state,
-allow APs to schedule tasks, and make blocking primitives work across CPUs.
-This requires an interrupt mechanism that can wake another CPU, so LAPIC/IPI
-support is part of the milestone rather than an optional extra.
+allow APs to schedule tasks, and make blocking primitives work across CPUs. This
+requires an interrupt mechanism that can wake another CPU, so LAPIC/IPI support
+is part of the milestone.
 
-### Why the current design cannot simply be extended
+### What landed
 
-The existing scheduler and wait queues rely on three assumptions:
+1. **Lock ordering** — the order is documented in
+   [synchronization](../architecture/synchronization.md). The scheduler uses one
+   global `task_lock`; the VMM and PMM use IRQ-safe allocator locks; the TLB
+   shootdown path uses a plain spinlock so a waiting CPU can still take the
+   remote shootdown IPI; console and serial lock messages; the heap remains
+   unlocked and is documented as partial.
+2. **Per-CPU scheduler state** — every CPU has a `CpuState` (current task, idle
+   task, scan cursor, pending sleep/wait requests), a private idle stack, and a
+   `PerCpu` block installed through the GS base MSR. Tasks are pinned to a CPU
+   at creation with `createOn`.
+3. **AP scheduler entry** — APs leave Limine's park loop, install their per-CPU
+   block, initialise the LAPIC, call `sched.initCpu`, and enter `enterScheduler`,
+   which resumes the AP's idle frame. APs no longer halt permanently.
+4. **LAPIC/IPI support** — xAPIC and x2APIC are detected from `IA32_APIC_BASE`.
+   The kernel programs the spurious vector, reads LAPIC IDs, sends fixed IPIs to
+   one CPU or all-but-self, and acknowledges interrupts with LAPIC EOI. Vector
+   240 is the reschedule IPI, 241 the TLB IPI, and 255 the spurious gate.
+5. **SMP-aware blocking primitives** — wait queues, mutexes, and condition
+   variables enqueue and wake task IDs under `task_lock`; waking a task on
+   another CPU sends a reschedule IPI. Mutex and condition waits pre-mark the
+   current task blocked before releasing the scheduler lock, so a cross-CPU
+   unlock cannot lose the wakeup.
+6. **TLB shootdown** — `vmm.unmapPage` reports the unmapped address through a
+   callback after releasing its page-table lock. The scheduler sends IPI 241 to
+   every other online CPU and waits for acknowledgements.
+7. **AP exception and FPU state** — `PerCpu.fpu_state` at offset 0 is reached
+   through `%gs:0` from the interrupt entry stub and from `sched_resume`. The
+   scheduler updates the per-CPU pointer when it switches tasks, so AP
+   exceptions save and restore the interrupted AP task's state.
+8. **Expanded tests** — the selftest now runs AP scheduler workers, a cross-CPU
+   wakeup, an AP `int3`/FPU-preservation test, a TLB-shootdown test, and a
+   nested `IrqSpinLock` guard test. The full flow passes under KVM, TCG,
+   `-Doptimize=Debug`, and `ZIG_KERNEL_SMP=1/2/4`.
 
-1. only the BSP runs the scheduler;
-2. only the BSP takes IRQ0;
-3. disabling interrupts on the current CPU is sufficient to protect scheduler
-   and wait-queue state.
+### Key bug found during M11 bring-up
 
-Those assumptions break under SMP. Cross-CPU wakeups need a way to interrupt a
-remote CPU, and shared state needs real locks with per-acquisition interrupt
-state.
+Zig's automatic struct layout reordered the fields of `cpu.PerCpu`, so
+`%gs:8`/`%gs:12` did not read `index`/`lapic_id`; every AP appeared to be CPU 0
+and received no schedulable task. `PerCpu` is now an `extern struct` with
+compile-time offset checks for `fpu_state`, `index`, and `lapic_id`.
 
-### Ordered implementation plan
-
-The order below follows the audit recommendation. The `IrqSpinLock` guard fix
-is already complete, so the remaining M11 work starts with lock ordering.
-
-1. **Define lock ordering** — document and enforce the order among task/run-queue
-   locks, wait-queue locks, and any allocator/console locks.
-2. **Per-CPU scheduler state** — introduce per-CPU `current`, run queues, idle
-   tasks, counters, and an AP scheduler entry. Keep the BSP as CPU 0.
-3. **AP scheduler entry** — let APs leave the park loop and enter a scheduler
-   idle loop instead of halting permanently.
-4. **LAPIC/IPI support** — discover and map the local APIC, add an IPI send
-   path, and use it for cross-CPU wakeups and TLB shootdown.
-5. **SMP-aware wait queues, mutex, and condition** — make enqueue/wake operate
-   on the correct CPU's run queue, preserve signal-vs-timeout semantics, and
-   avoid lost wakeups.
-6. **TLB shootdown** — invalidate remote TLB entries after `vmm.unmapPage` or
-   mapping changes that affect other CPUs.
-7. **AP exception and FPU state** — replace global `current_fpu_state` use in
-   the interrupt path with per-CPU state, and make the dispatcher safe on APs.
-8. **Expanded tests** — add KVM, TCG, and Debug runs covering AP scheduling,
-   cross-CPU wakeups, nested/contended locks, TLB shootdown, and AP exceptions.
-
-### M11 acceptance criteria (planned)
+### M11 acceptance criteria (met)
 
 - APs run scheduler idle loops and can execute tasks.
-- A task can be woken on a CPU other than the one it blocked on.
-- Wait queues, mutexes, and condition variables preserve their current
-  signal/timeout semantics under cross-CPU wakeups.
+- A task can be created on, and woken on, a CPU other than the BSP.
+- Wait queues, mutexes, and condition variables preserve their signal/timeout
+  semantics under cross-CPU wakeups.
 - `IrqSpinLock` works under contention and nesting without corrupting
   interrupt state.
-- TLB shootdown prevents stale translations after unmap.
+- TLB shootdown invalidates remote translations after `unmapPage`.
 - AP exceptions use per-CPU FPU and scheduler state.
 - The full test flow passes under KVM, TCG, and `-Doptimize=Debug`.
-
-These criteria are **PLANNED**.
 
 ### M11 non-goals
 
 - User mode, user address spaces, and system calls.
 - A general driver framework or filesystem.
-- Replacing the PIC/PIT entirely; the APIC timer may be added for per-CPU
-  ticks, but that is a design decision for the milestone.
+- Replacing the PIC/PIT entirely; there is no APIC timer or IOAPIC routing yet.
 - More than `max_cpus = 8` without changing the GDT/TSS layout.
 
 ## Later work
@@ -103,14 +107,16 @@ not by priority.
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| LAPIC timer / IOAPIC / x2APIC | **PLANNED** | Required for richer interrupt routing; x2APIC is currently only logged. |
+| Heap locking | **PLANNED** | PMM, VMM, console, and serial are locked; the heap free list is not. |
+| LAPIC timer / IOAPIC interrupt routing | **PLANNED** | Timer ticks remain BSP-only through the PIT; APs receive only IPIs. |
+| Per-CPU timer preemption | **PLANNED** | APs are preempted only by reschedule/TLB IPIs, not by a timer. |
 | Physical memory above 4 GiB | **PLANNED** | PMM bitmap is sized for 4 GiB. |
 | Heap `resize`/`remap` | **PLANNED** | Currently `noResize`/`noRemap`. |
 | NX-bit policy | **PLANNED** | No executable/non-executable split yet. |
 | User mode and address-space isolation | **PLANNED** | All tasks share kernel page tables. |
-| Priorities, migration, join | **PLANNED** | Round-robin only; tests poll counters. |
-| AP exception/NMI tests | **PLANNED** | Depends on per-CPU interrupt state. |
-| Thread-safe PMM/VMM/heap/console/serial | **PLANNED** | Current global state is not locked. |
+| Priorities, migration, join | **PLANNED** | Round-robin per CPU; tasks are pinned, tests poll counters. |
+| AP NMI and additional exception tests | **PLANNED** | AP `int3`/FPU state is covered; NMI is not. |
+| Concurrent heap/VMM allocation stress | **PLANNED** | VMM has a lock; heap does not. |
 
 ## Milestone history
 
@@ -130,7 +136,7 @@ not by priority.
 | M9 | **IMPLEMENTED** | FPU/SIMD context switching. |
 | M10 | **IMPLEMENTED** | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test. |
 | Pre-M11 | **IMPLEMENTED** | Interrupt-safe guards, AP setup ordering, accurate diagnostics, task return trampoline, host SMP/test harness fixes. |
-| M11 | **PLANNED** | Per-CPU scheduling and SMP-aware wait queues. |
+| M11 | **IMPLEMENTED** | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware blocking, TLB shootdown, AP exception/FPU state, expanded tests. |
 
 ## Related documentation
 

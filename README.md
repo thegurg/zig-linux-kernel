@@ -17,7 +17,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M9 complete:** FPU/SIMD context switching with per-task `FXSAVE`/`FXRSTOR` areas.
 - **M10 complete:** Limine MP bring-up with per-CPU stacks/TSS, atomic spinlocks, and an SMP stress test.
 - **Pre-M11 bugfix pass complete:** per-acquisition interrupt guards, AP SSE/`CR0.WP`/global-TLB setup ordering, accurate diagnostics, a task return trampoline, and a dynamic SMP test assertion.
-- **Next:** M11 - per-CPU scheduling and SMP-aware wait queues.
+- **M11 complete:** per-CPU scheduling with pinned tasks and per-CPU idle tasks, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition variables, TLB shootdown, GS-based per-CPU FPU state on APs, and expanded QEMU tests.
+- **Next:** M12 (not started). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -45,10 +46,12 @@ Build options:
   another worker on a wait queue and wakes it with `wakeOne`, verifies both the
   timeout and signaled paths of `WaitQueue.waitTimeout`, checks mutex exclusion
   across a yield and a condition-variable wait/signal handshake, checks that two
-  tasks keep distinct `xmm0` patterns across a cooperative yield, brings up the
-  application processors and verifies a shared spinlock-protected counter
-  across every CPU, triggers `int3` and must return from the handler (QEMU
-  status 33);
+  tasks keep distinct `xmm0` patterns across a cooperative yield, then runs the
+  M11 SMP checks: per-AP pinned tasks and a shared spinlock-protected counter
+  that must reach `100000 * CPUs` with zero overlap, a cross-CPU wakeup via
+  reschedule IPI, an AP `int3` with XMM5 preservation, a TLB shootdown after
+  `unmapPage`, and nested `IrqSpinLock` guards; it then triggers `int3` and must
+  return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35).
 
@@ -57,18 +60,20 @@ Build options:
 boot/limine.conf   Limine menu/config
 linker.ld          Higher-half layout, page-aligned PT_LOAD segments
 src/
-  arch/x86_64/     ports, serial, qemu exit, SSE, GDT/TSS, IDT, PIC, PIT
-  arch/x86_64/interrupts.S  Exception/IRQ stubs and full GPR save/restore
+  arch/x86_64/     ports, serial, qemu exit, SSE, per-CPU state, GDT/TSS, IDT, PIC, PIT, LAPIC
+  arch/x86_64/cpu.zig       per-CPU GS-based state and SSE/FPU enablement
+  arch/x86_64/lapic.zig     xAPIC/x2APIC detection, EOI, and IPIs
+  arch/x86_64/interrupts.S  Exception/IRQ/IPI stubs, GPR and FPU save/restore
   arch/x86_64/smp_entry.S   AP entry: private stack, kernel CR3, ap_main
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M2-M10 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M11 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
-  memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch
+  memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch, TLB shootdown hook
   memory/heap.zig  lazily mapped first-fit kernel heap + std.mem.Allocator
-  sched.zig        scheduler, wait queues, mutex/condition, FPU state, idle task
-  smp.zig          Limine MP bring-up, AP contexts and SMP stress test
+  sched.zig        per-CPU scheduler, wait queues, mutex/condition, IPIs, TLB shootdown
+  smp.zig          Limine MP bring-up, AP scheduler entry and M11 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
 tools/run.sh       Build ESP (vvfat) and launch QEMU
 tools/genfont.py   Regenerate src/font.zig from a system font

@@ -75,6 +75,10 @@ ISR_NOERR 51   /* scheduler block */
 ISR_NOERR 52   /* scheduler wait queue */
 ISR_NOERR 53   /* scheduler timed wait */
 
+ISR_NOERR 240  /* IPI: reschedule */
+ISR_NOERR 241  /* IPI: TLB shootdown */
+ISR_NOERR 255  /* LAPIC spurious interrupt */
+
 IRQ_NOERR 32   /* IRQ0: PIT */
 IRQ_NOERR 33
 IRQ_NOERR 34
@@ -113,9 +117,9 @@ isr_common:
     pushq %r15
 
     /* Save the interrupted task's x87/SSE state before any Zig code can use
-     * SIMD registers. The scheduler updates current_fpu_state when it switches
-     * tasks; the matching restore happens immediately before iretq. */
-    movq current_fpu_state(%rip), %rax
+     * SIMD registers. %gs:0 points at the current task's 512-byte FXSAVE
+     * area; the scheduler updates it in switchTaskLocked. */
+    movq %gs:0, %rax
     testq %rax, %rax
     jz 1f
     fxsave64 (%rax)
@@ -135,7 +139,7 @@ isr_common:
      * Restore the FPU state after the dispatcher has finished using SIMD, so
      * the next task sees exactly the state saved on its last interrupt. */
     movq %rax, %r12
-    movq current_fpu_state(%rip), %rax
+    movq %gs:0, %rax
     testq %rax, %rax
     jz 2f
     fxrstor64 (%rax)
@@ -160,6 +164,38 @@ isr_common:
     iretq
 .size isr_common, .-isr_common
 
+/* Resume a scheduler context from normal (non-interrupt) code. Used by an AP
+ * to enter its idle task after `sched.initCpu`. RDI is the saved-register base
+ * returned by `initialFrame`. The FXSAVE pointer in %gs:0 has already been set
+ * by the scheduler. */
+.globl sched_resume
+.type sched_resume, @function
+sched_resume:
+    movq %rdi, %rsp
+    movq %gs:0, %rax
+    testq %rax, %rax
+    jz 3f
+    fxrstor64 (%rax)
+3:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    addq $16, %rsp
+    iretq
+.size sched_resume, .-sched_resume
+
 .section .rodata
 .align 8
 .globl isr_stub_table
@@ -177,5 +213,9 @@ irq_stub_table:
 .globl sched_stub_table
 sched_stub_table:
     .quad isr_48, isr_49, isr_50, isr_51, isr_52, isr_53
+
+.globl ipi_stub_table
+ipi_stub_table:
+    .quad isr_240, isr_241, isr_255
 
 .section .note.GNU-stack,"",@progbits
