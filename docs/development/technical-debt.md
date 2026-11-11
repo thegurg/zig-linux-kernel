@@ -2,14 +2,14 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M11; **RESOLVED** entries are kept so the audit trail and the remaining
+after M12; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
-> issue was fixed in the pre-M11 bugfix pass or in M11.
+> issue was fixed in the pre-M11 bugfix pass, M11, or M12.
 
 ## Critical
 
@@ -43,38 +43,44 @@ also changed to `extern struct` with an offset check for `stack_top`.
 
 ## High
 
-### 3. The heap is not thread-safe
+### 3. The heap was not thread-safe
 
-**Status: PARTIAL.** **Source:**
+**Status: RESOLVED (M12).** **Source:**
 [`src/memory/heap.zig`](../../src/memory/heap.zig).
 
-The PMM, VMM, console, and serial paths now have IRQ-safe locks. The heap free
-list, break, and statistics are still unsynchronized. Two CPUs calling
-`heap.alloc` or `heap.free` concurrently can corrupt the free list. The current
-M11 tests do not perform concurrent heap allocation, and boot-time allocation is
-single-threaded. A heap lock must be added before using the allocator from
-multiple CPUs; see the lock ordering in
-[synchronization](../architecture/synchronization.md).
+The free list, break, and statistics are now protected by `heap_lock`, an
+IRQ-safe spinlock acquired for every `alloc`, `free`, `stats`, and `init` call.
+`grow` runs under the same lock, so the lock order is heap before
+`vmm.table_lock` and `pmm.lock`. The M12 concurrent-heap test runs
+allocate/write/verify/free loops on every CPU and reports zero errors.
 
-### 4. TLB shootdown has a bounded, best-effort wait
+The grow path deliberately does not unmap pages on failure: it returns the
+mapped prefix to the free list and leaves the rest of that reserved range unused.
+This avoids holding `heap_lock` across a TLB shootdown. The lost address space
+is recorded as issue 15.
 
-**Status: PARTIAL.** **Sources:**
+### 4. TLB shootdown had a bounded, best-effort wait
+
+**Status: RESOLVED (M12).** **Sources:**
 [`src/memory/vmm.zig`](../../src/memory/vmm.zig),
 [`src/sched.zig`](../../src/sched.zig).
 
 `unmapPage` clears the PTE, releases the page-table lock, and invokes
-`sched.shootdownTlb`, which sends IPI 241 to every other online CPU and waits
-for acknowledgements. The wait is bounded at 50,000,000 `pause` iterations.
+`sched.shootdownTlb`. The old implementation used one shared address and an
+acknowledgement mask, serialized by a plain spinlock, and gave up after
+50,000,000 `pause` iterations.
 
-A target CPU that runs with interrupts disabled for longer than the bound will
-not acknowledge in time, and the shooter proceeds without its invalidation. The
-current tests shoot down from the BSP while the APs are idle, so this path is
-not stressed. A fully robust design needs a per-CPU pending-generation counter
-so a CPU can re-check a missed shootdown when it re-enables interrupts.
+The replacement uses lock-free per-CPU mailboxes: each shooter owns a row of
+`(address, sequence)` slots and each target acknowledges into its own column.
+`shootdownTlb` publishes a unique sequence, sends IPI 241, and waits until every
+target acknowledges that sequence. The IPI handler takes no locks, so a CPU that
+is itself waiting for acknowledgements can still service a request from another
+CPU. There is no timeout.
 
-The shootdown lock is a plain `SpinLock`, deliberately not `IrqSpinLock`, so a
-waiting shooter can still take a remote IPI. It must never be held while taking
-another lock.
+Callers must run `unmapPage` with interrupts enabled when other CPUs are online;
+otherwise the waiting CPU cannot take their shootdown IPIs. The heap grow path
+satisfies this by never unmapping while `heap_lock` is held. The M12 tests cover
+a target with interrupts disabled and several CPUs shooting down concurrently.
 
 ### 5. The timer is BSP-only and APs are not preempted by a timer
 
@@ -85,8 +91,8 @@ another lock.
 IRQ0 remains a legacy PIC/PIT interrupt delivered to the BSP. Every tick
 increments one global counter and scans all blocked tasks. APs switch tasks only
 through explicit scheduler calls or reschedule/TLB IPIs. There is no APIC timer,
-no per-CPU tick counter, and no timer-driven AP preemption. The M11 selftest
-masks IRQ0 before running the SMP tests, so AP sleep/timeout wakeup is not
+no per-CPU tick counter, and no timer-driven AP preemption. The selftest masks
+IRQ0 before running the M11/M12 SMP tests, so AP sleep/timeout wakeup is not
 covered end-to-end.
 
 ### 6. AP NMI handling is not tested
@@ -125,12 +131,13 @@ no join/wait-for-exit API; tests poll `finishedCount()`.
 **Status: PARTIAL.** Tasks use stacks supplied to `sched.create`. There is no
 guard page, automatic stack allocation, or stack-overflow detection.
 
-### 10. Allocator concurrency is not stress-tested
+### 10. Allocator concurrency is only lightly stressed
 
-**Status: PARTIAL.** The PMM and VMM have locks, but the M11 tests do not run
-concurrent allocation/mapping workloads. The VMM's `mapPage` can allocate a
-page-table page from the PMM while holding `table_lock`, so the lock order is
-`table_lock` before `pmm.lock`; this is documented but only lightly exercised.
+**Status: PARTIAL.** The M12 tests run concurrent heap allocations on every CPU
+and concurrent per-AP map/unmap loops. They do not force PMM exhaustion or
+page-table allocation failure. The VMM's `mapPage` can allocate a page-table page
+from the PMM while holding `table_lock`, so the lock order is `table_lock` before
+`pmm.lock`; this is documented and exercised, but not under memory pressure.
 
 ### 11. Test coverage gaps
 
@@ -138,20 +145,22 @@ page-table page from the PMM while holding `table_lock`, so the lock order is
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11:
+Covered in M11 and M12:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
+- concurrent heap allocation from every CPU;
+- TLB shootdown to a CPU with interrupts disabled;
+- several CPUs issuing TLB shootdowns concurrently;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11 and M12 result markers.
 
 Still open:
 
 - no AP NMI test;
-- no concurrent TLB-shootdown or interrupts-disabled-target test;
 - no AP timer/timeout test;
-- no concurrent heap allocation test;
-- no cross-CPU mutex/condition stress test.
+- no cross-CPU mutex/condition stress test;
+- no allocator test under PMM exhaustion or mapping failure.
 
 ## Low
 
@@ -174,6 +183,18 @@ page tables, privilege transitions, or per-process address spaces. The IDT
 dispatcher has a `from_user` branch for reporting, but user mode is not
 implemented.
 
+### 15. Partial heap growth leaks reserved virtual address space
+
+**Status: PARTIAL.** **Source:**
+[`src/memory/heap.zig`](../../src/memory/heap.zig).
+
+If a grow fails partway through mapping, the mapped prefix is returned to the
+free list but the rest of the reserved range is not reclaimed. The heap keeps a
+separate mapped-byte counter so statistics remain accurate, but repeated
+failures could exhaust the 64 MiB virtual reservation. Reclaiming the range
+would require unmapping pages and a TLB shootdown while the heap lock is held,
+which the allocator deliberately avoids.
+
 ## Implementation status summary
 
 | Area | Status | Notes |
@@ -183,11 +204,11 @@ implemented.
 | SMP scheduling | **IMPLEMENTED** | Per-CPU current/idle state; pinned tasks. |
 | Cross-CPU wakeups / IPIs | **IMPLEMENTED** | LAPIC/x2APIC, vectors 240/241/255. |
 | AP exception/FPU safety | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE; AP `int3` test. |
-| TLB shootdown | **PARTIAL** | Bounded acknowledgement wait; not stressed with IRQs disabled. |
-| Allocator thread safety | **PARTIAL** | PMM/VMM/console/serial locked; heap unlocked. |
+| TLB shootdown | **IMPLEMENTED** | Lock-free mailboxes; waits for every acknowledgement. |
+| Allocator thread safety | **IMPLEMENTED** | Heap, PMM, VMM, console, and serial use IRQ-safe locks. |
 | AP setup ordering | **RESOLVED** | SSE and `CR0.WP` set in the assembly stub; global TLB flushed after `CR3`. |
 | AP timer / per-CPU ticks | **DEFERRED** | Timer remains BSP PIT. |
-| Test coverage | **PARTIAL** | M11 tests added; gaps listed above. |
+| Test coverage | **PARTIAL** | M11/M12 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 8 CPUs. |
 
 ## Related documentation

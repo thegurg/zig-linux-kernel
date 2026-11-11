@@ -13,6 +13,8 @@
 const std = @import("std");
 const limine = @import("limine.zig");
 const vmm = @import("memory/vmm.zig");
+const pmm = @import("memory/pmm.zig");
+const heap = @import("memory/heap.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
@@ -23,8 +25,12 @@ const sched = @import("sched.zig");
 pub const max_cpus = gdt.max_cpus;
 const ap_stack_size = 16 * 1024;
 const stress_iterations: u64 = 100_000;
+const heap_stress_iterations: u64 = 1_000;
+const tlb_stress_iterations: u64 = 50;
 const max_start_spin: u64 = 50_000_000;
 const max_test_spin: u64 = 100_000_000;
+const tlb_stress_base: u64 = 0xffff_ffff_c200_0000;
+const irq_off_test_virt: u64 = 0xffff_ffff_c100_0000;
 
 /// Per-AP descriptor passed to the assembly entry stub. `stack_top` must stay
 /// at offset 0 because `smp_entry.S` loads it before any Zig code runs.
@@ -91,6 +97,18 @@ const ap_exc_pattern = [16]u8{
 var ap_exc_result: [16]u8 align(16) = @splat(0);
 var ap_exc_done: u64 = 0;
 var ap_exc_stack: [ap_stack_size]u8 align(16) = undefined;
+
+var heap_done: u64 = 0;
+var heap_errors: u64 = 0;
+var heap_test_stacks: [max_cpus][ap_stack_size]u8 align(16) = undefined;
+
+var irq_off_active: u64 = 0;
+var irq_off_done: u64 = 0;
+var irq_off_stack: [ap_stack_size]u8 align(16) = undefined;
+
+var tlb_stress_done: u64 = 0;
+var tlb_stress_errors: u64 = 0;
+var tlb_stress_stacks: [max_cpus][ap_stack_size]u8 align(16) = undefined;
 
 /// Physical PML4 used by the AP entry stub after it leaves Limine's page
 /// tables. Written once during `init`.
@@ -307,6 +325,213 @@ fn apExceptionWorker() callconv(.c) void {
           [result] "r" (&ap_exc_result),
         : .{ .xmm5 = true, .memory = true });
     _ = @atomicRmw(u64, &ap_exc_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+pub const ConcurrentHeapResult = struct {
+    allocs: u64,
+    errors: u64,
+};
+
+/// Allocate and free blocks concurrently on every CPU. The heap lock must keep
+/// the free list consistent under contention.
+pub fn runConcurrentHeapTest() ?ConcurrentHeapResult {
+    if (!initialized or !started) return null;
+
+    heap_done = 0;
+    heap_errors = 0;
+    const finished_base = sched.finishedCount();
+
+    var ap: usize = 0;
+    while (ap < stats.aps) : (ap += 1) {
+        const cpu_index: u32 = @intCast(ap + 1);
+        if (sched.createOn(cpu_index, "heap-worker", heapWorker, heap_test_stacks[ap][0..]) == null) {
+            return null;
+        }
+    }
+
+    heapWorkload();
+    _ = @atomicRmw(u64, &heap_done, .Add, 1, .seq_cst);
+
+    const expected_finished = finished_base + @as(u64, stats.aps);
+    var spin: u64 = 0;
+    while (@atomicLoad(u64, &heap_done, .acquire) < @as(u64, stats.aps) + 1 or
+        sched.finishedCount() < expected_finished)
+    {
+        if (spin >= max_test_spin) return null;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    return .{
+        .allocs = heap_stress_iterations * (@as(u64, stats.aps) + 1),
+        .errors = @atomicLoad(u64, &heap_errors, .acquire),
+    };
+}
+
+fn heapWorker() callconv(.c) void {
+    heapWorkload();
+    _ = @atomicRmw(u64, &heap_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+fn heapWorkload() void {
+    const sizes = [_]usize{ 24, 64, 257, 1024, 4096 };
+    var iteration: u64 = 0;
+    while (iteration < heap_stress_iterations) : (iteration += 1) {
+        const size = sizes[@intCast(iteration % sizes.len)];
+        const pattern: u8 = @truncate(0x5a +% iteration);
+        const ptr = heap.alloc(size, 16) orelse {
+            _ = @atomicRmw(u64, &heap_errors, .Add, 1, .seq_cst);
+            return;
+        };
+        @memset(ptr[0..size], pattern);
+        var index: usize = 0;
+        while (index < size) : (index += 1) {
+            if (ptr[index] != pattern) {
+                _ = @atomicRmw(u64, &heap_errors, .Add, 1, .seq_cst);
+                break;
+            }
+        }
+        heap.free(ptr, size);
+    }
+}
+
+/// Verify that a shootdown targeting a CPU with interrupts disabled waits for
+/// the pending IPI instead of timing out. The AP worker keeps interrupts off
+/// until it observes the shootdown request counter change.
+pub fn runIrqOffShootdownTest() ?bool {
+    if (!initialized or !started) return null;
+    if (stats.aps == 0) return true;
+
+    irq_off_active = 0;
+    irq_off_done = 0;
+    const finished_base = sched.finishedCount();
+
+    if (sched.createOn(1, "irq-off-tlb", irqOffWorker, irq_off_stack[0..]) == null) {
+        return null;
+    }
+
+    var spin: u64 = 0;
+    while (@atomicLoad(u64, &irq_off_active, .acquire) == 0) {
+        if (spin >= max_test_spin) return false;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    const phys = pmm.allocPage() orelse return null;
+    defer _ = pmm.freePage(phys);
+
+    if (vmm.translate(irq_off_test_virt) != null) return false;
+    if (!vmm.mapPage(irq_off_test_virt, phys, vmm.kernel_rw)) return false;
+    if (!vmm.unmapPage(irq_off_test_virt)) return false;
+
+    while (@atomicLoad(u64, &irq_off_done, .acquire) == 0 or
+        sched.finishedCount() < finished_base + 1)
+    {
+        if (spin >= max_test_spin) return false;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    return @atomicLoad(u64, &irq_off_done, .acquire) == 1;
+}
+
+fn irqOffWorker() callconv(.c) void {
+    const before = sched.tlbShootdownCount();
+    asm volatile ("cli" ::: .{ .memory = true });
+    @atomicStore(u64, &irq_off_active, 1, .release);
+
+    var spin: u64 = 0;
+    while (sched.tlbShootdownCount() == before) {
+        if (spin >= max_test_spin) break;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    // The shooter has published its request. Keep interrupts disabled briefly
+    // so the IPI is pending when it reaches this CPU.
+    var tail: u64 = 0;
+    while (tail < 1000) : (tail += 1) {
+        asm volatile ("pause");
+    }
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    @atomicStore(u64, &irq_off_active, 0, .release);
+
+    if (sched.tlbShootdownCount() != before) {
+        _ = @atomicRmw(u64, &irq_off_done, .Add, 1, .seq_cst);
+    }
+    sched.exit();
+}
+
+pub const ConcurrentTlbResult = struct {
+    shootdowns: u64,
+    errors: u64,
+};
+
+/// Map and unmap a private page on every AP concurrently. Several CPUs issue
+/// shootdowns at the same time, which exercises the per-shooter mailboxes.
+pub fn runConcurrentShootdownTest() ?ConcurrentTlbResult {
+    if (!initialized or !started) return null;
+    if (stats.aps == 0) return .{ .shootdowns = 0, .errors = 0 };
+
+    tlb_stress_done = 0;
+    tlb_stress_errors = 0;
+    const before = sched.tlbShootdownCount();
+    const finished_base = sched.finishedCount();
+
+    var ap: usize = 0;
+    while (ap < stats.aps) : (ap += 1) {
+        const cpu_index: u32 = @intCast(ap + 1);
+        if (sched.createOn(cpu_index, "tlb-worker", tlbStressWorker, tlb_stress_stacks[ap][0..]) == null) {
+            return null;
+        }
+    }
+
+    const expected_finished = finished_base + @as(u64, stats.aps);
+    var spin: u64 = 0;
+    while (@atomicLoad(u64, &tlb_stress_done, .acquire) < stats.aps or
+        sched.finishedCount() < expected_finished)
+    {
+        if (spin >= max_test_spin) return null;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    return .{
+        .shootdowns = sched.tlbShootdownCount() - before,
+        .errors = @atomicLoad(u64, &tlb_stress_errors, .acquire),
+    };
+}
+
+fn tlbStressWorker() callconv(.c) void {
+    const page_size: usize = @intCast(vmm.page_size);
+    const me: u64 = @intCast(cpu.currentIndex());
+    const virt = tlb_stress_base + me * vmm.page_size;
+
+    var iteration: u64 = 0;
+    while (iteration < tlb_stress_iterations) : (iteration += 1) {
+        const phys = pmm.allocPage() orelse {
+            _ = @atomicRmw(u64, &tlb_stress_errors, .Add, 1, .seq_cst);
+            break;
+        };
+        if (!vmm.mapPage(virt, phys, vmm.kernel_rw)) {
+            _ = pmm.freePage(phys);
+            _ = @atomicRmw(u64, &tlb_stress_errors, .Add, 1, .seq_cst);
+            break;
+        }
+
+        const ptr: [*]u8 = @ptrFromInt(virt);
+        @memset(ptr[0..page_size], @truncate(0x33 +% iteration));
+
+        if (!vmm.unmapPage(virt)) {
+            _ = @atomicRmw(u64, &tlb_stress_errors, .Add, 1, .seq_cst);
+        }
+        _ = pmm.freePage(phys);
+    }
+
+    _ = @atomicRmw(u64, &tlb_stress_done, .Add, 1, .seq_cst);
     sched.exit();
 }
 

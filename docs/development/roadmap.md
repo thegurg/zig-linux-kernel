@@ -4,9 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M11 are complete and validated through the QEMU test
-flow. The pre-M11 bugfix pass and M11 landed before this documentation update.
-M12 is the next milestone and has not been started.
+**Current status:** M0-M12 are complete and validated through the QEMU test
+flow. M13 is the next milestone and has not been scoped or started.
 
 ## Pre-M11 bugfix pass (complete)
 
@@ -42,10 +41,9 @@ is part of the milestone.
 
 1. **Lock ordering** — the order is documented in
    [synchronization](../architecture/synchronization.md). The scheduler uses one
-   global `task_lock`; the VMM and PMM use IRQ-safe allocator locks; the TLB
-   shootdown path uses a plain spinlock so a waiting CPU can still take the
-   remote shootdown IPI; console and serial lock messages; the heap remains
-   unlocked and is documented as partial.
+   global `task_lock`; the VMM and PMM use IRQ-safe allocator locks; console and
+   serial lock messages. The heap lock and the lock-free TLB mailboxes arrived
+   in M12.
 2. **Per-CPU scheduler state** — every CPU has a `CpuState` (current task, idle
    task, scan cursor, pending sleep/wait requests), a private idle stack, and a
    `PerCpu` block installed through the GS base MSR. Tasks are pinned to a CPU
@@ -100,23 +98,78 @@ compile-time offset checks for `fpu_state`, `index`, and `lapic_id`.
 - Replacing the PIC/PIT entirely; there is no APIC timer or IOAPIC routing yet.
 - More than `max_cpus = 8` without changing the GDT/TSS layout.
 
+## M12: allocator locking and TLB hardening (complete)
+
+### Goal
+
+Make the kernel heap safe for concurrent use and replace the bounded,
+shared-state TLB shootdown with a protocol that cannot silently drop an
+invalidation. Both changes must be verifiable under QEMU with active APs.
+
+### What landed
+
+1. **Heap lock** — `heap.alloc`, `free`, `stats`, and `init` take one IRQ-safe
+   `heap_lock`. `growLocked` maps and zeroes new pages while holding it, so the
+   lock order is `heap.lock` → `vmm.table_lock` → `pmm.lock`.
+2. **Partial-growth policy** — a grow that fails partway returns the mapped
+   prefix to the free list and leaves the reserved-but-unmapped tail unused. It
+   never unmaps while holding `heap_lock`, so it never waits for a TLB shootdown
+   with the lock held. `heap_mapped_bytes` keeps statistics accurate.
+3. **Lock-free TLB mailboxes** — each shooter owns a row of `(address,
+   sequence)` cells and each target acknowledges into its own column. The global
+   sequence counter makes stale requests distinguishable. The IPI handler scans
+   every shooter row, invalidates new sequences, and takes no locks.
+4. **Unbounded acknowledgement wait** — `shootdownTlb` waits until every target
+   acknowledges its sequence. A target with interrupts disabled keeps the
+   request pending in its LAPIC until it enables interrupts. Callers must call
+   `unmapPage` with interrupts enabled when other CPUs are online.
+5. **M12 tests** — `runConcurrentHeapTest` runs allocate/write/verify/free loops
+   on every CPU; `runIrqOffShootdownTest` shoots down to a CPU with interrupts
+   disabled; `runConcurrentShootdownTest` has every AP map/unmap a private page
+   concurrently. The selftest enables BSP interrupts for this phase while IRQ0
+   stays masked.
+
+### Validation
+
+The full matrix passed: default KVM `zig build test` (`SMP=4`), TCG
+(`ZIG_KERNEL_NO_KVM=1`), `ZIG_KERNEL_SMP=2`, `ZIG_KERNEL_SMP=1`, Debug
+(`-Doptimize=Debug`), and `zig build`. The default run reported:
+
+```text
+heap: concurrent allocs=4000, errors=0
+tlb: irq-off=1, concurrent shootdowns=150, errors=0
+selftest: M12 checks passed
+```
+
+`SMP=2` reported 2,000 allocations and 50 shootdowns; `SMP=1` skipped the
+AP-only tests and completed 1,000 BSP allocations. See
+[testing](testing.md) for the full record.
+
+### M12 non-goals
+
+- Per-CPU heap arenas or size classes.
+- Reclaiming the reserved tail left by a partial grow.
+- A TLB-shootdown fast path based on PCID or generation counters.
+- PMM exhaustion or page-table allocation-failure injection.
+
 ## Later work
 
-The following items are deferred beyond M11. They are ordered by dependency,
+The following items are deferred beyond M12. They are ordered by dependency,
 not by priority.
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| Heap locking | **PLANNED** | PMM, VMM, console, and serial are locked; the heap free list is not. |
+| Reclaim partial heap growth | **PLANNED** | A failed grow leaks the reserved-but-unmapped tail. |
 | LAPIC timer / IOAPIC interrupt routing | **PLANNED** | Timer ticks remain BSP-only through the PIT; APs receive only IPIs. |
 | Per-CPU timer preemption | **PLANNED** | APs are preempted only by reschedule/TLB IPIs, not by a timer. |
 | Physical memory above 4 GiB | **PLANNED** | PMM bitmap is sized for 4 GiB. |
 | Heap `resize`/`remap` | **PLANNED** | Currently `noResize`/`noRemap`. |
+| Per-CPU heap arenas | **PLANNED** | One global lock serializes all allocations. |
 | NX-bit policy | **PLANNED** | No executable/non-executable split yet. |
 | User mode and address-space isolation | **PLANNED** | All tasks share kernel page tables. |
 | Priorities, migration, join | **PLANNED** | Round-robin per CPU; tasks are pinned, tests poll counters. |
 | AP NMI and additional exception tests | **PLANNED** | AP `int3`/FPU state is covered; NMI is not. |
-| Concurrent heap/VMM allocation stress | **PLANNED** | VMM has a lock; heap does not. |
+| Allocator failure-path injection | **PLANNED** | No PMM-exhaustion or mapping-failure test. |
 
 ## Milestone history
 
@@ -137,6 +190,8 @@ not by priority.
 | M10 | **IMPLEMENTED** | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test. |
 | Pre-M11 | **IMPLEMENTED** | Interrupt-safe guards, AP setup ordering, accurate diagnostics, task return trampoline, host SMP/test harness fixes. |
 | M11 | **IMPLEMENTED** | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware blocking, TLB shootdown, AP exception/FPU state, expanded tests. |
+| M12 | **IMPLEMENTED** | IRQ-safe heap lock, concurrent allocator stress, lock-free TLB mailboxes, IRQ-off and concurrent shootdown tests. |
+| M13 | **PLANNED** | Not yet scoped. |
 
 ## Related documentation
 

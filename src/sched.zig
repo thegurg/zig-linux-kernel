@@ -308,13 +308,18 @@ var task_lock: sync.IrqSpinLock = .{};
 /// Bit N is set once CPU N has reached its scheduler idle loop.
 var online_mask: u64 = 0;
 
-/// Serializes TLB shootdown requests. This is a plain spinlock, not an
-/// IRQ-safe lock: a CPU waiting for it must still be able to take the remote
-/// shootdown IPI that the holder is waiting for. The caller may already have
-/// interrupts disabled, in which case only its own acknowledgements matter.
-var tlb_lock: sync.SpinLock = .{};
-var tlb_virt: u64 = 0;
-var tlb_acks: u64 = 0;
+/// Per-CPU TLB shootdown mailboxes. A shooter writes row `[shooter][target]`;
+/// the target acknowledges through `tlb_ack_seq[target][shooter]`. Each cell has
+/// a single writer, so the protocol is lock-free. Sequence numbers prevent a
+/// stale request from being mistaken for a new one.
+///
+/// `shootdownTlb` must run with interrupts enabled when other CPUs are online.
+/// The waiting CPU has to take their shootdown IPIs; a caller that disables
+/// interrupts and then waits can deadlock against another CPU doing the same.
+var tlb_virt: [max_cpus][max_cpus]u64 = @splat(@splat(0));
+var tlb_request_seq: [max_cpus][max_cpus]u64 = @splat(@splat(0));
+var tlb_ack_seq: [max_cpus][max_cpus]u64 = @splat(@splat(0));
+var tlb_next_seq: u64 = 0;
 var tlb_requests: u64 = 0;
 var reschedule_count: u64 = 0;
 
@@ -335,7 +340,10 @@ pub fn init() void {
     initialized = true;
     cpu_state = @splat(.{});
     online_mask = 0;
-    tlb_acks = 0;
+    tlb_virt = @splat(@splat(0));
+    tlb_request_seq = @splat(@splat(0));
+    tlb_ack_seq = @splat(@splat(0));
+    tlb_next_seq = 0;
     tlb_requests = 0;
 
     tasks[0] = .{
@@ -714,42 +722,57 @@ pub fn stats() Stats {
 
 /// Invalidate `virt` on every other online CPU. Called by the VMM after
 /// releasing its page-table lock. The local CPU has already executed `invlpg`.
+///
+/// The request is published in this CPU's mailbox row before each IPI. The
+/// shooter then waits until every target has acknowledged its sequence number.
+/// There is no timeout: a target that runs with interrupts disabled keeps the
+/// request pending in its LAPIC until it enables interrupts, at which point the
+/// handler invalidates the page and acknowledges. Callers must therefore not
+/// call `unmapPage` with interrupts disabled when other CPUs are online.
 pub fn shootdownTlb(virt: u64) void {
-    tlb_lock.acquire();
-    defer tlb_lock.release();
-
-    const me: u6 = @intCast(cpu.currentIndex());
-    const targets = @atomicLoad(u64, &online_mask, .acquire) & ~(@as(u64, 1) << me);
+    const me: usize = @intCast(cpu.currentIndex());
+    const targets = @atomicLoad(u64, &online_mask, .acquire) & ~(@as(u64, 1) << @intCast(me));
 
     _ = @atomicRmw(u64, &tlb_requests, .Add, 1, .monotonic);
     if (targets == 0) return;
 
-    @atomicStore(u64, &tlb_virt, virt, .release);
-    @atomicStore(u64, &tlb_acks, 0, .release);
+    const seq = @atomicRmw(u64, &tlb_next_seq, .Add, 1, .monotonic) + 1;
 
-    var index: u32 = 0;
+    var index: usize = 0;
     while (index < max_cpus) : (index += 1) {
         if ((targets & (@as(u64, 1) << @intCast(index))) == 0) continue;
+        @atomicStore(u64, &tlb_virt[me][index], virt, .monotonic);
+        @atomicStore(u64, &tlb_request_seq[me][index], seq, .release);
         lapic.sendIpi(cpu.per_cpu[index].lapic_id, tlb_vector);
     }
 
-    var spin: u64 = 0;
-    while ((@atomicLoad(u64, &tlb_acks, .acquire) & targets) != targets) {
-        if (spin >= 50_000_000) break;
-        spin += 1;
-        asm volatile ("pause");
+    index = 0;
+    while (index < max_cpus) : (index += 1) {
+        if ((targets & (@as(u64, 1) << @intCast(index))) == 0) continue;
+        while (@atomicLoad(u64, &tlb_ack_seq[index][me], .acquire) < seq) {
+            asm volatile ("pause");
+        }
     }
 }
 
-/// IPI handler: invalidate the page recorded by `shootdownTlb` and acknowledge.
+/// IPI handler: scan every shooter's mailbox, invalidate new requests, and
+/// acknowledge. No locks are taken, so a CPU spinning in `shootdownTlb` can
+/// still service a request from another CPU.
 pub fn tlbInterrupt() void {
-    const me: u6 = @intCast(cpu.currentIndex());
-    const virt = @atomicLoad(u64, &tlb_virt, .acquire);
-    asm volatile ("invlpg (%[virt])"
-        :
-        : [virt] "r" (virt),
-        : .{ .memory = true });
-    _ = @atomicRmw(u64, &tlb_acks, .Or, @as(u64, 1) << me, .release);
+    const me: usize = @intCast(cpu.currentIndex());
+    var shooter: usize = 0;
+    while (shooter < max_cpus) : (shooter += 1) {
+        const seq = @atomicLoad(u64, &tlb_request_seq[shooter][me], .acquire);
+        if (seq == 0) continue;
+        if (seq <= @atomicLoad(u64, &tlb_ack_seq[me][shooter], .acquire)) continue;
+
+        const virt = @atomicLoad(u64, &tlb_virt[shooter][me], .acquire);
+        asm volatile ("invlpg (%[virt])"
+            :
+            : [virt] "r" (virt),
+            : .{ .memory = true });
+        @atomicStore(u64, &tlb_ack_seq[me][shooter], seq, .release);
+    }
 }
 
 fn currentTask() ?*Task {

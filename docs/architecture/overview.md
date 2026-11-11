@@ -3,8 +3,8 @@
 **Purpose:** describe what zig-kernel is, the constraints it is built under,
 which milestones are implemented, and how the source tree is organized.
 
-**Implementation status:** M0-M11 are implemented and validated through the
-QEMU test flow. M12 is planned. See the per-subsystem documents for the exact
+**Implementation status:** M0-M12 are implemented and validated through the
+QEMU test flow. M13 is planned. See the per-subsystem documents for the exact
 status of individual features.
 
 ## Project facts
@@ -16,7 +16,7 @@ status of individual features.
 | Boot path | Limine 12.9.4, UEFI, Limine boot protocol base revision 3 | [`src/limine.zig`](../../src/limine.zig) |
 | Kernel base | `0xffffffff80000000` (higher half) | [`linker.ld`](../../linker.ld) |
 | Default build | `ReleaseSafe` with LLVM (`exe.use_llvm = true`) | [`build.zig`](../../build.zig) |
-| Current version string | `0.14.0-m11` | [`src/main.zig`](../../src/main.zig) |
+| Current version string | `0.15.0-m12` | [`src/main.zig`](../../src/main.zig) |
 | Primary test platform | QEMU with KVM when available, TCG as fallback | [`tools/run.sh`](../../tools/run.sh) |
 
 ## Design constraints
@@ -56,7 +56,8 @@ status of individual features.
 | M9 | FPU/SIMD context switching with per-task `FXSAVE`/`FXRSTOR` areas | **IMPLEMENTED** |
 | M10 | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test | **IMPLEMENTED** |
 | M11 | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition, TLB shootdown, AP exception/FPU state | **IMPLEMENTED** |
-| M12 | Next milestone; not yet scoped or started | **PLANNED** |
+| M12 | IRQ-safe heap locking, concurrent allocator stress, lock-free TLB-shootdown mailboxes, IRQ-off and concurrent shootdown tests | **IMPLEMENTED** |
+| M13 | Next milestone; not yet scoped or started | **PLANNED** |
 
 Detailed milestone behavior is documented in the subsystem pages:
 [memory](memory.md), [CPU and interrupts](cpu-interrupts.md),
@@ -86,8 +87,8 @@ normal boot: PIT 100 Hz -> IRQ0 on BSP -> per-CPU idle tasks
 Every CPU runs its own scheduler state. IRQ0 drives preemption on the BSP; APs
 enter their idle tasks, switch tasks on explicit scheduler calls, and receive
 reschedule (240) and TLB-shootdown (241) IPIs. Blocking primitives wake tasks
-across CPUs, and `unmapPage` issues a shootdown after releasing the page-table
-lock. The heap remains unlocked and is documented as partial.
+across CPUs. Heap, PMM, VMM, console, and serial state use IRQ-safe locks;
+`unmapPage` issues a lock-free shootdown after releasing the page-table lock.
 
 ## Source layout
 
@@ -95,7 +96,7 @@ lock. The heap remains unlocked and is documented as partial.
 | --- | --- |
 | [`boot/limine.conf`](../../boot/limine.conf) | Limine menu and kernel path. |
 | [`linker.ld`](../../linker.ld) | Higher-half layout and page-aligned `PT_LOAD` segments. |
-| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M11 self-tests. |
+| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M12 self-tests. |
 | [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests. |
 | [`src/console.zig`](../../src/console.zig) | Framebuffer text console with serial mirroring. |
 | [`src/font.zig`](../../src/font.zig) | 8x16 bitmap font. |
@@ -104,7 +105,7 @@ lock. The heap remains unlocked and is documented as partial.
 | [`src/smp.zig`](../../src/smp.zig) | Limine MP bring-up, AP contexts, AP scheduler entry, SMP tests. |
 | [`src/memory/pmm.zig`](../../src/memory/pmm.zig) | Bitmap physical page allocator. |
 | [`src/memory/vmm.zig`](../../src/memory/vmm.zig) | 4-level page tables, kernel/HHDM mappings, CR3 switch. |
-| [`src/memory/heap.zig`](../../src/memory/heap.zig) | Lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
+| [`src/memory/heap.zig`](../../src/memory/heap.zig) | IRQ-safe, lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
 | [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement and GS-based per-CPU state. |
 | [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, and IPIs. |
 | [`src/arch/x86_64/gdt.zig`](../../src/arch/x86_64/gdt.zig) | GDT, per-CPU TSS, #DF IST stacks. |

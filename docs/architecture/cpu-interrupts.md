@@ -179,7 +179,9 @@ this order:
 1. **Reschedule IPI 240**: send LAPIC EOI and return
    `sched.rescheduleInterrupt(saved_rsp)`.
 2. **TLB IPI 241**: send LAPIC EOI, call `sched.tlbInterrupt()`, and return
-   `saved_rsp` unchanged.
+   `saved_rsp` unchanged. The handler scans the lock-free per-CPU mailboxes and
+   takes no kernel locks, so it can run while another CPU is waiting for
+   shootdown acknowledgements.
 3. **Spurious vector 255**: return `saved_rsp` without an EOI.
 4. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
    `sched.tick(saved_rsp)`; all other IRQs return `saved_rsp` unchanged.

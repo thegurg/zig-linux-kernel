@@ -199,6 +199,24 @@ CPU a reschedule IPI. The PIT itself remains a BSP interrupt; no AP takes IRQ0.
 
 This is how a task created on an AP, or woken on another CPU, starts running.
 
+### TLB shootdown IPI
+
+`sched.shootdownTlb(virt)` runs after the VMM has cleared a PTE and released its
+page-table lock. It:
+
+1. snapshots `online_mask` and excludes the current CPU (the local `invlpg` has
+   already happened);
+2. allocates a unique sequence number and, for every target, writes the virtual
+   address and sequence into the shooter's mailbox row, then sends IPI 241;
+3. waits until each target's acknowledgement column is at least that sequence.
+
+`tlbInterrupt()` scans every shooter's mailbox, invalidates each sequence it has
+not acknowledged, and writes the acknowledgement. The handler takes no locks, so
+a CPU waiting for acknowledgements can still service a request from another CPU.
+There is no timeout: a target with interrupts disabled keeps the IPI pending
+until it enables interrupts. Callers must therefore run `unmapPage` with
+interrupts enabled when other CPUs are online.
+
 ### Yield
 
 `yieldCurrent(saved_rsp)` saves the current `rsp`, finds the next ready task on
@@ -319,6 +337,9 @@ The scheduler is exercised by the selftest image described in
 | M11 cross-CPU wake | A task blocked on CPU 1 is woken from the BSP through a reschedule IPI. |
 | M11 AP exception/FPU | An AP task preserves XMM5 across `int3`. |
 | M11 TLB shootdown | `unmapPage` after AP bring-up increments the shootdown counter. |
+| M12 concurrent heap | Every CPU allocates, writes, verifies, and frees blocks concurrently with zero errors. |
+| M12 IRQ-off TLB | A shootdown targeting a CPU that has interrupts disabled completes after that CPU enables them and services the pending IPI. |
+| M12 concurrent TLB | Every AP maps and unmaps a private page concurrently; all shootdowns complete with zero errors. |
 
 ## Limitations
 
@@ -348,6 +369,7 @@ The scheduler is exercised by the selftest image described in
 | Per-CPU idle tasks and slot reuse | **IMPLEMENTED** | 8 KiB idle stacks; task limit 32. |
 | FPU/SIMD context switching | **IMPLEMENTED** | Per-task 512-byte FXSAVE area; `%gs:0` pointer. |
 | Cross-CPU wakeups | **IMPLEMENTED** | Reschedule IPI 240. |
+| TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241; waits for every acknowledgement. |
 | AP timer preemption | **PLANNED** | Requires an APIC timer or routed IRQ0. |
 | Priorities, migration, join | **PLANNED** | Not implemented. |
 

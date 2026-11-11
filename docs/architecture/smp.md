@@ -27,8 +27,9 @@ tick counter, so deadline wakeups are scanned on the BSP and delivered to other
 CPUs by reschedule IPI.
 
 The kernel still does **not** provide an APIC timer, IOAPIC routing, AP
-preemption by timer, or per-CPU tick counters. Allocator locking is partial: the
-PMM, VMM, console, and serial paths are locked; the heap is not.
+preemption by timer, or per-CPU tick counters. The heap, PMM, VMM, console, and
+serial paths all use IRQ-safe locks, and TLB shootdowns use lock-free per-CPU
+mailboxes.
 
 ## Limine MP protocol
 
@@ -231,20 +232,23 @@ IRQ0 also sends a LAPIC EOI in addition to the PIC EOI.
 the lock, then invokes the registered `sched.shootdownTlb` callback for the
 unmapped address. The callback:
 
-1. takes a plain `SpinLock` so a waiting shooter can still receive the remote
-   IPI;
-2. reads `sched.online_mask` and excludes the calling CPU;
-3. records the address and resets the acknowledgement mask;
+1. reads `sched.online_mask` and excludes the calling CPU;
+2. allocates a unique sequence number;
+3. writes the address and sequence into its own row of the per-CPU mailboxes
+   for every target;
 4. sends IPI 241 to every other online CPU;
-5. waits until every target has set its acknowledgement bit.
+5. waits until every target's acknowledgement column reaches that sequence.
 
-The handler executes `invlpg` for the shared address, then sets its bit in
-`tlb_acks`. The local CPU has already executed `invlpg` inside the VMM.
+The handler scans all shooter rows, executes `invlpg` for each unacknowledged
+sequence, and records the acknowledgement. It takes no locks, so a CPU waiting
+for acknowledgements can still service a request from another CPU. The local CPU
+has already executed `invlpg` inside the VMM.
 
-The wait is bounded (50,000,000 `pause` iterations); a CPU that cannot
-acknowledge in time causes a best-effort completion rather than a permanent
-hang. This is a limitation for interrupts-disabled callers and is recorded in
-[technical debt](../development/technical-debt.md).
+There is no timeout. A target with interrupts disabled keeps the request pending
+in its LAPIC until it enables interrupts; `unmapPage` callers must therefore have
+interrupts enabled when other CPUs are online. The M12 IRQ-off test exercises
+this path, and the concurrent-shootdown test has several APs issuing requests at
+once.
 
 ## SMP tests
 
@@ -277,13 +281,29 @@ and checks that `sched.tlbShootdownCount()` increases. `selftestLockGuards()`
 checks that nested `IrqSpinLock` guards disable interrupts while held and
 restore the previous state independently.
 
+### M12 allocator and TLB tests
+
+- `runConcurrentHeapTest()` creates one task per AP and runs the same
+  allocate/write/verify/free workload on the BSP. It returns the allocation count
+  and the number of errors; the M12 test requires zero errors.
+- `runIrqOffShootdownTest()` creates a worker on CPU 1 that disables interrupts
+  and waits for the shootdown request counter to change. The BSP maps and unmaps
+  a test page; the shootdown must wait until the worker executes `sti`, takes the
+  pending IPI, invalidates the page, and acknowledges.
+- `runConcurrentShootdownTest()` creates one worker per AP. Each repeatedly maps,
+  writes, and unmaps a private page, so several CPUs issue shootdowns at the same
+  time. It returns the shootdown count and the number of errors.
+
 The selftest log is:
 
 ```text
 smp: cpus=4, aps=3, online=3, counter=400000, expected=400000, overlap=0
 tlb: shootdowns=1
 smp: cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1
-smp: smp checks passed
+selftest: smp checks passed
+heap: concurrent allocs=4000, errors=0
+tlb: irq-off=1, concurrent shootdowns=150, errors=0
+selftest: M12 checks passed
 ```
 
 ## Boot-mode behavior
@@ -291,7 +311,7 @@ smp: smp checks passed
 | Mode | AP behavior |
 | --- | --- |
 | Normal kernel | `kmain` calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state and enter the scheduler idle loop. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling, and runs the M11 tests. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11 and M12 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
 
 The normal-run log is:
@@ -303,7 +323,7 @@ smp: 3 APs online, scheduler idle
 
 ## Recorded validation
 
-M11 validation ran the full matrix:
+M12 validation ran the full matrix:
 
 - default KVM `zig build test` (`SMP=4`, ReleaseSafe): passed;
 - `ZIG_KERNEL_NO_KVM=1 zig build test` (TCG): passed;
@@ -311,9 +331,16 @@ M11 validation ran the full matrix:
 - `ZIG_KERNEL_SMP=1 zig build test`: passed;
 - `zig build -Doptimize=Debug test`: passed;
 - `zig build`: passed;
-- the smoke result was `counter=400000, expected=400000, overlap=0`, with
-  `cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1`;
+- the default smoke result was `counter=400000, expected=400000, overlap=0`,
+  `cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1`,
+  `heap: concurrent allocs=4000, errors=0`, and
+  `tlb: irq-off=1, concurrent shootdowns=150, errors=0`;
+- `SMP=2` reported `heap: concurrent allocs=2000` and 50 shootdowns; `SMP=1`
+  correctly skipped the AP-only tests and reported 1,000 BSP allocations;
 - `zig fmt --check build.zig src` and `git diff --check`: passed.
+
+The earlier M11 validation is recorded in the
+[roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
 
@@ -325,10 +352,10 @@ M11 validation ran the full matrix:
 | Per-CPU scheduler/run queues | **IMPLEMENTED** | Pinned tasks; one global task table guarded by `task_lock`. |
 | Local APIC and x2APIC | **IMPLEMENTED** | xAPIC MMIO through HHDM; x2APIC MSRs. |
 | IPIs and cross-CPU wakeups | **IMPLEMENTED** | Vectors 240 and 241; spurious gate 255. |
-| TLB shootdown | **PARTIAL** | Bounded wait; callers that disable interrupts can delay acknowledgement. |
+| TLB shootdown | **IMPLEMENTED** | Lock-free mailboxes; waits for every online CPU to acknowledge. |
 | AP exception and FPU state | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE pointer; AP `int3` test. |
 | PMM/VMM/console/serial locking | **IMPLEMENTED** | IRQ-safe locks; VMM page-table lock plus TLB callback. |
-| Heap locking | **PLANNED** | Heap free list remains single-CPU. |
+| Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
 | APIC timer / IOAPIC routing | **PLANNED** | Timer remains BSP PIT/IRQ0. |
 | Timer-driven AP preemption | **PLANNED** | APs only switch on IPIs or explicit calls. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |

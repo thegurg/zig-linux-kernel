@@ -1,7 +1,7 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-harness assertions, and the validation recorded for M11.
+harness assertions, and the validation recorded for M12.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -12,7 +12,7 @@ verification path for each milestone. Coverage gaps are documented below and in
 | Layer | Command | What it proves |
 | --- | --- | --- |
 | Host unit tests | part of `zig build test` | The host harness and the pure Limine binding test run. |
-| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, synchronization, FPU, LAPIC/IPIs, and SMP tests work together. |
+| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
 
 `zig build test` runs all three. It builds the selftest and fault-test images
@@ -65,8 +65,12 @@ initialization, `kmain` runs the checks in this order.
 | M11 AP exception/FPU | `smp: cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1` | An AP task preserves XMM5 across `int3`; `int3` returns. |
 | M11 TLB shootdown | `tlb: shootdowns=<n>` | Maps and unmaps a test page after APs are online and checks the shootdown counter increased. |
 | M11 nested locks | `nested locks=1` | Nested `IrqSpinLock` guards disable interrupts while held and restore the outer state on release. |
-| `int3` | `returned from int3`, `M11 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
-| Success | `M11 checks passed` | Exits QEMU successfully. |
+| M11 result | `M11 checks passed` | The scheduler/SMP group completed. |
+| M12 concurrent heap | `heap: concurrent allocs=<n>, errors=0` | Every CPU allocates, writes, verifies, and frees blocks concurrently. The count is 1,000 per online CPU (BSP included). |
+| M12 IRQ-off TLB | `tlb: irq-off=1` | A CPU disables interrupts, the BSP unmaps a page, and the shootdown completes only after that CPU enables interrupts and services the pending IPI. |
+| M12 concurrent TLB | `tlb: irq-off=1, concurrent shootdowns=<n>, errors=0` | Every AP maps and unmaps a private page concurrently; the reported count is the number of shootdowns issued with zero errors. |
+| `int3` | `returned from int3`, `M12 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
+| Success | `M12 checks passed` | Exits QEMU successfully. |
 
 The selftest logs diagnostic lines such as:
 
@@ -85,6 +89,8 @@ smp: 3 APs online for scheduler tests
 smp: cpus=4, aps=3, online=3, counter=400000, expected=400000, overlap=0
 tlb: shootdowns=1
 smp: cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1
+heap: concurrent allocs=4000, errors=0
+tlb: irq-off=1, concurrent shootdowns=150, errors=0
 ```
 
 Timing values vary by host and acceleration mode; the assertions check
@@ -112,7 +118,7 @@ The #PF handler must print:
 and the kernel exits through the failure path, producing QEMU status 35. The
 harness accepts status 35 only if both the `vector 14: #PF` and `cr2=0x0` log
 lines are present. In this image the APs are already in their scheduler idle
-loops, so the fault path runs with M11 SMP state active.
+loops, so the fault path runs with active per-CPU scheduler state.
 
 ## Harness assertions
 
@@ -124,7 +130,11 @@ example below shows the default:
 
 ```text
 returned from int3
+M12 checks passed
 M11 checks passed
+heap: concurrent allocs=.*errors=0
+tlb: irq-off=1
+concurrent shootdowns=
 M9 checks passed
 M8 checks passed
 M7 checks passed
@@ -175,7 +185,7 @@ The test modes time out after 90 seconds.
 
 ## Recorded validation
 
-M11 validation ran the full matrix after the documentation update:
+M12 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -190,26 +200,33 @@ The default KVM run reported:
 smp: cpus=4, aps=3, online=3, counter=400000, expected=400000, overlap=0
 tlb: shootdowns=1
 smp: cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1
-smp checks passed
-selftest: M11 checks passed, exiting QEMU
+selftest: M11 checks passed
+heap: concurrent allocs=4000, errors=0
+tlb: irq-off=1, concurrent shootdowns=150, errors=0
+selftest: M12 checks passed
+selftest: exiting QEMU
 ```
 
-`zig fmt --check build.zig src` and `git diff --check` were run before the M11
-commit. Earlier M10 and pre-M11 validation remains in
+With `ZIG_KERNEL_SMP=2`, the heap test reported 2,000 allocations and 50
+shootdowns. With `ZIG_KERNEL_SMP=1`, the AP-only tests were skipped and the BSP
+completed 1,000 allocations.
+
+`zig fmt --check build.zig src` and `git diff --check` were run before the M12
+commit. Earlier M10, pre-M11, and M11 validation remains in
 [SMP](../architecture/smp.md#recorded-validation) and the roadmap.
 
 ## Coverage gaps
 
 - There is no AP NMI test. AP `int3` and FPU-state preservation are covered.
-- TLB shootdown is tested from the BSP while the APs are idle. There is no
-  concurrent-shootdown stress test or test with a target CPU holding
-  interrupts disabled.
+- The M12 tests cover a target with interrupts disabled and several concurrent
+  shootdowns, but not a CPU that never re-enables interrupts.
 - The SMP timer path is not exercised: `selftestSmp` masks IRQ0 before running
-  the M11 tests, and APs have no timer. AP sleep/timeout wakeups are therefore
-  not covered end-to-end.
+  the M11/M12 tests, and APs have no timer. AP sleep/timeout wakeups are
+  therefore not covered end-to-end.
 - There is no cross-CPU mutex/condition stress test; the cross-CPU wake test
   covers the wait-queue/IPI path.
-- There is no concurrent heap allocation test because the heap is unlocked.
+- The concurrent heap test does not force PMM exhaustion or page-table
+  allocation failure.
 - Debug builds are validated by running the same test flow with
   `-Doptimize=Debug`, but there is no separate debug-only test suite.
 
@@ -218,16 +235,17 @@ commit. Earlier M10 and pre-M11 validation remains in
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M11 behavior, AP scheduling, IPIs, and `int3`. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M12 behavior, AP scheduling, IPIs, concurrent allocation, TLB hardening, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11 test results. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11/M12 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
-| TLB-shootdown test | **IMPLEMENTED** | Checks the shootdown counter after an unmap. |
+| TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |
 | Nested lock test | **IMPLEMENTED** | Nested `IrqSpinLock` guards. |
 | Cross-CPU wake test | **IMPLEMENTED** | BSP wakes a CPU 1 task. |
+| Concurrent heap test | **IMPLEMENTED** | All CPUs allocate/write/verify/free concurrently. |
 | AP timer / NMI tests | **PLANNED** | APs have no timer; NMI is not tested. |
-| Concurrent heap/allocator stress | **PLANNED** | Heap is unlocked. |
+| Allocator failure-path test | **PLANNED** | No PMM-exhaustion or mapping-failure test. |
 
 ## Related documentation
 

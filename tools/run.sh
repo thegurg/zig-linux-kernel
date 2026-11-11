@@ -81,7 +81,11 @@ if [ "$MODE" != "run" ]; then
     case $status in
       33)
         if grep -q "returned from int3" "$WORK/serial.log" &&
+           grep -q "M12 checks passed" "$WORK/serial.log" &&
            grep -q "M11 checks passed" "$WORK/serial.log" &&
+           grep -q "heap: concurrent allocs=.*errors=0" "$WORK/serial.log" &&
+           grep -q "tlb: irq-off=1" "$WORK/serial.log" &&
+           grep -q "concurrent shootdowns=" "$WORK/serial.log" &&
            grep -q "M9 checks passed" "$WORK/serial.log" &&
            grep -q "M8 checks passed" "$WORK/serial.log" &&
            grep -q "M7 checks passed" "$WORK/serial.log" &&

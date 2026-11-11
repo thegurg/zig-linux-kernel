@@ -3,10 +3,9 @@
 **Purpose:** describe the three memory layers in zig-kernel: the physical page
 allocator (PMM), the virtual memory manager (VMM), and the kernel heap.
 
-**Implementation status:** all three layers are **IMPLEMENTED**. The PMM and VMM
-are protected by IRQ-safe locks and the VMM issues a TLB shootdown after
-unmapping a page. The heap is **PARTIAL**: its free list is not locked. The PMM
-does not manage physical memory above 4 GiB.
+**Implementation status:** all three layers are **IMPLEMENTED** and protected by
+IRQ-safe locks. The VMM issues a lock-free TLB shootdown after unmapping a page.
+The PMM does not manage physical memory above 4 GiB.
 
 ## Layer overview
 
@@ -125,9 +124,10 @@ managed limit.
 
 ### Limitations
 
-- TLB shootdown waits for acknowledgements with a bounded spin. A target CPU
-  that runs with interrupts disabled for a long time can delay completion; the
-  shooter proceeds best-effort after the limit. See
+- TLB shootdown waits for acknowledgements from every other online CPU. There is
+  no timeout: a target with interrupts disabled keeps the request pending until
+  it enables interrupts. Callers must not invoke `unmapPage` with interrupts
+  disabled when other CPUs are online. See
   [technical debt](../development/technical-debt.md).
 - There is no user-space mapping support, no copy-on-write, and no demand
   paging. The VMM maps and unmaps explicit pages only.
@@ -150,10 +150,13 @@ The heap owns a fixed 64 MiB virtual range:
   pointer. The header stores a magic value (`0x4b48_4541_504d_3143`,
   "KHEAPM1C"), the block start, the total block size, and the requested size.
 - Minimum block size is 64 bytes.
-- `grow` asks the PMM for pages, maps them with `vmm.mapPage(..., kernel_rw)`,
-  zeroes them, advances `heap_brk`, and inserts the new region into a sorted
-  free list.
-- Allocation is first-fit with arbitrary power-of-two alignment.
+- `grow` reserves the next virtual range, asks the PMM for pages, maps them with
+  `vmm.mapPage(..., kernel_rw)`, zeroes them, and inserts the new region into a
+  sorted free list. A partial failure returns the mapped prefix to the free list
+  and leaves the remaining reserved range unused; it never unmaps while the heap
+  lock is held.
+- Allocation is first-fit with arbitrary power-of-two alignment, under one
+  IRQ-safe `heap_lock`.
 - Freeing inserts the block in address order and coalesces with the next and
   previous free blocks.
 - `resize` and `remap` are not implemented; the `std.mem.Allocator` adapter
@@ -163,24 +166,27 @@ The heap owns a fixed 64 MiB virtual range:
 
 | Function | Behavior |
 | --- | --- |
-| `init() void` | Clears the free list and resets the break to the heap base. |
+| `init() void` | Clears the free list, resets the break and mapped-byte counter to the heap base. |
 | `alloc(size, alignment) ?[*]u8` | Returns an aligned block, growing the heap if no free block fits. Rejects zero size and non-power-of-two alignment. |
 | `free(ptr, size) void` | Validates the header magic, block bounds, and optional size, then returns the block to the free list. |
 | `stats() Stats` | Reports reserved, mapped, free, and allocated bytes. |
 | `allocator` | `std.mem.Allocator` adapter backed by `alloc`/`free`. |
 
-`grow` rolls back already-mapped pages if a later PMM allocation or VMM mapping
-fails. The selftest allocates 64, 128, and 4096-byte blocks with different
+A failed `grow` returns the already-mapped prefix to the free list instead of
+unmapping it, because unmapping would require a TLB shootdown while `heap_lock`
+is held. The selftest allocates 64, 128, and 4096-byte blocks with different
 alignments, verifies non-overlap and contents, frees and reuses a block, uses
 the allocator adapter, rejects an allocation larger than the reserved range,
-and checks the final free/mapped counters.
+and checks the final free/mapped counters. The M12 SMP test runs the same
+allocate/write/verify/free pattern concurrently on every CPU.
 
 ### Limitations
 
-- The heap is not thread-safe; the PMM, VMM, console, and serial drivers use
-  IRQ-safe locks.
+- A partial grow leaks the reserved-but-unmapped tail of that request; the
+  address space is not reclaimed.
 - The reserved range is fixed at 64 MiB; there is no remapping or shrinking.
-- There are no per-CPU arenas or size classes.
+- One global IRQ-safe lock serializes every allocation and free; there are no
+  per-CPU arenas or size classes.
 - `free` silently ignores unknown or corrupted pointers rather than reporting an
   error.
 
@@ -193,9 +199,9 @@ and checks the final free/mapped counters.
 | Kernel text/rodata read-only | **IMPLEMENTED** | `CR0.WP` enabled. |
 | Lazy kernel heap with allocator adapter | **IMPLEMENTED** | First-fit, coalescing, alignment. |
 | Heap `resize`/`remap` | **PLANNED** | Not implemented; `noResize`/`noRemap` are used. |
-| TLB shootdown | **IMPLEMENTED** | IPI 241 after `unmapPage`; bounded acknowledgement wait. |
+| TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241 after `unmapPage`; waits for every ack. |
 | PMM/VMM locking | **IMPLEMENTED** | IRQ-safe allocator and page-table locks. |
-| Heap locking | **PLANNED** | Free list is not safe for concurrent use. |
+| Heap locking | **IMPLEMENTED** | One IRQ-safe lock; concurrent M12 allocation test. |
 | Physical memory above 4 GiB | **PLANNED** | Not managed. |
 | User-space mappings / demand paging | **PLANNED** | Not implemented. |
 

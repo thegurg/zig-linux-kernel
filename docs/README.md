@@ -19,7 +19,7 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.14.0-m11`. Milestones M0 through M11 are implemented; M12 is planned.
+`0.15.0-m12`. Milestones M0 through M12 are implemented; M13 is planned.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | --- | --- |
 | [Overview](architecture/overview.md) | Goals, constraints, milestone status, source layout, and how the subsystems fit together. |
 | [Boot and early bring-up](architecture/boot.md) | Limine/UEFI handoff, linker layout, `_start`, `kmain`, boot variants, and the console. |
-| [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, and the kernel heap. |
+| [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, the kernel heap, and TLB shootdown. |
 | [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, and the LAPIC. |
 | [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
 | [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
@@ -40,7 +40,7 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | [Building](development/building.md) | Toolchain requirements, build options, kernel variants, and the QEMU harness. |
 | [Testing](development/testing.md) | Host tests, QEMU smoke and fault tests, assertions, exit codes, and recorded results. |
 | [Technical debt and known issues](development/technical-debt.md) | Correctness hazards, unsafe assumptions, and current limitations. |
-| [Roadmap](development/roadmap.md) | M11 results and the deferred work planned beyond it. |
+| [Roadmap](development/roadmap.md) | M12 results and the deferred work planned beyond it. |
 
 ## Suggested reading paths
 

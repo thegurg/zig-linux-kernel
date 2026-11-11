@@ -26,7 +26,7 @@ const smp = @import("smp.zig");
 const sync = @import("sync.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.14.0-m11";
+pub const version = "0.15.0-m12";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -448,11 +448,19 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: smp checks passed\n");
+        serial.write("selftest: M11 checks passed\n");
+
+        serial.write("selftest: checking M12 allocator and TLB hardening\n");
+        if (!selftestM12()) {
+            serial.write("selftest: M12 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M12 checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
-        serial.write("selftest: M11 checks passed, exiting QEMU\n");
+        serial.write("selftest: exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
 
@@ -1023,6 +1031,9 @@ fn selftestSmp() bool {
     // `stopTimer` disabled scheduling for the earlier BSP-only tests. AP tasks
     // need the scheduler (and blocking) enabled again.
     sched.resumeScheduling();
+    // The M12 shootdown tests need the BSP to accept remote IPIs while the APs
+    // are running. IRQ0 stays masked by `stopTimer`.
+    asm volatile ("sti" ::: .{ .memory = true });
 
     const result = smp.runTest() orelse {
         console.print("smp: did not complete: cpus={d}, aps={d}, online={d}\n", .{
@@ -1046,6 +1057,34 @@ fn selftestSmp() bool {
         result.counter == result.expected and
         result.overlap == 0 and
         cross_cpu and ap_exception and tlb and locks;
+}
+
+/// M12: concurrent heap allocation and TLB-shootdown hardening. Runs with the
+/// APs online and BSP interrupts enabled (set up by `selftestSmp`).
+fn selftestM12() bool {
+    const heap_result = smp.runConcurrentHeapTest() orelse return false;
+    if (heap_result.errors != 0) {
+        console.print("heap: concurrent allocs={d}, errors={d}\n", .{
+            heap_result.allocs, heap_result.errors,
+        });
+        return false;
+    }
+    console.print("heap: concurrent allocs={d}, errors=0\n", .{heap_result.allocs});
+
+    const irq_off = smp.runIrqOffShootdownTest() orelse return false;
+    const tlb_result = smp.runConcurrentShootdownTest() orelse return false;
+    if (!irq_off or tlb_result.errors != 0) {
+        console.print("tlb: irq-off={d}, concurrent shootdowns={d}, errors={d}\n", .{
+            @intFromBool(irq_off), tlb_result.shootdowns, tlb_result.errors,
+        });
+        return false;
+    }
+    if (smp.getStats().aps != 0 and tlb_result.shootdowns == 0) return false;
+
+    console.print("tlb: irq-off=1, concurrent shootdowns={d}, errors=0\n", .{
+        tlb_result.shootdowns,
+    });
+    return true;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

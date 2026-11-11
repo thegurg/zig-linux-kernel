@@ -8,10 +8,18 @@
 //!
 //! The allocator also implements `std.mem.Allocator` (resize/remap are not
 //! supported yet, so callers fall back to allocate-copy-free).
+//!
+//! All allocator state is protected by `heap_lock`, an IRQ-safe spinlock. The
+//! lock is held while growing the heap, which maps pages through the VMM, so the
+//! lock order is heap -> `vmm.table_lock` -> `pmm.lock`. The grow path never
+//! unmaps pages: a partial failure adds the mapped prefix to the free list and
+//! leaves the remaining reserved range unused, so the heap lock is never held
+//! across a TLB shootdown.
 
 const std = @import("std");
 const pmm = @import("pmm.zig");
 const vmm = @import("vmm.zig");
+const sync = @import("../sync.zig");
 
 const page_size: usize = @intCast(pmm.page_size);
 
@@ -40,8 +48,12 @@ const Header = extern struct {
 const header_size: usize = @sizeOf(Header);
 
 var free_head: ?*FreeBlock = null;
+/// Next unreserved virtual address. `heap_mapped_bytes` counts pages actually
+/// mapped, which can be smaller after a partial grow failure.
 var heap_brk: usize = base;
+var heap_mapped_bytes: usize = 0;
 var initialized = false;
+var heap_lock: sync.IrqSpinLock = .{};
 
 pub const Stats = struct {
     reserved_bytes: usize,
@@ -51,8 +63,12 @@ pub const Stats = struct {
 };
 
 pub fn init() void {
+    const guard = heap_lock.acquire();
+    defer guard.release();
+
     free_head = null;
     heap_brk = base;
+    heap_mapped_bytes = 0;
     initialized = true;
 }
 
@@ -64,13 +80,19 @@ pub fn alloc(size: usize, alignment: usize) ?[*]u8 {
     const overhead = add(header_size, alignment) orelse return null;
     const needed = add(size_aligned, overhead) orelse return null;
 
+    const guard = heap_lock.acquire();
+    defer guard.release();
+
     if (findBlock(size_aligned, alignment, size)) |ptr| return ptr;
-    if (!grow(needed)) return null;
+    if (!growLocked(needed)) return null;
     return findBlock(size_aligned, alignment, size);
 }
 
 pub fn free(ptr: [*]u8, size: usize) void {
     if (!initialized or @intFromPtr(ptr) == 0) return;
+
+    const guard = heap_lock.acquire();
+    defer guard.release();
 
     const user_addr = @intFromPtr(ptr);
     if (user_addr < base + header_size or user_addr >= heap_brk) return;
@@ -90,7 +112,9 @@ pub fn free(ptr: [*]u8, size: usize) void {
 }
 
 pub fn stats() Stats {
-    const mapped = heap_brk - base;
+    const guard = heap_lock.acquire();
+    defer guard.release();
+
     var free_bytes: usize = 0;
     var current = free_head;
     while (current) |block| {
@@ -99,9 +123,9 @@ pub fn stats() Stats {
     }
     return .{
         .reserved_bytes = reserved_bytes,
-        .mapped_bytes = mapped,
+        .mapped_bytes = heap_mapped_bytes,
         .free_bytes = free_bytes,
-        .allocated_bytes = mapped - free_bytes,
+        .allocated_bytes = heap_mapped_bytes - free_bytes,
     };
 }
 
@@ -182,7 +206,7 @@ fn allocateFrom(
     return @ptrFromInt(user_addr);
 }
 
-fn grow(needed: usize) bool {
+fn growLocked(needed: usize) bool {
     if (!initialized) return false;
 
     const wanted = @max(needed, initial_grow_bytes);
@@ -190,38 +214,39 @@ fn grow(needed: usize) bool {
     if (heap_brk > limit or bytes > limit - heap_brk) return false;
 
     const start = heap_brk;
+    heap_brk += bytes;
     const pages = bytes / page_size;
     var mapped: usize = 0;
 
     while (mapped < pages) : (mapped += 1) {
         const virt = start + mapped * page_size;
         const phys = pmm.allocPage() orelse {
-            rollback(start, mapped);
+            accountPartialGrowth(start, mapped);
             return false;
         };
         if (!vmm.mapPage(@intCast(virt), phys, vmm.kernel_rw)) {
             _ = pmm.freePage(phys);
-            rollback(start, mapped);
+            accountPartialGrowth(start, mapped);
             return false;
         }
         const ptr: [*]u8 = @ptrFromInt(virt);
         @memset(ptr[0..page_size], 0);
     }
 
-    heap_brk += bytes;
+    heap_mapped_bytes += bytes;
     addFreeBlock(start, bytes);
     return true;
 }
 
-fn rollback(start: usize, mapped: usize) void {
-    var index: usize = 0;
-    while (index < mapped) : (index += 1) {
-        const virt: u64 = @intCast(start + index * page_size);
-        if (vmm.translate(virt)) |phys| {
-            _ = vmm.unmapPage(virt);
-            _ = pmm.freePage(phys);
-        }
-    }
+/// A failed grow keeps the pages mapped before the failure and returns them to
+/// the free list. The reserved virtual range past `mapped` pages stays unused.
+/// Unmapping here would require a TLB shootdown while `heap_lock` is held, so
+/// the allocator deliberately leaks that address space instead.
+fn accountPartialGrowth(start: usize, mapped: usize) void {
+    const mapped_bytes = mapped * page_size;
+    if (mapped_bytes == 0) return;
+    heap_mapped_bytes += mapped_bytes;
+    addFreeBlock(start, mapped_bytes);
 }
 
 fn addFreeBlock(addr: usize, size: usize) void {

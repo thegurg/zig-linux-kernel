@@ -2,12 +2,12 @@
 
 **Purpose:** document the spinlocks, interrupt-masking helpers, wait queues,
 mutexes, condition variables, cross-CPU wakeups, and the lock ordering used by
-the M11 scheduler and memory subsystems.
+the scheduler and memory subsystems.
 
 **Implementation status:** `SpinLock`, `IrqSpinLock`, `IrqLock`, wait queues,
 mutexes, and condition variables are **IMPLEMENTED** and work across CPUs. The
-PMM, VMM, console, and serial paths have IRQ-safe locks. The heap is **PARTIAL**:
-its free list remains unsynchronized. See
+heap, PMM, VMM, console, and serial paths have IRQ-safe locks. TLB shootdowns use
+a lock-free per-CPU mailbox protocol. See
 [technical debt](../development/technical-debt.md).
 
 ## Primitives at a glance
@@ -225,16 +225,23 @@ holding a higher-level lock; the reverse is forbidden.
 
 | Order | Lock | Protects |
 | --- | --- | --- |
-| 1 | `vmm.table_lock` (`IrqSpinLock`) | Page tables and VMM mapping mutation. |
-| 2 | `pmm.lock` (`IrqSpinLock`) | PMM bitmaps and counters. The VMM may allocate a table page while holding `table_lock`, so `table_lock` is acquired before `pmm.lock`. |
-| 3 | `task_lock` (`IrqSpinLock`) | Task table, per-CPU run state, wait queues, mutex/condition state. Never held while taking a memory or console lock, and no console output occurs while it is held. |
-| 4 | `console.lock` (`IrqSpinLock`) | Framebuffer grid and cursor. `console.write` then calls `serial.write`, so `console.lock` is acquired before `serial.lock`. |
-| 5 | `serial.lock` (`IrqSpinLock`) | Complete serial messages. |
-| — | `tlb_lock` (`SpinLock`) | TLB shootdown request/ack state. Independent of the others: it is taken only after `vmm.table_lock` has been released, and no other lock is taken while holding it. It is deliberately not IRQ-safe so a CPU waiting for it can still acknowledge a remote shootdown IPI. |
+| 1 | `heap.lock` (`IrqSpinLock`) | Heap free list, break, and statistics. `grow` maps pages while holding it, so the heap lock is acquired before the VMM and PMM locks. |
+| 2 | `vmm.table_lock` (`IrqSpinLock`) | Page tables and VMM mapping mutation. The VMM may allocate a table page while holding it, so it is acquired before `pmm.lock`. |
+| 3 | `pmm.lock` (`IrqSpinLock`) | PMM bitmaps and counters. |
+| 4 | `task_lock` (`IrqSpinLock`) | Task table, per-CPU run state, wait queues, mutex/condition state. Never held while taking a memory or console lock, and no console output occurs while it is held. |
+| 5 | `console.lock` (`IrqSpinLock`) | Framebuffer grid and cursor. `console.write` then calls `serial.write`, so `console.lock` is acquired before `serial.lock`. |
+| 6 | `serial.lock` (`IrqSpinLock`) | Complete serial messages. |
 
-The heap has no lock. `heap.alloc`/`free` may call into the PMM and VMM, so any
-future heap lock must be ordered above `vmm.table_lock`/`pmm.lock` and must not
-be taken together with `task_lock`.
+TLB shootdown state has no lock. Each shooter writes its own row of per-CPU
+mailboxes and each target acknowledges into its own column, so every cell has a
+single writer. The IPI handler takes no locks, which lets a CPU that is waiting
+for acknowledgements still service a request from another CPU.
+
+`unmapPage` invokes the shootdown callback after releasing `vmm.table_lock`.
+Callers must have interrupts enabled when other CPUs are online: the waiting CPU
+must be able to take their shootdown IPIs. The heap grow path follows this rule
+by never unmapping pages while `heap.lock` is held; a partial grow leaks the
+unmapped tail of its reserved range instead.
 
 ## Implementation status
 
@@ -247,10 +254,11 @@ be taken together with `task_lock`.
 | Blocking mutex with ownership transfer | **IMPLEMENTED** | Not reentrant; idle cannot block; pre-marked blocked. |
 | Condition variable | **IMPLEMENTED** | Requires predicate mutex discipline. |
 | Cross-CPU wakeups | **IMPLEMENTED** | Reschedule IPI vector 240. |
-| Explicit lock ordering | **IMPLEMENTED** | Table above; heap lock still deferred. |
+| Explicit lock ordering | **IMPLEMENTED** | Table above; heap, VMM, PMM, scheduler, console, and serial. |
 | PMM/VMM locking | **IMPLEMENTED** | IRQ-safe locks; VMM callback after unlock. |
 | Console/serial locking | **IMPLEMENTED** | IRQ-safe message locks. |
-| Heap locking | **PLANNED** | Free list remains single-CPU. |
+| Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
+| Lock-free TLB mailboxes | **IMPLEMENTED** | Per-shooter slots; handlers take no locks. |
 
 ## Related documentation
 
