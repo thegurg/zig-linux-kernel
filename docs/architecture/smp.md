@@ -1,35 +1,36 @@
 # SMP bring-up and per-CPU scheduling
 
 **Purpose:** describe the Limine multiprocessor protocol path, application
-processor entry, per-CPU state, LAPIC/x2APIC setup, IPIs, and the M11 SMP tests.
+processor entry, per-CPU state, LAPIC/x2APIC setup, IPIs, timers, and the SMP
+tests.
 
 **Implementation status:** Limine MP bring-up, per-CPU stacks/TSS, pre-Zig AP
 setup, the atomic spinlock stress test, per-CPU scheduler entry, LAPIC and
-x2APIC initialisation, reschedule and TLB IPIs, cross-CPU wakeups, TLB
-shootdown, and AP exception/FPU-state handling are **IMPLEMENTED**. The timer
-and interrupt routing remain PIC/PIT-based and BSP-only; APs receive IPIs but no
-timer interrupt. See [technical debt](../development/technical-debt.md).
+x2APIC initialisation, reschedule/TLB/timer interrupts, cross-CPU wakeups, TLB
+shootdown, timer-driven AP preemption, and AP exception/FPU-state handling are
+**IMPLEMENTED**. CPU 0 keeps the PIT; APs use LAPIC timers. See
+[technical debt](../development/technical-debt.md).
 
 ## Scope
 
-M11 brings secondary CPUs into the scheduler. Every online CPU now has:
+Every online CPU has:
 
 - a per-CPU `cpu.PerCpu` block addressed through the GS base MSR;
-- its own scheduler idle task, current task, scan cursor, and pending
-  sleep/wait requests;
+- its own scheduler idle task, current task, scan cursor, tick counter, and
+  pending sleep/wait requests;
 - LAPIC initialisation and a spurious-vector gate;
-- IPI dispatch for reschedule (vector 240) and TLB shootdown (vector 241);
+- interrupt dispatch for reschedule (vector 240), TLB shootdown (vector 241),
+  and its own periodic timer (vector 242);
 - interrupt-time FPU state reachable at `%gs:0`.
 
 Tasks are pinned to the CPU chosen at creation (`sched.createOn`). There is no
-load balancing or task migration. The BSP continues to own IRQ0 and the global
-tick counter, so deadline wakeups are scanned on the BSP and delivered to other
-CPUs by reschedule IPI.
+load balancing or task migration. CPU 0 owns IRQ0 and advances its tick from the
+PIT; every AP advances its own tick from its LAPIC timer, so local deadlines are
+handled locally.
 
-The kernel still does **not** provide an APIC timer, IOAPIC routing, AP
-preemption by timer, or per-CPU tick counters. The heap, PMM, VMM, console, and
-serial paths all use IRQ-safe locks, and TLB shootdowns use lock-free per-CPU
-mailboxes.
+The kernel still does **not** provide a LAPIC timer on CPU 0, IOAPIC routing, or
+ACPI MADT parsing. The heap, PMM, VMM, console, and serial paths all use IRQ-safe
+locks, and TLB shootdowns use lock-free per-CPU mailboxes.
 
 ## Limine MP protocol
 
@@ -177,9 +178,11 @@ returns, the stub halts in a `cli; hlt` loop.
 6. calls `sched.initCpu(ctx.cpu_index, ctx.lapic_id)`, which creates the AP's
    idle task, marks the CPU online in `sched.online_mask`, and points `%gs:0` at
    the idle task's FPU area;
-7. increments `online_count`;
-8. calls `sched.enterScheduler()`, which resumes the idle task's initial frame
-   with interrupts enabled.
+7. starts this AP's periodic LAPIC timer on vector 242 using the reload value
+   the BSP calibrated before release;
+8. increments `online_count`;
+9. calls `sched.enterScheduler()`, which resumes the idle task's initial frame
+   with interrupts enabled. The pending timer then fires.
 
 If LAPIC or scheduler setup fails, the AP increments `parked_count` and halts.
 
@@ -198,6 +201,9 @@ on the current CPU before touching APIC registers.
 - `eoi()` writes the EOI register.
 - `sendIpi(destination, vector)` sends a fixed-delivery edge IPI to one CPU.
 - `sendIpiAllButSelf(vector)` uses the all-but-self shorthand.
+- `calibrateTimer(hz)` measures a masked one-shot count against PIT channel 2.
+- `startPeriodicTimer(vector)` starts the divided-by-16 periodic timer on the
+  calling CPU.
 
 The IDT installs gates for:
 
@@ -205,6 +211,7 @@ The IDT installs gates for:
 | --- | --- | --- |
 | 240 | Reschedule IPI | Acknowledge LAPIC, call `sched.rescheduleInterrupt`. |
 | 241 | TLB shootdown IPI | Acknowledge LAPIC, call `sched.tlbInterrupt`, return unchanged. |
+| 242 | LAPIC timer | Acknowledge LAPIC, call `sched.timerInterrupt`. |
 | 255 | LAPIC spurious | Ignore; no EOI is required. |
 
 IRQ0 also sends a LAPIC EOI in addition to the PIC EOI.
@@ -216,13 +223,14 @@ IRQ0 also sends a LAPIC EOI in addition to the PIC EOI.
 - Each CPU has `cpu_state[index]` with `current`, `idle`, `next_scan`, and
   pending sleep/wait requests. `pickNextLocked` scans the global task table for
   `ready` tasks whose `cpu` field matches the current CPU.
-- The AP idle entry runs `sti; hlt`; a reschedule or TLB IPI wakes it. The IPI
-  handler can switch directly to a ready task from the interrupt frame.
+- The AP idle entry runs `sti; hlt`; a timer, reschedule, or TLB IPI wakes it.
+  The handler can switch directly to a ready task from the interrupt frame.
 - `sched.enterScheduler()` resumes the idle frame through `sched_resume`. The
   idle frame's `RFLAGS` has `IF=1`.
-- The BSP's PIT tick increments the global tick counter and scans all blocked
-  tasks for deadlines. A timeout on a remote CPU is delivered as a reschedule
-  IPI.
+- Each CPU's timer interrupt advances that CPU's `cpu_ticks` entry and scans only
+  blocked tasks pinned to that CPU. A sleeper on an AP is woken by the AP's LAPIC
+  timer; explicit cross-CPU wakeups still use the reschedule IPI.
+- CPU 0's tick comes from PIT IRQ0; AP ticks come from vector 242.
 - A task's FPU area is per task, and `%gs:0` is updated on every context switch
   on that CPU. AP exception entry therefore saves and restores AP-local state.
 
@@ -294,6 +302,19 @@ restore the previous state independently.
   writes, and unmaps a private page, so several CPUs issue shootdowns at the same
   time. It returns the shootdown count and the number of errors.
 
+### M13 per-CPU timer tests
+
+- `runTimerTest()` creates one sleeper per AP. Each records its CPU's tick
+  counter, calls `sched.sleep(3)`, and records the counter again. The sleepers
+  cannot finish unless their AP timer wakes them, and the selftest requires the
+  summed deltas to be at least three ticks per AP.
+- The same test then creates two CPU-bound tasks pinned to CPU 1. Each spins
+  without yielding until it observes the other's counter, then exits. Both
+  observations must be set and CPU 1's tick counter must advance, which is only
+  possible if the LAPIC timer preempts the first task.
+- The result reports the summed AP sleep ticks, sleeper count, preemption flag,
+  the two counters, and the ticks elapsed during the preemption test.
+
 The selftest log is:
 
 ```text
@@ -304,14 +325,16 @@ selftest: smp checks passed
 heap: concurrent allocs=4000, errors=0
 tlb: irq-off=1, concurrent shootdowns=150, errors=0
 selftest: M12 checks passed
+timer: per-cpu ticks=9, sleepers=3, preempted=1 (a=1, b=1928600, ticks=1)
+selftest: M13 checks passed
 ```
 
 ## Boot-mode behavior
 
 | Mode | AP behavior |
 | --- | --- |
-| Normal kernel | `kmain` calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state and enter the scheduler idle loop. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11 and M12 tests. |
+| Normal kernel | `kmain` calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. The log is `smp: 3 APs online, scheduler idle`. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, and M13 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
 
 The normal-run log is:
@@ -323,7 +346,7 @@ smp: 3 APs online, scheduler idle
 
 ## Recorded validation
 
-M12 validation ran the full matrix:
+M13 validation ran the full matrix:
 
 - default KVM `zig build test` (`SMP=4`, ReleaseSafe): passed;
 - `ZIG_KERNEL_NO_KVM=1 zig build test` (TCG): passed;
@@ -333,13 +356,15 @@ M12 validation ran the full matrix:
 - `zig build`: passed;
 - the default smoke result was `counter=400000, expected=400000, overlap=0`,
   `cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1`,
-  `heap: concurrent allocs=4000, errors=0`, and
-  `tlb: irq-off=1, concurrent shootdowns=150, errors=0`;
-- `SMP=2` reported `heap: concurrent allocs=2000` and 50 shootdowns; `SMP=1`
-  correctly skipped the AP-only tests and reported 1,000 BSP allocations;
+  `heap: concurrent allocs=4000, errors=0`,
+  `tlb: irq-off=1, concurrent shootdowns=150, errors=0`, and
+  `timer: per-cpu ticks=9, sleepers=3, preempted=1`;
+- `SMP=2` reported two AP sleepers and a successful preemption test with three
+  sleep ticks; `SMP=1` skipped the AP-only timer part and reported zero sleepers;
+- repeated default runs and the TCG run also passed the preemption test;
 - `zig fmt --check build.zig src` and `git diff --check`: passed.
 
-The earlier M11 validation is recorded in the
+The earlier M11 and M12 validation is recorded in the
 [roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
@@ -356,8 +381,10 @@ The earlier M11 validation is recorded in the
 | AP exception and FPU state | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE pointer; AP `int3` test. |
 | PMM/VMM/console/serial locking | **IMPLEMENTED** | IRQ-safe locks; VMM page-table lock plus TLB callback. |
 | Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
-| APIC timer / IOAPIC routing | **PLANNED** | Timer remains BSP PIT/IRQ0. |
-| Timer-driven AP preemption | **PLANNED** | APs only switch on IPIs or explicit calls. |
+| Per-CPU tick counters | **IMPLEMENTED** | CPU 0 from PIT; APs from LAPIC timers. |
+| AP LAPIC timer | **IMPLEMENTED** | Vector 242; calibrated against PIT channel 2. |
+| Timer-driven AP preemption | **IMPLEMENTED** | Two CPU-bound AP tasks interleave under the timer. |
+| CPU 0 LAPIC timer / IOAPIC routing | **PLANNED** | CPU 0 still uses PIT IRQ0. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |
 
 ## Related documentation

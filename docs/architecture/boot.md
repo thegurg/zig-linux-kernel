@@ -115,7 +115,7 @@ The build creates three images from the same source using `build_options` in
 | Variant | Options | Behavior |
 | --- | --- | --- |
 | Normal kernel | `exit_after_boot = false`, `test_page_fault = false` | Reports boot information, starts the APs into their scheduler idle loops, initializes the PIT, unmasks IRQ0, and exits the boot task into the BSP idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false` | Skips the early AP release, runs the M1c-M12 self-tests, then `selftestSmp()` starts the APs and runs the M11 and M12 SMP, allocator, and TLB checks, triggers `int3`, and exits QEMU with success. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false` | Skips the early AP release, runs the M1c-M13 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, and M13 per-CPU timer checks, triggers `int3`, and exits QEMU with success. |
 | Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
 
 Normal operation after the report is:

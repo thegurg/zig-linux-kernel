@@ -25,6 +25,7 @@ extern const isr_stub_table: [32]u64;
 extern const irq_stub_table: [16]u64;
 extern const sched_stub_table: [6]u64;
 extern const ipi_stub_table: [3]u64;
+extern const timer_stub_table: [1]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
 /// In long mode the CPU pushes a full five-qword frame (RIP, CS, RFLAGS, RSP,
@@ -88,6 +89,7 @@ pub fn init() void {
 
     setGate(sched.reschedule_vector, ipi_stub_table[0], 0);
     setGate(sched.tlb_vector, ipi_stub_table[1], 0);
+    setGate(sched.timer_vector, timer_stub_table[0], 0);
     setGate(255, ipi_stub_table[2], 0); // LAPIC spurious
 
     idtr = @splat(0);
@@ -138,6 +140,10 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
         sched.tlbInterrupt();
         return saved_rsp;
     }
+    if (vector == sched.timer_vector) {
+        lapic.eoi();
+        return sched.timerInterrupt(saved_rsp);
+    }
     if (vector == 255) {
         // LAPIC spurious interrupt: it must be ignored and needs no EOI.
         return saved_rsp;
@@ -147,7 +153,7 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
         const irq = vector - 32;
         pic.sendEoi(irq);
         lapic.eoi();
-        if (irq == 0) return sched.tick(saved_rsp);
+        if (irq == 0) return sched.timerInterrupt(saved_rsp);
         return saved_rsp;
     }
     if (vector == sched.yield_vector) return sched.yieldCurrent(saved_rsp);

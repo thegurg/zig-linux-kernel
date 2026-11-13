@@ -2,14 +2,14 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M12; **RESOLVED** entries are kept so the audit trail and the remaining
+after M13; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
-> issue was fixed in the pre-M11 bugfix pass, M11, or M12.
+> issue was fixed in the pre-M11 bugfix pass, M11, M12, or M13.
 
 ## Critical
 
@@ -82,18 +82,26 @@ otherwise the waiting CPU cannot take their shootdown IPIs. The heap grow path
 satisfies this by never unmapping while `heap_lock` is held. The M12 tests cover
 a target with interrupts disabled and several CPUs shooting down concurrently.
 
-### 5. The timer is BSP-only and APs are not preempted by a timer
+### 5. The timer was BSP-only and APs were not preempted by a timer
 
-**Status: PARTIAL.** **Sources:**
+**Status: RESOLVED (M13).** **Sources:**
 [`src/sched.zig`](../../src/sched.zig),
+[`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig),
 [`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig).
 
-IRQ0 remains a legacy PIC/PIT interrupt delivered to the BSP. Every tick
-increments one global counter and scans all blocked tasks. APs switch tasks only
-through explicit scheduler calls or reschedule/TLB IPIs. There is no APIC timer,
-no per-CPU tick counter, and no timer-driven AP preemption. The selftest masks
-IRQ0 before running the M11/M12 SMP tests, so AP sleep/timeout wakeup is not
-covered end-to-end.
+Each CPU now owns a `cpu_ticks` entry. CPU 0 keeps the 100 Hz PIT on IRQ0; every
+AP starts a periodic LAPIC timer on vector 242 after bring-up. The shared
+`timerInterrupt` path advances only the local counter, wakes only blocked tasks
+pinned to that CPU, and can preempt the local task. The reload value is calibrated
+once on the BSP against a 50 ms PIT channel-2 reference, so no IOAPIC or ACPI
+support is required.
+
+The M13 test creates a timed sleeper on every AP and runs two CPU-bound tasks on
+CPU 1 that must observe each other while both are running. `selftestSmp` still
+masks the BSP PIT during the SMP tests, but AP timers remain active.
+
+CPU 0 still uses the PIT rather than its LAPIC timer, and there is no IOAPIC
+routing; that remaining work is tracked in the roadmap.
 
 ### 6. AP NMI handling is not tested
 
@@ -145,20 +153,21 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11 and M12:
+Covered in M11, M12, and M13:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
 - concurrent heap allocation from every CPU;
 - TLB shootdown to a CPU with interrupts disabled;
 - several CPUs issuing TLB shootdowns concurrently;
+- per-AP tick counters, local AP sleep wakeup, and timer-driven AP preemption;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11 and M12 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11, M12, and M13 result markers.
 
 Still open:
 
 - no AP NMI test;
-- no AP timer/timeout test;
+- no IOAPIC routing or CPU 0 LAPIC timer test;
 - no cross-CPU mutex/condition stress test;
 - no allocator test under PMM exhaustion or mapping failure.
 
@@ -202,13 +211,13 @@ which the allocator deliberately avoids.
 | `IrqSpinLock` correctness | **IMPLEMENTED** | Per-acquisition guard; verified by the full scheduler suite. |
 | GS-relative per-CPU layout | **IMPLEMENTED** | `extern struct` plus compile-time offset checks. |
 | SMP scheduling | **IMPLEMENTED** | Per-CPU current/idle state; pinned tasks. |
-| Cross-CPU wakeups / IPIs | **IMPLEMENTED** | LAPIC/x2APIC, vectors 240/241/255. |
+| Cross-CPU wakeups / IPIs | **IMPLEMENTED** | LAPIC/x2APIC, vectors 240/241/242/255. |
 | AP exception/FPU safety | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE; AP `int3` test. |
 | TLB shootdown | **IMPLEMENTED** | Lock-free mailboxes; waits for every acknowledgement. |
 | Allocator thread safety | **IMPLEMENTED** | Heap, PMM, VMM, console, and serial use IRQ-safe locks. |
 | AP setup ordering | **RESOLVED** | SSE and `CR0.WP` set in the assembly stub; global TLB flushed after `CR3`. |
-| AP timer / per-CPU ticks | **DEFERRED** | Timer remains BSP PIT. |
-| Test coverage | **PARTIAL** | M11/M12 tests added; gaps listed above. |
+| AP timer / per-CPU ticks | **IMPLEMENTED** | LAPIC timer vector 242; CPU 0 keeps the PIT. |
+| Test coverage | **PARTIAL** | M11/M12/M13 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 8 CPUs. |
 
 ## Related documentation

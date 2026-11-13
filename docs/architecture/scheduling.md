@@ -5,16 +5,19 @@ lifecycle operations, idle tasks, blocking primitives, and FPU/SIMD context
 switching.
 
 **Implementation status:** per-CPU scheduling, pinned task creation, AP idle
-tasks, cross-CPU wakeups, and per-CPU FPU context are **IMPLEMENTED**. The timer
-tick and deadline scanning remain **BSP-only**; APs switch only on explicit
-scheduler calls and IPIs. See [technical debt](../development/technical-debt.md).
+tasks, cross-CPU wakeups, per-CPU FPU context, and timer-driven preemption on
+every CPU are **IMPLEMENTED**. CPU 0 uses the PIT; APs use their LAPIC timers.
+Deadlines and tick counters are per CPU. See
+[technical debt](../development/technical-debt.md).
 
 ## Scope
 
 The scheduler in [`src/sched.zig`](../../src/sched.zig) provides:
 
-- preemptive round-robin scheduling on the BSP, driven by IRQ0 at 100 Hz;
-- per-CPU current task, idle task, scan cursor, and pending sleep/wait state;
+- preemptive round-robin scheduling on every CPU: IRQ0 at 100 Hz on the BSP and
+  a periodic LAPIC timer on each AP;
+- per-CPU tick counters, current task, idle task, scan cursor, and pending
+  sleep/wait state;
 - cooperative `yield` and `exit` software interrupts;
 - timer-based sleep and indefinite block/wake;
 - wait queues, mutexes, and condition variables that wake tasks across CPUs;
@@ -23,8 +26,8 @@ The scheduler in [`src/sched.zig`](../../src/sched.zig) provides:
 - per-task FPU/SIMD state saved with `fxsave64`/`fxrstor64`;
 - reschedule IPIs and TLB-shootdown IPIs on the target CPU.
 
-It does **not** provide priorities, load balancing, task migration, per-CPU
-tick counters, an APIC timer, address-space switching, or task join. Tasks are
+It does **not** provide priorities, load balancing, task migration, an APIC
+timer on CPU 0, IOAPIC routing, address-space switching, or task join. Tasks are
 pinned to the CPU selected at creation.
 
 ## Task model
@@ -36,7 +39,7 @@ pinned to the CPU selected at creation.
 | `name` | `[]const u8` | Diagnostic name. |
 | `rsp` | `u64` | Saved stack pointer / saved-register frame base. |
 | `state` | `TaskState` | `idle`, `ready`, `running`, `blocked`, or `finished`. |
-| `ticks` | `u64` | Number of timer ticks this task has run (BSP tick only). |
+| `ticks` | `u64` | Number of timer ticks this task has run. |
 | `wake_tick` | `u64` | Deadline for sleep/timed wait; `~0` for indefinite block. |
 | `wake_reason` | `WakeReason` | `none`, `signal`, or `timeout`. |
 | `fpu_state` | `FpuState align(16)` | 512-byte FXSAVE area. |
@@ -163,28 +166,33 @@ must supply a valid stack to `create`.
 4. sets the CPU's bit in `online_mask`;
 5. points `%gs:0` at the idle task's FPU area.
 
-The AP then calls `sched.enterScheduler()`, which re-checks the idle task, leaves
-the AP's boot stack, and resumes the idle initial frame through `sched_resume`.
-The frame enables interrupts on `iretq`, and the idle entry executes `sti; hlt`.
+The AP then starts its periodic LAPIC timer and calls `sched.enterScheduler()`,
+which re-checks the idle task, leaves the AP's boot stack, and resumes the idle
+initial frame through `sched_resume`. The frame enables interrupts on `iretq`,
+and the idle entry executes `sti; hlt`. The pending LAPIC timer then fires on
+vector 242.
 
-### Timer tick (BSP only)
+### Timer ticks (per CPU)
 
-`tick(saved_rsp)` is called by IRQ0 on the BSP:
+`timerInterrupt(saved_rsp)` is called by IRQ0 on the BSP and by the LAPIC timer
+on each AP:
 
-1. increment the global `tick_counter`;
-2. if not initialized, return the saved frame;
-3. acquire `task_lock`;
-4. wake every blocked task whose deadline has passed (`wakeBlockedLocked`);
+1. if the scheduler is not initialized, return the saved frame;
+2. acquire `task_lock`;
+3. increment this CPU's `cpu_ticks` entry;
+4. wake every blocked task pinned to this CPU whose deadline has passed
+   (`wakeBlockedLocked`);
 5. save the current task's `rsp` and increment its `ticks`;
 6. if scheduling is disabled, return the saved frame;
-7. find the next `ready` task pinned to CPU 0 (`pickNextLocked`);
+7. find the next `ready` task pinned to this CPU (`pickNextLocked`);
 8. if one exists, park the current task (`running` -> `ready`, except an idle
    task which becomes `idle`) and switch to the next task;
 9. otherwise return the saved frame and continue the current task.
 
-`wakeBlockedLocked` scans the global table, so a sleeper on any CPU is woken by
-the BSP tick. If the sleeper is pinned to another CPU, `wakeLocked` sends that
-CPU a reschedule IPI. The PIT itself remains a BSP interrupt; no AP takes IRQ0.
+Deadlines are compared against the owning CPU's counter. A sleeper on an AP is
+woken by that AP's LAPIC timer, so no cross-CPU IPI is needed. Explicit wakeups
+from another CPU still send the reschedule IPI. CPU 0 continues to take IRQ0;
+APs take vector 242 and never receive IRQ0.
 
 ### Reschedule IPI
 
@@ -235,11 +243,10 @@ interrupt ever returns.
 
 `sched.sleep(duration)` saves interrupts, stores a pending duration in the
 current CPU's `sleep_request`, and executes `int $50`. `sleepCurrent` marks the
-task `blocked`, sets `wake_tick = tick_counter + duration`, increments
+task `blocked`, sets `wake_tick = cpu_ticks[this_cpu] + duration`, increments
 `blocked_counter`, and switches to the next ready task or the idle task. The
-BSP timer tick wakes the task with `WakeReason.timeout` once the deadline is
-reached; if the sleeper is on an AP, the wakeup is delivered by IPI. A duration
-of zero is a no-op. The idle task cannot sleep.
+owning CPU's timer tick wakes the task with `WakeReason.timeout` once the
+deadline is reached. A duration of zero is a no-op. The idle task cannot sleep.
 
 ### Indefinite block and wake
 
@@ -262,9 +269,9 @@ semantics and the lost-wakeup rules.
 
 ### Stop and resume
 
-`sched.stop()` acquires `task_lock` and sets `enabled = false`. The timer tick
-still increments `tick_counter` and wakes blocked tasks, but no CPU switches
-tasks. `sched.resumeScheduling()` sets `enabled = true` again. The selftest
+`sched.stop()` acquires `task_lock` and sets `enabled = false`. Timer ticks
+still increment the local CPU's counter and wake local blocked tasks, but no CPU
+switches tasks. `sched.resumeScheduling()` sets `enabled = true` again. The selftest
 calls `stopTimer()` (which disables interrupts, masks IRQ0, and calls
 `sched.stop()`) before the BSP-only tests, then re-enables scheduling before the
 M11 SMP tests.
@@ -291,7 +298,8 @@ IPI.
 
 | API | Meaning |
 | --- | --- |
-| `sched.ticks()` | Global BSP PIT tick counter. |
+| `sched.ticks()` | This CPU's tick counter. |
+| `sched.ticksOn(cpu)` | Tick counter for a specific CPU. |
 | `sched.finishedCount()` | Tasks that have exited. |
 | `sched.blockedCount()` | Tasks currently blocked. |
 | `sched.onlineCount()` | CPUs with scheduler state installed. |
@@ -340,10 +348,11 @@ The scheduler is exercised by the selftest image described in
 | M12 concurrent heap | Every CPU allocates, writes, verifies, and frees blocks concurrently with zero errors. |
 | M12 IRQ-off TLB | A shootdown targeting a CPU that has interrupts disabled completes after that CPU enables them and services the pending IPI. |
 | M12 concurrent TLB | Every AP maps and unmaps a private page concurrently; all shootdowns complete with zero errors. |
+| M13 AP ticks/sleep | One sleeper per AP advances that AP's tick counter and wakes locally after `sched.sleep`. |
+| M13 AP preemption | Two CPU-bound tasks pinned to CPU 1 each observe the other's counter while both are running, proving timer-driven preemption. |
 
 ## Limitations
 
-- **BSP-only timer:** only the BSP takes IRQ0; APs are not preempted by a timer.
 - **No migration or balancing:** every task is pinned at creation.
 - **No priorities:** round-robin over ready tasks per CPU.
 - **Fixed task limit:** 32 slots total, including the boot task and one idle task
@@ -353,8 +362,8 @@ The scheduler is exercised by the selftest image described in
 - **No join/wait-for-exit API**; tests poll `finishedCount()`.
 - **No address-space switching**; all tasks share the kernel page tables.
 - **Idle cannot block**; blocking calls return immediately for idle tasks.
-- **Global tick counter:** deadlines are global, so tick rates and per-CPU time
-  accounting are not independent.
+- **BSP timer differs:** CPU 0 still uses the PIT; APs use LAPIC timers. The two
+  sources are calibrated to the same nominal rate but are not phase-locked.
 
 ## Implementation status
 
@@ -362,15 +371,17 @@ The scheduler is exercised by the selftest image described in
 | --- | --- | --- |
 | Per-CPU round-robin scheduler | **IMPLEMENTED** | Pinned tasks, per-CPU idle and current state. |
 | BSP timer preemption | **IMPLEMENTED** | IRQ0 at 100 Hz, CPU 0 only. |
+| Per-CPU tick counters | **IMPLEMENTED** | Independent `cpu_ticks` entries; `ticksOn(cpu)`. |
 | Cooperative yield/exit | **IMPLEMENTED** | Vectors 48 and 49. |
-| Sleep and explicit block/wake | **IMPLEMENTED** | Vectors 50 and 51; deadline scanning on BSP. |
+| Sleep and explicit block/wake | **IMPLEMENTED** | Vectors 50 and 51; local deadline scanning. |
 | Wait queues and timed waits | **IMPLEMENTED** | Vectors 52 and 53; SMP-aware task IDs. |
 | Mutex and condition variable | **IMPLEMENTED** | Ownership transfer; blocked-before-unlock. |
 | Per-CPU idle tasks and slot reuse | **IMPLEMENTED** | 8 KiB idle stacks; task limit 32. |
 | FPU/SIMD context switching | **IMPLEMENTED** | Per-task 512-byte FXSAVE area; `%gs:0` pointer. |
 | Cross-CPU wakeups | **IMPLEMENTED** | Reschedule IPI 240. |
 | TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241; waits for every acknowledgement. |
-| AP timer preemption | **PLANNED** | Requires an APIC timer or routed IRQ0. |
+| AP timer preemption | **IMPLEMENTED** | Periodic LAPIC timer, vector 242, calibrated from the PIT. |
+| CPU 0 LAPIC timer / IOAPIC | **PLANNED** | CPU 0 still uses PIT IRQ0. |
 | Priorities, migration, join | **PLANNED** | Not implemented. |
 
 ## Related documentation

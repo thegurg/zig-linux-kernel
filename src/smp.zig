@@ -7,8 +7,9 @@
 //! initialises its local APIC, and enters the scheduler idle loop.
 //!
 //! Task execution is per-CPU: the scheduler pins tasks to a CPU and uses LAPIC
-//! IPIs for remote wakeups and TLB shootdowns. The timer remains a BSP PIT
-//! interrupt, but its timeout scan wakes sleepers on every CPU.
+//! IPIs for remote wakeups and TLB shootdowns. CPU 0 keeps the PIT tick; each AP
+//! starts its own periodic LAPIC timer during bring-up, so AP tasks are
+//! preempted and timed sleepers wake locally.
 
 const std = @import("std");
 const limine = @import("limine.zig");
@@ -27,6 +28,8 @@ const ap_stack_size = 16 * 1024;
 const stress_iterations: u64 = 100_000;
 const heap_stress_iterations: u64 = 1_000;
 const tlb_stress_iterations: u64 = 50;
+const timer_sleep_ticks: u64 = 3;
+const preempt_iterations: u64 = 200_000_000;
 const max_start_spin: u64 = 50_000_000;
 const max_test_spin: u64 = 100_000_000;
 const tlb_stress_base: u64 = 0xffff_ffff_c200_0000;
@@ -109,6 +112,16 @@ var irq_off_stack: [ap_stack_size]u8 align(16) = undefined;
 var tlb_stress_done: u64 = 0;
 var tlb_stress_errors: u64 = 0;
 var tlb_stress_stacks: [max_cpus][ap_stack_size]u8 align(16) = undefined;
+
+var timer_sleep_done: u64 = 0;
+var timer_sleep_by_cpu: [max_cpus]u64 = @splat(0);
+var timer_sleep_stacks: [max_cpus][ap_stack_size]u8 align(16) = undefined;
+
+var preempt_a: u64 = 0;
+var preempt_b: u64 = 0;
+var preempt_a_observed: u64 = 0;
+var preempt_b_observed: u64 = 0;
+var preempt_stacks: [2][ap_stack_size]u8 align(16) = undefined;
 
 /// Physical PML4 used by the AP entry stub after it leaves Limine's page
 /// tables. Written once during `init`.
@@ -535,6 +548,120 @@ fn tlbStressWorker() callconv(.c) void {
     sched.exit();
 }
 
+pub const TimerTestResult = struct {
+    ticks: u64,
+    sleepers: u64,
+    preempted: bool,
+    preempt_a: u64,
+    preempt_b: u64,
+    preempt_ticks: u64,
+};
+
+/// Verify that each AP's LAPIC timer advances its own tick counter and wakes a
+/// local timed sleeper, then prove timer-driven preemption with two CPU-bound
+/// tasks pinned to CPU 1. Both counters must be observed while the other task is
+/// still running; without preemption the first task spins to its bound alone.
+pub fn runTimerTest() ?TimerTestResult {
+    if (!initialized or !started) return null;
+    if (stats.aps != 0 and lapic.timerCountPerTick() == 0) return null;
+
+    timer_sleep_done = 0;
+    timer_sleep_by_cpu = @splat(0);
+    const sleep_finished_base = sched.finishedCount();
+
+    var ap: usize = 0;
+    while (ap < stats.aps) : (ap += 1) {
+        const cpu_index: u32 = @intCast(ap + 1);
+        if (sched.createOn(cpu_index, "timer-sleeper", apSleeperWorker, timer_sleep_stacks[ap][0..]) == null) {
+            return null;
+        }
+    }
+
+    const expected_sleepers = @as(u64, stats.aps);
+    var spin: u64 = 0;
+    while (@atomicLoad(u64, &timer_sleep_done, .acquire) < expected_sleepers or
+        sched.finishedCount() < sleep_finished_base + expected_sleepers)
+    {
+        if (spin >= max_test_spin) return null;
+        spin += 1;
+        asm volatile ("pause");
+    }
+
+    var total_ticks: u64 = 0;
+    var index: usize = 0;
+    while (index < stats.aps) : (index += 1) {
+        total_ticks += timer_sleep_by_cpu[index + 1];
+    }
+
+    var preempted = true;
+    var preempt_count_a: u64 = 0;
+    var preempt_count_b: u64 = 0;
+    var preempt_ticks: u64 = 0;
+    if (stats.aps != 0) {
+        preempt_a = 0;
+        preempt_b = 0;
+        preempt_a_observed = 0;
+        preempt_b_observed = 0;
+        const preempt_finished_base = sched.finishedCount();
+        const before_ticks = sched.ticksOn(1);
+
+        if (sched.createOn(1, "preempt-a", preemptWorkerA, preempt_stacks[0][0..]) == null) return null;
+        if (sched.createOn(1, "preempt-b", preemptWorkerB, preempt_stacks[1][0..]) == null) return null;
+
+        spin = 0;
+        while (sched.finishedCount() < preempt_finished_base + 2) {
+            if (spin >= max_test_spin) return null;
+            spin += 1;
+            asm volatile ("pause");
+        }
+
+        preempt_count_a = @atomicLoad(u64, &preempt_a, .acquire);
+        preempt_count_b = @atomicLoad(u64, &preempt_b, .acquire);
+        preempt_ticks = sched.ticksOn(1) - before_ticks;
+        preempted = @atomicLoad(u64, &preempt_a_observed, .acquire) != 0 and
+            @atomicLoad(u64, &preempt_b_observed, .acquire) != 0 and
+            preempt_ticks > 0;
+    }
+
+    return .{
+        .ticks = total_ticks,
+        .sleepers = expected_sleepers,
+        .preempted = preempted,
+        .preempt_a = preempt_count_a,
+        .preempt_b = preempt_count_b,
+        .preempt_ticks = preempt_ticks,
+    };
+}
+
+fn apSleeperWorker() callconv(.c) void {
+    const index = cpu.currentIndex();
+    const before = sched.ticksOn(index);
+    sched.sleep(timer_sleep_ticks);
+    timer_sleep_by_cpu[index] = sched.ticksOn(index) -% before;
+    _ = @atomicRmw(u64, &timer_sleep_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+fn preemptWorkerA() callconv(.c) void {
+    preemptWorkload(&preempt_a, &preempt_b, &preempt_a_observed);
+}
+
+fn preemptWorkerB() callconv(.c) void {
+    preemptWorkload(&preempt_b, &preempt_a, &preempt_b_observed);
+}
+
+fn preemptWorkload(own: *u64, other: *u64, observed: *u64) void {
+    var iteration: u64 = 0;
+    while (iteration < preempt_iterations) : (iteration += 1) {
+        _ = @atomicRmw(u64, own, .Add, 1, .monotonic);
+        if (@atomicLoad(u64, other, .acquire) != 0) {
+            @atomicStore(u64, observed, 1, .release);
+            break;
+        }
+    }
+    sched.exit();
+}
+
 /// Zig side of the AP entry path. Called by `ap_entry` with a private
 /// descriptor and this CPU's `limine_mp_info`.
 export fn ap_main(ctx: *ApContext, info: *limine.MpInfo) callconv(.c) noreturn {
@@ -551,6 +678,12 @@ export fn ap_main(ctx: *ApContext, info: *limine.MpInfo) callconv(.c) noreturn {
 
     const apic_ready = lapic.init();
     if (!apic_ready or !sched.initCpu(ctx.cpu_index, ctx.lapic_id)) park();
+
+    // Calibration happened on the BSP before release. The timer stays pending
+    // until `enterScheduler` resumes the idle frame with interrupts enabled.
+    if (lapic.timerCountPerTick() != 0) {
+        _ = lapic.startPeriodicTimer(sched.timer_vector);
+    }
 
     _ = @atomicRmw(u64, &online_count, .Add, 1, .seq_cst);
     sched.enterScheduler();

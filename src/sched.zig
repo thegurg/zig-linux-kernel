@@ -6,10 +6,12 @@
 //! `task_lock` protects the task table, wait queues, and scheduling decisions;
 //! it never covers task execution, so CPUs run tasks in parallel.
 //!
-//! IRQ0 on the bootstrap processor increments the global tick counter and
-//! wakes timed sleepers on every CPU. Cross-CPU wakeups use LAPIC IPIs:
-//! `reschedule_vector` (240) makes the target CPU re-evaluate its run queue and
-//! `tlb_vector` (241) invalidates a page that another CPU just unmapped.
+//! Every CPU has its own tick counter. CPU 0 uses the PIT (IRQ0); application
+//! processors use a periodic LAPIC timer on `timer_vector` (242). A timer tick
+//! wakes timed sleepers pinned to that CPU and may preempt its current task.
+//! Cross-CPU wakeups use LAPIC IPIs: `reschedule_vector` (240) makes the target
+//! CPU re-evaluate its run queue and `tlb_vector` (241) invalidates a page that
+//! another CPU just unmapped.
 //!
 //! The interrupt entry stub saves x87/SSE state to the address in `%gs:0`. The
 //! scheduler updates that per-CPU pointer in `switchTaskLocked`, so no global
@@ -25,6 +27,7 @@ pub const max_cpus = cpu.max_cpus;
 
 pub const reschedule_vector: u8 = 240;
 pub const tlb_vector: u8 = 241;
+pub const timer_vector: u8 = 242;
 
 pub const yield_vector: u8 = 48;
 pub const exit_vector: u8 = 49;
@@ -291,7 +294,7 @@ const idle_stack_size = 8 * 1024;
 
 var tasks: [max_tasks]Task = undefined;
 var task_count: usize = 0;
-var tick_counter: u64 = 0;
+var cpu_ticks: [max_cpus]u64 = @splat(0);
 var finished_counter: u64 = 0;
 var blocked_counter: u64 = 0;
 var next_id: u32 = 0;
@@ -332,7 +335,7 @@ pub fn init() void {
     initFpuTemplate();
 
     task_count = 0;
-    tick_counter = 0;
+    cpu_ticks = @splat(0);
     finished_counter = 0;
     blocked_counter = 0;
     next_id = 2;
@@ -443,16 +446,18 @@ pub fn enterScheduler() noreturn {
     sched_resume(rsp);
 }
 
-pub fn tick(saved_rsp: u64) u64 {
-    _ = @atomicRmw(u64, &tick_counter, .Add, 1, .monotonic);
+/// Timer interrupt entry shared by PIT IRQ0 on the BSP and the LAPIC timer on
+/// application processors. Only the local CPU's tick counter advances, and only
+/// that CPU's timed sleepers are woken. Preemption stays per-CPU.
+pub fn timerInterrupt(saved_rsp: u64) u64 {
     if (!initialized) return saved_rsp;
 
     const index = cpu.currentIndex();
     const guard = task_lock.acquire();
     defer guard.release();
 
-    const now = @atomicLoad(u64, &tick_counter, .monotonic);
-    wakeBlockedLocked(now);
+    const now = @atomicRmw(u64, &cpu_ticks[index], .Add, 1, .monotonic) + 1;
+    wakeBlockedLocked(index, now);
 
     const current_task = cpu_state[index].current orelse return saved_rsp;
     current_task.rsp = saved_rsp;
@@ -561,7 +566,7 @@ pub fn sleepCurrent(saved_rsp: u64) u64 {
     if (current_task.is_idle or duration == 0 or !enabled) return saved_rsp;
 
     current_task.rsp = saved_rsp;
-    const now = @atomicLoad(u64, &tick_counter, .monotonic);
+    const now = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
     blockCurrentLocked(current_task, now +% duration);
     return switchBlockedLocked(index, current_task);
 }
@@ -639,7 +644,7 @@ pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
     request.queue.count += 1;
 
     current_task.rsp = saved_rsp;
-    const now = @atomicLoad(u64, &tick_counter, .monotonic);
+    const now = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
     blockCurrentLocked(current_task, now +% request.ticks);
     return switchBlockedLocked(index, current_task);
 }
@@ -682,7 +687,13 @@ pub fn resumeScheduling() void {
 }
 
 pub fn ticks() u64 {
-    return @atomicLoad(u64, &tick_counter, .monotonic);
+    return ticksOn(cpu.currentIndex());
+}
+
+/// Tick counter for one CPU. Counters start at zero and advance independently.
+pub fn ticksOn(index: u32) u64 {
+    if (index >= max_cpus) return 0;
+    return @atomicLoad(u64, &cpu_ticks[index], .monotonic);
 }
 
 pub fn finishedCount() u64 {
@@ -850,11 +861,11 @@ fn ensureIdleLocked(index: u32) ?*Task {
     return idle;
 }
 
-fn wakeBlockedLocked(now: u64) void {
-    var index: usize = 0;
-    while (index < task_count) : (index += 1) {
-        const task = &tasks[index];
-        if (task.state == .blocked and now >= task.wake_tick) {
+fn wakeBlockedLocked(index: u32, now: u64) void {
+    var task_index: usize = 0;
+    while (task_index < task_count) : (task_index += 1) {
+        const task = &tasks[task_index];
+        if (task.cpu == index and task.state == .blocked and now >= task.wake_tick) {
             _ = wakeLocked(task, .timeout);
         }
     }

@@ -19,7 +19,7 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.15.0-m12`. Milestones M0 through M12 are implemented; M13 is planned.
+`0.16.0-m13`. Milestones M0 through M13 are implemented; M14 is planned.
 
 ## Architecture
 
@@ -28,10 +28,10 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | [Overview](architecture/overview.md) | Goals, constraints, milestone status, source layout, and how the subsystems fit together. |
 | [Boot and early bring-up](architecture/boot.md) | Limine/UEFI handoff, linker layout, `_start`, `kmain`, boot variants, and the console. |
 | [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, the kernel heap, and TLB shootdown. |
-| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, and the LAPIC. |
-| [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
+| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, and the LAPIC timer. |
+| [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, per-CPU timer ticks, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
 | [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
-| [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs, and the M11 SMP tests. |
+| [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs/timers, and the SMP tests. |
 
 ## Development
 

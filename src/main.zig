@@ -26,7 +26,7 @@ const smp = @import("smp.zig");
 const sync = @import("sync.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.15.0-m12";
+pub const version = "0.16.0-m13";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
@@ -313,6 +313,15 @@ export fn kmain() callconv(.c) noreturn {
     sched.init();
     vmm.setTlbShootdownHandler(&sched.shootdownTlb);
 
+    // APs program their LAPIC timers with this reload value during bring-up.
+    if (smp.getStats().aps != 0) {
+        if (lapic.calibrateTimer(timer_hz)) |count| {
+            console.print("timer: LAPIC {d} counts per tick\n", .{count});
+        } else {
+            console.write("timer: LAPIC calibration failed; AP timers disabled\n");
+        }
+    }
+
     if (smp.getStats().cpus != 0) {
         const smp_stats = smp.getStats();
         console.print("smp: cpus={d}, aps={d}, bsp_lapic_id={d}, x2apic={d}\n", .{
@@ -456,6 +465,13 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: M12 checks passed\n");
+
+        serial.write("selftest: checking M13 per-CPU timers\n");
+        if (!selftestM13()) {
+            serial.write("selftest: M13 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M13 checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
@@ -1016,6 +1032,12 @@ fn selftestFpu() bool {
 
 fn selftestSmp() bool {
     const smp_stats = smp.getStats();
+    if (smp_stats.aps != 0 and lapic.timerCountPerTick() == 0) {
+        if (lapic.calibrateTimer(timer_hz) == null) {
+            console.write("timer: LAPIC calibration failed\n");
+            return false;
+        }
+    }
     if (!smp.start()) {
         console.print("smp: start failed: cpus={d}, aps={d}\n", .{ smp_stats.cpus, smp_stats.aps });
         return false;
@@ -1085,6 +1107,24 @@ fn selftestM12() bool {
         tlb_result.shootdowns,
     });
     return true;
+}
+
+/// M13: per-CPU timer counters, local AP sleep wakeups, and timer-driven AP
+/// preemption. Runs with the APs online and their LAPIC timers active.
+fn selftestM13() bool {
+    const aps = smp.getStats().aps;
+    if (aps != 0 and lapic.timerCountPerTick() == 0) return false;
+
+    const result = smp.runTimerTest() orelse {
+        console.write("timer: AP timer test did not complete\n");
+        return false;
+    };
+    console.print("timer: per-cpu ticks={d}, sleepers={d}, preempted={d} (a={d}, b={d}, ticks={d})\n", .{
+        result.ticks,     result.sleepers,  @intFromBool(result.preempted),
+        result.preempt_a, result.preempt_b, result.preempt_ticks,
+    });
+    if (aps != 0 and (result.sleepers != aps or result.ticks < 3 * @as(u64, aps))) return false;
+    return result.preempted;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

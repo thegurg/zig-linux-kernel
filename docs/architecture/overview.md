@@ -3,8 +3,8 @@
 **Purpose:** describe what zig-kernel is, the constraints it is built under,
 which milestones are implemented, and how the source tree is organized.
 
-**Implementation status:** M0-M12 are implemented and validated through the
-QEMU test flow. M13 is planned. See the per-subsystem documents for the exact
+**Implementation status:** M0-M13 are implemented and validated through the
+QEMU test flow. M14 is planned. See the per-subsystem documents for the exact
 status of individual features.
 
 ## Project facts
@@ -16,7 +16,7 @@ status of individual features.
 | Boot path | Limine 12.9.4, UEFI, Limine boot protocol base revision 3 | [`src/limine.zig`](../../src/limine.zig) |
 | Kernel base | `0xffffffff80000000` (higher half) | [`linker.ld`](../../linker.ld) |
 | Default build | `ReleaseSafe` with LLVM (`exe.use_llvm = true`) | [`build.zig`](../../build.zig) |
-| Current version string | `0.15.0-m12` | [`src/main.zig`](../../src/main.zig) |
+| Current version string | `0.16.0-m13` | [`src/main.zig`](../../src/main.zig) |
 | Primary test platform | QEMU with KVM when available, TCG as fallback | [`tools/run.sh`](../../tools/run.sh) |
 
 ## Design constraints
@@ -34,9 +34,8 @@ status of individual features.
   addition to host-side tests where applicable.
 - Default builds keep safety checks enabled (`ReleaseSafe`).
 - The scheduler is per-CPU: every online CPU has its own current task, idle
-  task, and run state. Tasks are pinned to the CPU chosen at creation. The
-  legacy PIT timer still delivers IRQ0 to the BSP only; APs are switched by
-  scheduler calls and reschedule IPIs.
+  task, run state, and tick counter. Tasks are pinned to the CPU chosen at
+  creation. CPU 0 uses the PIT on IRQ0; each AP uses a periodic LAPIC timer.
 
 ## Milestone status
 
@@ -57,7 +56,8 @@ status of individual features.
 | M10 | Limine MP bring-up, per-CPU stacks/TSS, atomic spinlocks, SMP stress test | **IMPLEMENTED** |
 | M11 | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition, TLB shootdown, AP exception/FPU state | **IMPLEMENTED** |
 | M12 | IRQ-safe heap locking, concurrent allocator stress, lock-free TLB-shootdown mailboxes, IRQ-off and concurrent shootdown tests | **IMPLEMENTED** |
-| M13 | Next milestone; not yet scoped or started | **PLANNED** |
+| M13 | Per-CPU tick counters, AP LAPIC timers calibrated against the PIT, local deadline wakeups, timer-driven AP preemption | **IMPLEMENTED** |
+| M14 | Next milestone; not yet scoped or started | **PLANNED** |
 
 Detailed milestone behavior is documented in the subsystem pages:
 [memory](memory.md), [CPU and interrupts](cpu-interrupts.md),
@@ -76,19 +76,20 @@ _start -> kernel stack -> kmain
     +-- PMM -> VMM -> heap
     +-- framebuffer console + boot report
     +-- SMP init (Limine MP request)
-    +-- LAPIC/x2APIC init, scheduler init, TLB-shootdown hook
+    +-- LAPIC/x2APIC init, scheduler init, timer calibration, TLB-shootdown hook
     +-- normal boot: start APs -> per-CPU scheduler idle
     +-- selftest / fault-test variant
     |
     v
-normal boot: PIT 100 Hz -> IRQ0 on BSP -> per-CPU idle tasks
+normal boot: PIT 100 Hz -> IRQ0 on BSP; AP LAPIC timers -> per-CPU ticks
 ```
 
-Every CPU runs its own scheduler state. IRQ0 drives preemption on the BSP; APs
-enter their idle tasks, switch tasks on explicit scheduler calls, and receive
-reschedule (240) and TLB-shootdown (241) IPIs. Blocking primitives wake tasks
-across CPUs. Heap, PMM, VMM, console, and serial state use IRQ-safe locks;
-`unmapPage` issues a lock-free shootdown after releasing the page-table lock.
+Every CPU runs its own scheduler state and tick counter. IRQ0 drives preemption
+on the BSP; APs enter their idle tasks and are preempted by their LAPIC timers,
+which also wake local timed sleepers. APs additionally receive reschedule (240)
+and TLB-shootdown (241) IPIs. Blocking primitives wake tasks across CPUs. Heap,
+PMM, VMM, console, and serial state use IRQ-safe locks; `unmapPage` issues a
+lock-free shootdown after releasing the page-table lock.
 
 ## Source layout
 
@@ -96,7 +97,7 @@ across CPUs. Heap, PMM, VMM, console, and serial state use IRQ-safe locks;
 | --- | --- |
 | [`boot/limine.conf`](../../boot/limine.conf) | Limine menu and kernel path. |
 | [`linker.ld`](../../linker.ld) | Higher-half layout and page-aligned `PT_LOAD` segments. |
-| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M12 self-tests. |
+| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M13 self-tests. |
 | [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests. |
 | [`src/console.zig`](../../src/console.zig) | Framebuffer text console with serial mirroring. |
 | [`src/font.zig`](../../src/font.zig) | 8x16 bitmap font. |
@@ -107,7 +108,7 @@ across CPUs. Heap, PMM, VMM, console, and serial state use IRQ-safe locks;
 | [`src/memory/vmm.zig`](../../src/memory/vmm.zig) | 4-level page tables, kernel/HHDM mappings, CR3 switch. |
 | [`src/memory/heap.zig`](../../src/memory/heap.zig) | IRQ-safe, lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
 | [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement and GS-based per-CPU state. |
-| [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, and IPIs. |
+| [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, IPIs, and the periodic LAPIC timer. |
 | [`src/arch/x86_64/gdt.zig`](../../src/arch/x86_64/gdt.zig) | GDT, per-CPU TSS, #DF IST stacks. |
 | [`src/arch/x86_64/idt.zig`](../../src/arch/x86_64/idt.zig) | IDT, exception dispatch, IRQ dispatch. |
 | [`src/arch/x86_64/interrupts.S`](../../src/arch/x86_64/interrupts.S) | Exception/IRQ/scheduler stubs and FPU save/restore. |

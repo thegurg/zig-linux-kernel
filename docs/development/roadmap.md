@@ -4,8 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M12 are complete and validated through the QEMU test
-flow. M13 is the next milestone and has not been scoped or started.
+**Current status:** M0-M13 are complete and validated through the QEMU test
+flow. M14 is the next milestone and has not been scoped or started.
 
 ## Pre-M11 bugfix pass (complete)
 
@@ -95,7 +95,7 @@ compile-time offset checks for `fpu_state`, `index`, and `lapic_id`.
 
 - User mode, user address spaces, and system calls.
 - A general driver framework or filesystem.
-- Replacing the PIC/PIT entirely; there is no APIC timer or IOAPIC routing yet.
+- Replacing the PIC/PIT entirely; IOAPIC routing and a CPU 0 LAPIC timer remain deferred.
 - More than `max_cpus = 8` without changing the GDT/TSS layout.
 
 ## M12: allocator locking and TLB hardening (complete)
@@ -152,16 +152,67 @@ AP-only tests and completed 1,000 BSP allocations. See
 - A TLB-shootdown fast path based on PCID or generation counters.
 - PMM exhaustion or page-table allocation-failure injection.
 
+## M13: per-CPU timers and AP preemption (complete)
+
+### Goal
+
+Give application processors their own timer-driven ticks so their tasks are
+preempted and their timed sleepers wake locally, without changing CPU 0's
+existing PIT behavior.
+
+### What landed
+
+1. **Per-CPU tick counters** — the single global `tick_counter` was replaced by
+   `cpu_ticks[max_cpus]`. Every CPU advances only its own counter.
+2. **AP LAPIC timers** — each AP starts a periodic LAPIC timer on vector 242
+   during bring-up. CPU 0 keeps the 100 Hz PIT on IRQ0, so existing BSP tests and
+   boot behavior are unchanged.
+3. **Calibration** — the BSP measures a masked one-shot LAPIC count against a
+   50 ms PIT channel-2 reference and publishes the reload value before releasing
+   the APs. The measurement does not need interrupts or IOAPIC/ACPI support.
+4. **Local deadline handling** — a timer tick wakes only blocked tasks pinned to
+   that CPU and compares deadlines against that CPU's counter. Cross-CPU wakeups
+   still use the reschedule IPI.
+5. **Timer dispatch** — `sched.timerInterrupt` is shared by PIT IRQ0 and LAPIC
+   vector 242. The AP timer fires with interrupts enabled in the idle frame, and
+   `timerInterrupt` may switch tasks like any other preemption point.
+6. **M13 tests** — one sleeper per AP proves that each AP counter advances and
+   `sched.sleep` wakes on that AP. Two CPU-bound tasks pinned to CPU 1 prove
+   timer-driven preemption: each must observe the other's counter while both are
+   still running.
+
+### Validation
+
+The full matrix passed: default KVM `zig build test` (`SMP=4`), TCG
+(`ZIG_KERNEL_NO_KVM=1`), `ZIG_KERNEL_SMP=2`, `ZIG_KERNEL_SMP=1`, Debug
+(`-Doptimize=Debug`), and `zig build`. The default run reported:
+
+```text
+timer: LAPIC 625396 counts per tick
+timer: per-cpu ticks=9, sleepers=3, preempted=1
+selftest: M13 checks passed
+```
+
+`SMP=2` reported one AP sleeper with three ticks of sleep; `SMP=1` skipped the
+AP-only part and reported zero sleepers. The preemption test also passed on
+repeated KVM runs and under TCG. See [testing](testing.md) for the full record.
+
+### M13 non-goals
+
+- Replacing the BSP PIT with a LAPIC timer on CPU 0.
+- IOAPIC routing or ACPI MADT parsing.
+- A per-CPU timer abstraction for drivers.
+- AP NMI or watchdog support.
+
 ## Later work
 
-The following items are deferred beyond M12. They are ordered by dependency,
+The following items are deferred beyond M13. They are ordered by dependency,
 not by priority.
 
 | Item | Status | Notes |
 | --- | --- | --- |
 | Reclaim partial heap growth | **PLANNED** | A failed grow leaks the reserved-but-unmapped tail. |
-| LAPIC timer / IOAPIC interrupt routing | **PLANNED** | Timer ticks remain BSP-only through the PIT; APs receive only IPIs. |
-| Per-CPU timer preemption | **PLANNED** | APs are preempted only by reschedule/TLB IPIs, not by a timer. |
+| BSP LAPIC timer / IOAPIC routing | **PLANNED** | CPU 0 still uses the PIT; APs use LAPIC timers. |
 | Physical memory above 4 GiB | **PLANNED** | PMM bitmap is sized for 4 GiB. |
 | Heap `resize`/`remap` | **PLANNED** | Currently `noResize`/`noRemap`. |
 | Per-CPU heap arenas | **PLANNED** | One global lock serializes all allocations. |
@@ -191,7 +242,8 @@ not by priority.
 | Pre-M11 | **IMPLEMENTED** | Interrupt-safe guards, AP setup ordering, accurate diagnostics, task return trampoline, host SMP/test harness fixes. |
 | M11 | **IMPLEMENTED** | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware blocking, TLB shootdown, AP exception/FPU state, expanded tests. |
 | M12 | **IMPLEMENTED** | IRQ-safe heap lock, concurrent allocator stress, lock-free TLB mailboxes, IRQ-off and concurrent shootdown tests. |
-| M13 | **PLANNED** | Not yet scoped. |
+| M13 | **IMPLEMENTED** | Per-CPU tick counters, AP LAPIC timers, local deadline wakeups, timer-driven AP preemption, calibration and tests. |
+| M14 | **PLANNED** | Not yet scoped. |
 
 ## Related documentation
 

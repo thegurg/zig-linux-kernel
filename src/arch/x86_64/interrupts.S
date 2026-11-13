@@ -77,6 +77,7 @@ ISR_NOERR 53   /* scheduler timed wait */
 
 ISR_NOERR 240  /* IPI: reschedule */
 ISR_NOERR 241  /* IPI: TLB shootdown */
+ISR_NOERR 242  /* LAPIC timer */
 ISR_NOERR 255  /* LAPIC spurious interrupt */
 
 IRQ_NOERR 32   /* IRQ0: PIT */
@@ -217,5 +218,9 @@ sched_stub_table:
 .globl ipi_stub_table
 ipi_stub_table:
     .quad isr_240, isr_241, isr_255
+
+.globl timer_stub_table
+timer_stub_table:
+    .quad isr_242
 
 .section .note.GNU-stack,"",@progbits

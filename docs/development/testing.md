@@ -1,7 +1,7 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-harness assertions, and the validation recorded for M12.
+harness assertions, and the validation recorded for M13.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -12,7 +12,7 @@ verification path for each milestone. Coverage gaps are documented below and in
 | Layer | Command | What it proves |
 | --- | --- | --- |
 | Host unit tests | part of `zig build test` | The host harness and the pure Limine binding test run. |
-| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
+| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, per-CPU timers, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
 
 `zig build test` runs all three. It builds the selftest and fault-test images
@@ -69,8 +69,11 @@ initialization, `kmain` runs the checks in this order.
 | M12 concurrent heap | `heap: concurrent allocs=<n>, errors=0` | Every CPU allocates, writes, verifies, and frees blocks concurrently. The count is 1,000 per online CPU (BSP included). |
 | M12 IRQ-off TLB | `tlb: irq-off=1` | A CPU disables interrupts, the BSP unmaps a page, and the shootdown completes only after that CPU enables interrupts and services the pending IPI. |
 | M12 concurrent TLB | `tlb: irq-off=1, concurrent shootdowns=<n>, errors=0` | Every AP maps and unmaps a private page concurrently; the reported count is the number of shootdowns issued with zero errors. |
-| `int3` | `returned from int3`, `M12 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
-| Success | `M12 checks passed` | Exits QEMU successfully. |
+| M13 AP sleep | `timer: per-cpu ticks=<n>, sleepers=<aps>, ...` | One sleeper per AP records its CPU's tick counter, sleeps for 3 ticks, and records the delta; the selftest requires the summed deltas to reach 3 ticks per AP, proving the AP LAPIC timer fires and wakes local deadlines. |
+| M13 AP preemption | `preempted=1` | Two CPU-bound tasks pinned to CPU 1 each observe the other's counter while both are still running, which requires timer-driven preemption. |
+| M13 result | `timer: per-cpu ticks=..., sleepers=..., preempted=1`, `M13 checks passed` | The per-CPU timer group completed with the expected sleeper count and preemption. |
+| `int3` | `returned from int3`, `M13 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
+| Success | `M13 checks passed` | Exits QEMU successfully. |
 
 The selftest logs diagnostic lines such as:
 
@@ -91,9 +94,12 @@ tlb: shootdowns=1
 smp: cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1
 heap: concurrent allocs=4000, errors=0
 tlb: irq-off=1, concurrent shootdowns=150, errors=0
+timer: LAPIC 625396 counts per tick
+timer: per-cpu ticks=9, sleepers=3, preempted=1
 ```
 
-Timing values vary by host and acceleration mode; the assertions check
+The `preempt_a`/`preempt_b`/`preempt_ticks` fields are diagnostics only and are
+not asserted. Timing values vary by host and acceleration mode; the assertions check
 conditions rather than exact tick counts except where a minimum is required.
 
 ## QEMU fault test
@@ -130,8 +136,10 @@ example below shows the default:
 
 ```text
 returned from int3
+M13 checks passed
 M12 checks passed
 M11 checks passed
+timer: per-cpu ticks=.*sleepers=.*preempted=1
 heap: concurrent allocs=.*errors=0
 tlb: irq-off=1
 concurrent shootdowns=
@@ -185,7 +193,7 @@ The test modes time out after 90 seconds.
 
 ## Recorded validation
 
-M12 validation ran the full matrix:
+M13 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -204,15 +212,21 @@ selftest: M11 checks passed
 heap: concurrent allocs=4000, errors=0
 tlb: irq-off=1, concurrent shootdowns=150, errors=0
 selftest: M12 checks passed
+timer: LAPIC 625396 counts per tick
+timer: per-cpu ticks=9, sleepers=3, preempted=1
+selftest: M13 checks passed
 selftest: exiting QEMU
 ```
 
-With `ZIG_KERNEL_SMP=2`, the heap test reported 2,000 allocations and 50
-shootdowns. With `ZIG_KERNEL_SMP=1`, the AP-only tests were skipped and the BSP
-completed 1,000 allocations.
+With `ZIG_KERNEL_SMP=2`, one AP sleeper reported three ticks and the preemption
+test passed. With `ZIG_KERNEL_SMP=1`, the AP-only timer part was skipped and the
+result reported zero sleepers and `preempted=1` without running the two
+preemption workers, because the test requires an AP. TCG
+(`timer: per-cpu ticks=9, sleepers=3, preempted=1`) and repeated KVM runs also
+passed.
 
-`zig fmt --check build.zig src` and `git diff --check` were run before the M12
-commit. Earlier M10, pre-M11, and M11 validation remains in
+`zig fmt --check build.zig src` and `git diff --check` were run before the M13
+commit. Earlier M10, pre-M11, M11, and M12 validation remains in
 [SMP](../architecture/smp.md#recorded-validation) and the roadmap.
 
 ## Coverage gaps
@@ -220,9 +234,9 @@ commit. Earlier M10, pre-M11, and M11 validation remains in
 - There is no AP NMI test. AP `int3` and FPU-state preservation are covered.
 - The M12 tests cover a target with interrupts disabled and several concurrent
   shootdowns, but not a CPU that never re-enables interrupts.
-- The SMP timer path is not exercised: `selftestSmp` masks IRQ0 before running
-  the M11/M12 tests, and APs have no timer. AP sleep/timeout wakeups are
-  therefore not covered end-to-end.
+- `selftestSmp` masks the BSP PIT before running the M11/M12/M13 tests, so CPU 0
+  tick behaviour during those tests is not exercised; AP LAPIC timers remain
+  active. There is no test for a CPU 0 LAPIC timer or IOAPIC routing.
 - There is no cross-CPU mutex/condition stress test; the cross-CPU wake test
   covers the wait-queue/IPI path.
 - The concurrent heap test does not force PMM exhaustion or page-table
@@ -235,16 +249,19 @@ commit. Earlier M10, pre-M11, and M11 validation remains in
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M12 behavior, AP scheduling, IPIs, concurrent allocation, TLB hardening, and `int3`. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M13 behavior, AP scheduling, IPIs, per-CPU timers, concurrent allocation, TLB hardening, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11/M12 test results. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11/M12/M13 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
 | TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |
 | Nested lock test | **IMPLEMENTED** | Nested `IrqSpinLock` guards. |
 | Cross-CPU wake test | **IMPLEMENTED** | BSP wakes a CPU 1 task. |
 | Concurrent heap test | **IMPLEMENTED** | All CPUs allocate/write/verify/free concurrently. |
-| AP timer / NMI tests | **PLANNED** | APs have no timer; NMI is not tested. |
+| AP timer / sleep test | **IMPLEMENTED** | One LAPIC-timer sleeper per AP; local deadline wakeup. |
+| AP timer preemption test | **IMPLEMENTED** | Two CPU-bound CPU 1 tasks must observe each other. |
+| AP NMI test | **PLANNED** | NMI is not tested. |
+| CPU 0 LAPIC timer / IOAPIC test | **PLANNED** | CPU 0 still uses PIT IRQ0. |
 | Allocator failure-path test | **PLANNED** | No PMM-exhaustion or mapping-failure test. |
 
 ## Related documentation

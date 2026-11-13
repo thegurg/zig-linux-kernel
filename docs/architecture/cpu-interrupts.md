@@ -5,10 +5,10 @@ interrupt and exception handling, the legacy PIC/PIT, the local APIC/IPIs, and
 the interrupt-facing FPU state.
 
 **Implementation status:** CPU bring-up, GDT/TSS, IDT, exception dispatch,
-PIC/PIT, LAPIC/x2APIC, IPI dispatch, and per-CPU interrupt-time FPU
-save/restore are **IMPLEMENTED** on every online CPU. The timer remains a
-BSP-only PIT interrupt; APs receive reschedule and TLB IPIs. See
-[technical debt](../development/technical-debt.md).
+PIC/PIT, LAPIC/x2APIC, IPI dispatch, per-CPU LAPIC timer bring-up, and per-CPU
+interrupt-time FPU save/restore are **IMPLEMENTED** on every online CPU. CPU 0
+keeps the PIT; APs use their LAPIC timer and receive reschedule and TLB IPIs.
+See [technical debt](../development/technical-debt.md).
 
 ## SSE and FPU enablement
 
@@ -102,6 +102,7 @@ of 16-byte gates. `idt.init()` installs:
 | 32-47 | `irq_stub_table` | PIC IRQs; only IRQ0 is unmasked. |
 | 48-53 | `sched_stub_table` | Scheduler software interrupts. |
 | 240, 241 | `ipi_stub_table[0..2]` | Reschedule and TLB-shootdown IPIs. |
+| 242 | `timer_stub_table[0]` | Periodic LAPIC timer on application processors. |
 | 255 | `ipi_stub_table[2]` | LAPIC spurious-interrupt gate. |
 
 Every gate is a present, DPL0, 64-bit interrupt gate (`type_attr = 0x8e`).
@@ -182,19 +183,22 @@ this order:
    `saved_rsp` unchanged. The handler scans the lock-free per-CPU mailboxes and
    takes no kernel locks, so it can run while another CPU is waiting for
    shootdown acknowledgements.
-3. **Spurious vector 255**: return `saved_rsp` without an EOI.
-4. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
-   `sched.tick(saved_rsp)`; all other IRQs return `saved_rsp` unchanged.
-5. **Scheduler vectors 48-53**: call the matching scheduler entry and return
+3. **Timer 242**: send LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
+   This is the AP timer path.
+4. **Spurious vector 255**: return `saved_rsp` without an EOI.
+5. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
+   `sched.timerInterrupt(saved_rsp)`; all other IRQs return `saved_rsp`
+   unchanged.
+6. **Scheduler vectors 48-53**: call the matching scheduler entry and return
    the saved-register base it selects.
-6. **Other exceptions**: print vector number and name, error code, RIP, CS,
+7. **Other exceptions**: print vector number and name, error code, RIP, CS,
    RFLAGS, and (for user-mode frames) RSP/SS.
-7. For vector 14 (`#PF`), read `CR2` and print it.
-8. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
+8. For vector 14 (`#PF`), read `CR2` and print it.
+9. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
    `saved_rsp`; this is the path both the BSP smoke test and the AP exception
    test use.
-9. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
-   with the failure code.
+10. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
+    with the failure code.
 
 The dispatcher uses the global console, which has its own IRQ-safe message
 lock, and the scheduler's `task_lock`. Exceptions on an AP therefore save and
@@ -215,9 +219,14 @@ before accessing APIC registers.
 - `eoi()` acknowledges the current interrupt.
 - `sendIpi(destination, vector)` sends a fixed-delivery edge IPI.
 - `sendIpiAllButSelf(vector)` uses the all-but-self shorthand.
+- `calibrateTimer(hz)` programs a masked one-shot timer, measures 50 ms against
+  PIT channel 2, and stores the reload count for that tick rate.
+- `startPeriodicTimer(vector)` programs a divided-by-16 periodic timer;
+  `stopTimer()` masks it.
 
-The scheduler uses vector 240 for reschedule and 241 for TLB shootdown. See
-[SMP](smp.md) and [synchronization](synchronization.md) for the protocols.
+The scheduler uses vector 240 for reschedule, 241 for TLB shootdown, and 242 for
+the AP timer. See [SMP](smp.md) and [synchronization](synchronization.md) for the
+protocols.
 
 ## PIC and PIT
 
@@ -230,8 +239,9 @@ the master at `0x20`, the slave at `0x28`, the cascade through master IRQ2, and
 data ports as appropriate. Unmasking an IRQ 8-15 also unmasks the master
 cascade line.
 
-The kernel unmasks only IRQ0 for the PIT. The PIC and PIT are the only timer
-source; there is no APIC timer or IOAPIC routing yet. APs receive only IPIs.
+The kernel unmasks only IRQ0 for the PIT. CPU 0 uses the PIT as its timer source;
+application processors use their own LAPIC timers and never take IRQ0. There is
+still no IOAPIC routing.
 
 ### 8253/8254 PIT
 
@@ -240,6 +250,10 @@ source; there is no APIC timer or IOAPIC routing yet. APs receive only IPIs.
 `base_frequency = 1_193_182` and a divisor clamped to `1..0xffff`. The kernel
 uses 100 Hz. The PIT line remains masked until the caller explicitly unmasks
 IRQ0.
+
+Channel 2 provides a blocking millisecond reference used to calibrate the LAPIC
+timer before the APs are released. It runs in one-shot mode with the speaker
+output off, so it does not depend on interrupts or on channel 0 being active.
 
 ## Implementation status
 
@@ -252,9 +266,11 @@ IRQ0.
 | IRQ stubs and full GPR save | **IMPLEMENTED** | 15 GPRs; scheduler resumption via returned base. |
 | Interrupt-time FPU save/restore | **IMPLEMENTED** | Per-CPU `%gs:0`; AP `int3` test. |
 | PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled. |
-| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; BSP only. |
+| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; CPU 0 timer source. |
+| PIT channel 2 reference | **IMPLEMENTED** | Blocking millisecond delay for LAPIC calibration. |
 | LAPIC/x2APIC and IPIs | **IMPLEMENTED** | Vectors 240/241; spurious gate 255. |
-| APIC timer / IOAPIC routing | **PLANNED** | No per-CPU timer or IOAPIC yet. |
+| AP LAPIC timer | **IMPLEMENTED** | Vector 242, periodic, calibrated from PIT channel 2. |
+| CPU 0 LAPIC timer / IOAPIC routing | **PLANNED** | CPU 0 still uses the PIT; no IOAPIC yet. |
 | User-mode interrupt frames | **PLANNED** | `from_user` reporting exists, but user mode is not implemented. |
 
 ## Related documentation
