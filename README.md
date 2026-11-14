@@ -19,7 +19,9 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **Pre-M11 bugfix pass complete:** per-acquisition interrupt guards, AP SSE/`CR0.WP`/global-TLB setup ordering, accurate diagnostics, a task return trampoline, and a dynamic SMP test assertion.
 - **M11 complete:** per-CPU scheduling with pinned tasks and per-CPU idle tasks, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition variables, TLB shootdown, GS-based per-CPU FPU state on APs, and expanded QEMU tests.
 - **M12 complete:** IRQ-safe heap locking with a concurrent allocator stress test, lock-free per-CPU TLB-shootdown mailboxes, and tests for interrupts-disabled targets and concurrent shootdowns.
-- **Next:** M13 (not started). See the [roadmap](docs/development/roadmap.md).
+- **M13 complete:** per-CPU tick counters, AP LAPIC timers calibrated against PIT channel 2, local deadline wakeups, and timer-driven AP preemption.
+- **M14 complete:** ACPI RSDP/XSDT/RSDT/MADT parsing, ISO-resolved ISA IRQ0, an IOAPIC redirection driver, a CPU 0 LAPIC timer, a PIT fallback boot image, and IOAPIC delivery tests.
+- **Next:** M15 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -37,7 +39,7 @@ zig build test   # host tests + QEMU smoke and fault tests
 Build options:
 - `-Doptimize={debug,safe,fast,small}` (default: `safe`/`ReleaseSafe`)
 
-`zig build test` builds two headless images and checks both with
+`zig build test` builds three headless images and checks them with
 `isa-debug-exit`:
 - the selftest checks PMM allocation/free/reuse, page-table translation and
   map/unmap, heap allocation/alignment/coalescing, waits for 30 PIT ticks while
@@ -53,30 +55,40 @@ Build options:
   reschedule IPI, an AP `int3` with XMM5 preservation, a TLB shootdown after
   `unmapPage`, and nested `IrqSpinLock` guards; the M12 checks then allocate,
   write, verify, and free blocks on every CPU concurrently, shoot down to a CPU
-  with interrupts disabled, and run concurrent per-AP map/unmap shootdowns; it
-  then triggers `int3` and must return from the handler (QEMU status 33);
+  with interrupts disabled, and run concurrent per-AP map/unmap shootdowns; the
+  M13 checks prove per-AP LAPIC timer wakeups and timer-driven preemption; the
+  M14 checks parse the ACPI MADT, cross-check its CPU list with Limine, resolve
+  ISA IRQ0 through its Interrupt Source Override, program and read back the
+  IOAPIC redirection entry, observe IOAPIC delivery with a LAPIC EOI, mask the
+  pin, then start CPU 0's LAPIC timer and verify a local sleeper and timer-driven
+  preemption; it then triggers `int3` and must return from the handler (QEMU
+  status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
-  exiting through the failure path (QEMU status 35).
+  exiting through the failure path (QEMU status 35);
+- the fallback image boots with `force_pit` and must log the PIT timer path and
+  the idle transition before the harness accepts its expected idle timeout.
 
 ## Layout
 ```
 boot/limine.conf   Limine menu/config
 linker.ld          Higher-half layout, page-aligned PT_LOAD segments
 src/
-  arch/x86_64/     ports, serial, qemu exit, SSE, per-CPU state, GDT/TSS, IDT, PIC, PIT, LAPIC
+  arch/x86_64/     ports, serial, qemu exit, SSE, per-CPU state, GDT/TSS, IDT, PIC, PIT, LAPIC, IOAPIC
   arch/x86_64/cpu.zig       per-CPU GS-based state and SSE/FPU enablement
-  arch/x86_64/lapic.zig     xAPIC/x2APIC detection, EOI, and IPIs
+  arch/x86_64/lapic.zig     xAPIC/x2APIC detection, EOI, IPIs, and the LAPIC timer
+  arch/x86_64/ioapic.zig    IOAPIC redirection entries, masking, and ISA IRQ routing
   arch/x86_64/interrupts.S  Exception/IRQ/IPI stubs, GPR and FPU save/restore
   arch/x86_64/smp_entry.S   AP entry: private stack, kernel CR3, ap_main
+  acpi.zig         RSDP/XSDT/RSDT/MADT parsing and ISA IRQ resolution
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M12 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M14 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch, TLB shootdown hook
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
   sched.zig        per-CPU scheduler, wait queues, mutex/condition, IPIs, TLB shootdown
-  smp.zig          Limine MP bring-up, AP scheduler entry and M11 SMP tests
+  smp.zig          Limine MP bring-up, AP scheduler entry and M11-M13 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
 tools/run.sh       Build ESP (vvfat) and launch QEMU
 tools/genfont.py   Regenerate src/font.zig from a system font

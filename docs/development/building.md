@@ -25,7 +25,7 @@ directory and exposes it to QEMU as a synthesized FAT drive through `vvfat`.
 export PATH=~/.local/opt/toolchain/zig-x86_64-linux-0.17.0:$PATH
 zig build        # build the normal kernel (default: ReleaseSafe)
 zig build run    # boot the kernel in QEMU, serial on stdio
-zig build test   # host tests + QEMU smoke and fault tests
+zig build test   # host tests + QEMU smoke, fault, and fallback-boot tests
 ```
 
 The default optimization mode is `ReleaseSafe`. Override it with:
@@ -58,33 +58,36 @@ zig build -Doptimize=ReleaseSmall
 LLVM is required because the self-hosted x86_64 backend in Zig 0.17 ignores
 custom linker scripts.
 
-The build creates three executables from the same `src/main.zig` root, passing
+The build creates four executables from the same `src/main.zig` root, passing
 different `build_options`:
 
-| Artifact | `exit_after_boot` | `test_page_fault` | Use |
-| --- | --- | --- | --- |
-| `zig-kernel` | `false` | `false` | Installed normal kernel; `zig build run`. |
-| `zig-kernel-selftest` | `true` | `false` | Smoke tests; `zig build test`. |
-| `zig-kernel-fault-test` | `false` | `true` | Deliberate `#PF`; `zig build test`. |
+| Artifact | `exit_after_boot` | `test_page_fault` | `force_pit` | Use |
+| --- | --- | --- | --- | --- |
+| `zig-kernel` | `false` | `false` | `false` | Installed normal kernel; `zig build run`. |
+| `zig-kernel-selftest` | `true` | `false` | `false` | Smoke tests; `zig build test`. |
+| `zig-kernel-fault-test` | `false` | `true` | `false` | Deliberate `#PF`; `zig build test`. |
+| `zig-kernel-fallback` | `false` | `false` | `true` | Forces the PIT timer path; `zig build test`. |
 
 `zig build test` runs:
 
 1. the host-side unit tests rooted at
    [`src/test_root.zig`](../../src/test_root.zig);
 2. `bash tools/run.sh <selftest> --test`;
-3. `bash tools/run.sh <fault-test> --test-fault`.
+3. `bash tools/run.sh <fault-test> --test-fault`;
+4. `bash tools/run.sh <fallback> --test-boot`.
 
 The QEMU steps are marked as side-effecting so the build system does not treat
 them as cacheable pure commands.
 
 ## QEMU harness
 
-[`tools/run.sh`](../../tools/run.sh) accepts three forms:
+[`tools/run.sh`](../../tools/run.sh) accepts four forms:
 
 ```bash
 tools/run.sh <kernel.elf>                # interactive, serial on stdio
 tools/run.sh <kernel.elf> --test         # headless smoke test, exit code = verdict
 tools/run.sh <kernel.elf> --test-fault   # headless fault test, expects a handled #PF
+tools/run.sh <kernel.elf> --test-boot    # headless boot test, expects the PIT fallback
 ```
 
 ### Default QEMU configuration
@@ -125,7 +128,7 @@ write to them.
 | --- | --- | --- |
 | `0x10` (`EXIT_SUCCESS`) | 33 | Selftest passed. |
 | `0x11` (`EXIT_FAILURE`) | 35 | Fatal exception, panic, or expected fault-test exit. |
-| — | 124 | Harness timeout (90 seconds in test modes). |
+| — | 124 | Harness timeout: 90 seconds for smoke/fault, 20 seconds for fallback boot. |
 
 The harness also inspects the serial log. See [testing](testing.md) for the
 exact assertions.
@@ -139,7 +142,7 @@ zig fmt --check build.zig src
 git diff --check
 ```
 
-Both were part of the M10 validation and passed. Running `zig fmt` on
+Both were part of the M14 validation and passed. Running `zig fmt` on
 `build.zig` and `src` keeps the Zig sources formatted; `git diff --check`
 catches trailing whitespace and conflict markers.
 
@@ -176,18 +179,20 @@ the no-AP path; `2` through `8` exercise AP bring-up and the SMP stress test.
 
 The normal kernel is designed to stay alive after boot and hand control to the
 idle task, so `tools/run.sh` without a test mode does not return on its own.
-Use `Ctrl-C` or the QEMU monitor to stop it. In test modes, a 90-second timeout
-turns a hang into status 124.
+Use `Ctrl-C` or the QEMU monitor to stop it. In smoke and fault-test modes, a
+90-second timeout turns a hang into status 124; the fallback-boot mode expects
+the idle timeout and uses 20 seconds.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Reproducible Zig build | **IMPLEMENTED** | Pinned Zig version, vendored Limine. |
-| Normal/selftest/fault variants | **IMPLEMENTED** | Built from the same root. |
+| Normal/selftest/fault/fallback variants | **IMPLEMENTED** | Built from the same root. |
 | UEFI QEMU harness without root | **IMPLEMENTED** | `vvfat` ESP; no mtools/xorriso/losetup. |
 | KVM with TCG fallback | **IMPLEMENTED** | Selected from `/dev/kvm` access. |
 | Dynamic smoke-test CPU assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
+| Fallback-boot assertion | **IMPLEMENTED** | `force_pit` image must log the PIT timer and idle transition. |
 | BIOS image | **PLANNED** | Not produced. |
 
 ## Related documentation

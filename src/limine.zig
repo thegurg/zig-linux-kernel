@@ -66,6 +66,13 @@ pub const PagingModeResponse = extern struct {
     mode: u64,
 };
 
+/// Base revision 3 returns the RSDP as a physical address. The caller adds the
+/// HHDM offset before reading the ACPI tables.
+pub const RsdpResponse = extern struct {
+    revision: u64,
+    address: ?*anyopaque,
+};
+
 /// x86-64 entry from Limine's MP (multiprocessor) protocol. `reserved` and
 /// `goto_address` are managed by the bootloader until we publish an entry;
 /// `extra_argument` is free for the kernel.
@@ -139,6 +146,12 @@ const PagingModeRequest = extern struct {
     min_mode: u64,
 };
 
+const RsdpRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*RsdpResponse,
+};
+
 const MemmapRequest = extern struct {
     id: [4]u64,
     revision: u64,
@@ -209,6 +222,13 @@ export var paging_mode_request: PagingModeRequest linksection(".limine_requests"
     .min_mode = 0,
 };
 
+/// ACPI root pointer request. Physical for Limine base revision 3.
+export var rsdp_request: RsdpRequest linksection(".limine_requests") = .{
+    .id = .{ common_magic_0, common_magic_1, 0xc5e77b6b397e7b43, 0x27637845accdcf3c },
+    .revision = 0,
+    .response = null,
+};
+
 pub fn baseRevisionSupported() bool {
     return base_revision[2] == 0;
 }
@@ -234,6 +254,10 @@ pub fn executableAddress() ?*ExecutableAddressResponse {
 
 pub fn pagingMode() ?*PagingModeResponse {
     return paging_mode_request.response;
+}
+
+pub fn rsdp() ?*RsdpResponse {
+    return rsdp_request.response;
 }
 
 pub fn mp() ?*MpResponse {

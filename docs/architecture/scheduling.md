@@ -6,16 +6,16 @@ switching.
 
 **Implementation status:** per-CPU scheduling, pinned task creation, AP idle
 tasks, cross-CPU wakeups, per-CPU FPU context, and timer-driven preemption on
-every CPU are **IMPLEMENTED**. CPU 0 uses the PIT; APs use their LAPIC timers.
-Deadlines and tick counters are per CPU. See
-[technical debt](../development/technical-debt.md).
+every CPU are **IMPLEMENTED**. CPU 0 and every AP use a periodic LAPIC timer;
+CPU 0 keeps the PIT IRQ0 path as a fallback. Deadlines and tick counters are per
+CPU. See [technical debt](../development/technical-debt.md).
 
 ## Scope
 
 The scheduler in [`src/sched.zig`](../../src/sched.zig) provides:
 
-- preemptive round-robin scheduling on every CPU: IRQ0 at 100 Hz on the BSP and
-  a periodic LAPIC timer on each AP;
+- preemptive round-robin scheduling on every CPU: a periodic LAPIC timer on
+  vector 242, with the 100 Hz PIT IRQ0 path as CPU 0's fallback;
 - per-CPU tick counters, current task, idle task, scan cursor, and pending
   sleep/wait state;
 - cooperative `yield` and `exit` software interrupts;
@@ -271,10 +271,11 @@ semantics and the lost-wakeup rules.
 
 `sched.stop()` acquires `task_lock` and sets `enabled = false`. Timer ticks
 still increment the local CPU's counter and wake local blocked tasks, but no CPU
-switches tasks. `sched.resumeScheduling()` sets `enabled = true` again. The selftest
-calls `stopTimer()` (which disables interrupts, masks IRQ0, and calls
-`sched.stop()`) before the BSP-only tests, then re-enables scheduling before the
-M11 SMP tests.
+switches tasks. `sched.resumeScheduling()` sets `enabled = true` again. The
+selftest calls `stopTimer()` (which disables interrupts, masks IRQ0, stops the
+LAPIC timer, and calls `sched.stop()`) before the BSP-only tests, then re-enables
+scheduling before the M11 SMP tests. M14 restarts CPU 0's LAPIC timer when it
+switches the BSP to the uniform timer path.
 
 ## Idle tasks
 
@@ -350,6 +351,8 @@ The scheduler is exercised by the selftest image described in
 | M12 concurrent TLB | Every AP maps and unmaps a private page concurrently; all shootdowns complete with zero errors. |
 | M13 AP ticks/sleep | One sleeper per AP advances that AP's tick counter and wakes locally after `sched.sleep`. |
 | M13 AP preemption | Two CPU-bound tasks pinned to CPU 1 each observe the other's counter while both are running, proving timer-driven preemption. |
+| M14 IOAPIC delivery | ISA IRQ0 is resolved through its MADT ISO, programmed into the IOAPIC, observed on vector 242 with a LAPIC EOI, then masked. |
+| M14 CPU 0 timer | CPU 0 starts its LAPIC timer, a sleeper wakes after five ticks, and two CPU-bound tasks are preempted by the local timer. |
 
 ## Limitations
 
@@ -362,15 +365,16 @@ The scheduler is exercised by the selftest image described in
 - **No join/wait-for-exit API**; tests poll `finishedCount()`.
 - **No address-space switching**; all tasks share the kernel page tables.
 - **Idle cannot block**; blocking calls return immediately for idle tasks.
-- **BSP timer differs:** CPU 0 still uses the PIT; APs use LAPIC timers. The two
-  sources are calibrated to the same nominal rate but are not phase-locked.
+- **Fallback timer:** CPU 0 uses the PIT if LAPIC calibration fails or the
+  `force_pit` image is built. Normal operation uses the same LAPIC mechanism as
+  the APs, but the per-CPU counters are not phase-locked.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Per-CPU round-robin scheduler | **IMPLEMENTED** | Pinned tasks, per-CPU idle and current state. |
-| BSP timer preemption | **IMPLEMENTED** | IRQ0 at 100 Hz, CPU 0 only. |
+| Per-CPU timer preemption | **IMPLEMENTED** | LAPIC vector 242 on CPU 0 and APs; PIT IRQ0 fallback on CPU 0. |
 | Per-CPU tick counters | **IMPLEMENTED** | Independent `cpu_ticks` entries; `ticksOn(cpu)`. |
 | Cooperative yield/exit | **IMPLEMENTED** | Vectors 48 and 49. |
 | Sleep and explicit block/wake | **IMPLEMENTED** | Vectors 50 and 51; local deadline scanning. |
@@ -381,7 +385,7 @@ The scheduler is exercised by the selftest image described in
 | Cross-CPU wakeups | **IMPLEMENTED** | Reschedule IPI 240. |
 | TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241; waits for every acknowledgement. |
 | AP timer preemption | **IMPLEMENTED** | Periodic LAPIC timer, vector 242, calibrated from the PIT. |
-| CPU 0 LAPIC timer / IOAPIC | **PLANNED** | CPU 0 still uses PIT IRQ0. |
+| CPU 0 LAPIC timer | **IMPLEMENTED** | Same vector and reload as the APs; PIT fallback retained. |
 | Priorities, migration, join | **PLANNED** | Not implemented. |
 
 ## Related documentation

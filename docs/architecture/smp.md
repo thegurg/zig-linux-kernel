@@ -7,8 +7,9 @@ tests.
 **Implementation status:** Limine MP bring-up, per-CPU stacks/TSS, pre-Zig AP
 setup, the atomic spinlock stress test, per-CPU scheduler entry, LAPIC and
 x2APIC initialisation, reschedule/TLB/timer interrupts, cross-CPU wakeups, TLB
-shootdown, timer-driven AP preemption, and AP exception/FPU-state handling are
-**IMPLEMENTED**. CPU 0 keeps the PIT; APs use LAPIC timers. See
+shootdown, timer-driven preemption on every CPU, ACPI/MADT discovery, IOAPIC
+routing, and AP exception/FPU-state handling are **IMPLEMENTED**. CPU 0 and every
+AP use LAPIC timers; the PIT IRQ0 path is the fallback. See
 [technical debt](../development/technical-debt.md).
 
 ## Scope
@@ -24,13 +25,18 @@ Every online CPU has:
 - interrupt-time FPU state reachable at `%gs:0`.
 
 Tasks are pinned to the CPU chosen at creation (`sched.createOn`). There is no
-load balancing or task migration. CPU 0 owns IRQ0 and advances its tick from the
-PIT; every AP advances its own tick from its LAPIC timer, so local deadlines are
-handled locally.
+load balancing or task migration. Every CPU advances its own tick from its
+periodic LAPIC timer, so local deadlines are handled locally. If LAPIC
+calibration fails, or when the `force_pit` image is built, CPU 0 uses PIT IRQ0
+instead.
 
-The kernel still does **not** provide a LAPIC timer on CPU 0, IOAPIC routing, or
-ACPI MADT parsing. The heap, PMM, VMM, console, and serial paths all use IRQ-safe
-locks, and TLB shootdowns use lock-free per-CPU mailboxes.
+ACPI/MADT discovery provides the local APIC list, IOAPIC list, and Interrupt
+Source Overrides. The IOAPIC driver can route ISA IRQs through their resolved
+GSI; M14 exercises ISA IRQ0 to vector 242. ACPI/IOAPIC failure is non-fatal and
+leaves the legacy PIC/PIT path available.
+
+The heap, PMM, VMM, console, and serial paths all use IRQ-safe locks, and TLB
+shootdowns use lock-free per-CPU mailboxes.
 
 ## Limine MP protocol
 
@@ -201,9 +207,11 @@ on the current CPU before touching APIC registers.
 - `eoi()` writes the EOI register.
 - `sendIpi(destination, vector)` sends a fixed-delivery edge IPI to one CPU.
 - `sendIpiAllButSelf(vector)` uses the all-but-self shorthand.
-- `calibrateTimer(hz)` measures a masked one-shot count against PIT channel 2.
+- `calibrateTimer(hz)` measures a masked one-shot count against PIT channel 2 on
+  the BSP before AP release; every CPU reuses the reload value.
 - `startPeriodicTimer(vector)` starts the divided-by-16 periodic timer on the
   calling CPU.
+- `stopTimer()` masks the timer.
 
 The IDT installs gates for:
 
@@ -214,7 +222,9 @@ The IDT installs gates for:
 | 242 | LAPIC timer | Acknowledge LAPIC, call `sched.timerInterrupt`. |
 | 255 | LAPIC spurious | Ignore; no EOI is required. |
 
-IRQ0 also sends a LAPIC EOI in addition to the PIC EOI.
+Vector 242 is also the target used by the M14 IOAPIC delivery test, so its LAPIC
+EOI is the only acknowledgement for that IOAPIC-delivered interrupt. The legacy
+PIC IRQ0 path sends both a PIC EOI and a LAPIC EOI.
 
 ## Per-CPU scheduling behavior
 
@@ -230,7 +240,9 @@ IRQ0 also sends a LAPIC EOI in addition to the PIC EOI.
 - Each CPU's timer interrupt advances that CPU's `cpu_ticks` entry and scans only
   blocked tasks pinned to that CPU. A sleeper on an AP is woken by the AP's LAPIC
   timer; explicit cross-CPU wakeups still use the reschedule IPI.
-- CPU 0's tick comes from PIT IRQ0; AP ticks come from vector 242.
+- CPU 0 and AP ticks come from vector 242 in normal operation. If LAPIC
+  calibration fails or `force_pit` is set, CPU 0's tick comes from PIT IRQ0
+  instead; APs still use their LAPIC timers.
 - A task's FPU area is per task, and `%gs:0` is updated on every context switch
   on that CPU. AP exception entry therefore saves and restores AP-local state.
 
@@ -329,42 +341,81 @@ timer: per-cpu ticks=9, sleepers=3, preempted=1 (a=1, b=1928600, ticks=1)
 selftest: M13 checks passed
 ```
 
+### M14 ACPI, IOAPIC, and CPU 0 timer tests
+
+`selftestM14()` runs after the APs are online:
+
+1. requires ACPI/MADT and at least one IOAPIC controller, and a calibrated
+   LAPIC timer;
+2. cross-checks the MADT enabled-CPU count against Limine's CPU count and
+   confirms the BSP's LAPIC ID appears in the MADT;
+3. resolves ISA IRQ0 with `acpi.isaIrqRoute(0)` and logs the GSI, polarity,
+   trigger mode, and whether an ISO overrode the identity mapping;
+4. stops CPU 0's LAPIC timer, leaves the PIT running, routes IRQ0 through its
+   resolved GSI to vector 242 for the BSP, and verifies the redirection
+   readback: vector 242, BSP destination, ISO polarity/trigger, and unmasked;
+5. waits for at least five ticks, proving end-to-end IOAPIC delivery with the
+   LAPIC EOI in the vector 242 handler, then masks the pin and checks the mask
+   readback;
+6. restarts CPU 0's periodic LAPIC timer and runs a CPU 0 sleeper and two
+   CPU-bound CPU 0 tasks that must observe each other, proving local timer
+   wakeups and preemption.
+
+The selftest log is:
+
+```text
+acpi: madt revision=3 cpus=4/4 ioapics=1 isos=5 lapic=0xfee00000
+ioapic: id=0 version=17 entries=24 gsi_base=0 address=0xfec00000
+acpi: madt cpus matched limine=4, bsp_lapic_id=0
+m14: irq0 gsi=2, polarity=active_high, trigger=edge, overridden=1
+m14: ioapic entry low=0xf2 high=0x0
+m14: ioapic ticks=5
+timer: source=lapic
+m14: cpu0 sleep ticks=5
+m14: cpu0 preempted=1 a=2339567 b=1 ticks=3
+selftest: M14 checks passed
+```
+
+The `force_pit` fallback image skips the normal LAPIC start and reports
+`timer: source=pit, 100 Hz, IRQ0 unmasked`; `tools/run.sh --test-boot` asserts
+that path.
+
 ## Boot-mode behavior
 
 | Mode | AP behavior |
 | --- | --- |
-| Normal kernel | `kmain` calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, and M13 tests. |
+| Normal kernel | `kmain` parses ACPI, initializes the IOAPICs, calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. CPU 0 then starts its own LAPIC timer. The log is `smp: 3 APs online, scheduler idle`. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, and M14 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
+| Fallback kernel | `kmain` follows the normal path but `force_pit` makes CPU 0 select PIT IRQ0 instead of its LAPIC timer. |
 
 The normal-run log is:
 
 ```text
 smp: cpus=4, aps=3, bsp_lapic_id=0, x2apic=1
 smp: 3 APs online, scheduler idle
+timer: source=lapic
 ```
 
 ## Recorded validation
 
-M13 validation ran the full matrix:
+M14 validation ran the full matrix:
 
-- default KVM `zig build test` (`SMP=4`, ReleaseSafe): passed;
+- `zig build` (default ReleaseSafe): passed;
+- default KVM `zig build test` (`SMP=4`): passed;
 - `ZIG_KERNEL_NO_KVM=1 zig build test` (TCG): passed;
 - `ZIG_KERNEL_SMP=2 zig build test`: passed;
 - `ZIG_KERNEL_SMP=1 zig build test`: passed;
 - `zig build -Doptimize=Debug test`: passed;
-- `zig build`: passed;
-- the default smoke result was `counter=400000, expected=400000, overlap=0`,
-  `cross-cpu wake=1, ap exception=1, tlb=1, nested locks=1`,
-  `heap: concurrent allocs=4000, errors=0`,
-  `tlb: irq-off=1, concurrent shootdowns=150, errors=0`, and
-  `timer: per-cpu ticks=9, sleepers=3, preempted=1`;
-- `SMP=2` reported two AP sleepers and a successful preemption test with three
-  sleep ticks; `SMP=1` skipped the AP-only timer part and reported zero sleepers;
-- repeated default runs and the TCG run also passed the preemption test;
-- `zig fmt --check build.zig src` and `git diff --check`: passed.
+- the default smoke result included `acpi: madt revision=3 ...`,
+  `ioapic: id=0 version=17 entries=24 gsi_base=0`, `m14: irq0 gsi=2 ...`,
+  `m14: ioapic ticks=5`, `timer: source=lapic`, `m14: cpu0 sleep ticks=5`, and
+  `m14: cpu0 preempted=1`;
+- the `force_pit` image booted through `timer: source=pit, 100 Hz, IRQ0
+  unmasked` and the `--test-boot` harness accepted it;
+- `zig fmt --check src build.zig` and `git diff --check`: passed.
 
-The earlier M11 and M12 validation is recorded in the
+The earlier M11-M13 validation and the M14 roadmap record are in the
 [roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
@@ -381,10 +432,12 @@ The earlier M11 and M12 validation is recorded in the
 | AP exception and FPU state | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE pointer; AP `int3` test. |
 | PMM/VMM/console/serial locking | **IMPLEMENTED** | IRQ-safe locks; VMM page-table lock plus TLB callback. |
 | Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
-| Per-CPU tick counters | **IMPLEMENTED** | CPU 0 from PIT; APs from LAPIC timers. |
-| AP LAPIC timer | **IMPLEMENTED** | Vector 242; calibrated against PIT channel 2. |
-| Timer-driven AP preemption | **IMPLEMENTED** | Two CPU-bound AP tasks interleave under the timer. |
-| CPU 0 LAPIC timer / IOAPIC routing | **PLANNED** | CPU 0 still uses PIT IRQ0. |
+| Per-CPU tick counters | **IMPLEMENTED** | LAPIC timers on CPU 0 and APs; PIT fallback for CPU 0. |
+| Per-CPU LAPIC timer | **IMPLEMENTED** | Vector 242; calibrated against PIT channel 2. |
+| Timer-driven preemption | **IMPLEMENTED** | CPU 1 AP test plus the M14 CPU 0 preemption test. |
+| ACPI/MADT discovery | **IMPLEMENTED** | RSDP/XSDT/RSDT/MADT validation; BSP-only. |
+| IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection entries, mask/unmask, ISA IRQ0 delivery test. |
+| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M14; deferred to M18. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |
 
 ## Related documentation

@@ -3,9 +3,9 @@
 **Purpose:** describe what zig-kernel is, the constraints it is built under,
 which milestones are implemented, and how the source tree is organized.
 
-**Implementation status:** M0-M13 are implemented and validated through the
-QEMU test flow. M14 is planned. See the per-subsystem documents for the exact
-status of individual features.
+**Implementation status:** M0-M14 are implemented and validated through the
+QEMU test flow. M15-M20 are planned. See the per-subsystem documents for the
+exact status of individual features.
 
 ## Project facts
 
@@ -16,7 +16,7 @@ status of individual features.
 | Boot path | Limine 12.9.4, UEFI, Limine boot protocol base revision 3 | [`src/limine.zig`](../../src/limine.zig) |
 | Kernel base | `0xffffffff80000000` (higher half) | [`linker.ld`](../../linker.ld) |
 | Default build | `ReleaseSafe` with LLVM (`exe.use_llvm = true`) | [`build.zig`](../../build.zig) |
-| Current version string | `0.16.0-m13` | [`src/main.zig`](../../src/main.zig) |
+| Current version string | `0.17.0-m14` | [`src/main.zig`](../../src/main.zig) |
 | Primary test platform | QEMU with KVM when available, TCG as fallback | [`tools/run.sh`](../../tools/run.sh) |
 
 ## Design constraints
@@ -35,7 +35,8 @@ status of individual features.
 - Default builds keep safety checks enabled (`ReleaseSafe`).
 - The scheduler is per-CPU: every online CPU has its own current task, idle
   task, run state, and tick counter. Tasks are pinned to the CPU chosen at
-  creation. CPU 0 uses the PIT on IRQ0; each AP uses a periodic LAPIC timer.
+  creation. CPU 0 and every AP use a periodic LAPIC timer; the legacy PIT IRQ0
+  path remains a fallback when ACPI or LAPIC calibration is unavailable.
 
 ## Milestone status
 
@@ -57,7 +58,13 @@ status of individual features.
 | M11 | Per-CPU scheduling, LAPIC/x2APIC IPIs, SMP-aware wait queues/mutex/condition, TLB shootdown, AP exception/FPU state | **IMPLEMENTED** |
 | M12 | IRQ-safe heap locking, concurrent allocator stress, lock-free TLB-shootdown mailboxes, IRQ-off and concurrent shootdown tests | **IMPLEMENTED** |
 | M13 | Per-CPU tick counters, AP LAPIC timers calibrated against the PIT, local deadline wakeups, timer-driven AP preemption | **IMPLEMENTED** |
-| M14 | Next milestone; not yet scoped or started | **PLANNED** |
+| M14 | ACPI/MADT discovery, ISO-resolved ISA IRQs, IOAPIC driver, CPU 0 LAPIC timer, PIC/PIT fallback, IOAPIC delivery and fallback boot tests | **IMPLEMENTED** |
+| M15 | Invariant TSC, cross-CPU clock sync, monotonic time, fallback clocksource, deadline queue, join/priorities | **PLANNED** |
+| M16 | Ring 3, per-task address spaces, syscalls, user-memory validation, minimal test-only ELF loader | **PLANNED** |
+| M17 | General ELF64 loading, W^X/NX, argv, spawn/wait/reap, process lifecycle | **PLANNED** |
+| M18 | PCI, virtio-blk polling, optional MSI-X, block layer, VFS/FAT/initramfs | **PLANNED** |
+| M19 | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP, loopback | **PLANNED** |
+| M20 | Shell, panic unwinding, cross-CPU NMI watchdog, migration, failure injection, stress | **PLANNED** |
 
 Detailed milestone behavior is documented in the subsystem pages:
 [memory](memory.md), [CPU and interrupts](cpu-interrupts.md),
@@ -75,18 +82,20 @@ _start -> kernel stack -> kmain
     +-- SSE enable, serial, GDT/TSS, IDT, PIC remap, per-CPU block
     +-- PMM -> VMM -> heap
     +-- framebuffer console + boot report
+    +-- ACPI RSDP/XSDT/RSDT -> MADT, IOAPIC discovery and masking
     +-- SMP init (Limine MP request)
     +-- LAPIC/x2APIC init, scheduler init, timer calibration, TLB-shootdown hook
     +-- normal boot: start APs -> per-CPU scheduler idle
-    +-- selftest / fault-test variant
+    +-- selftest / fault-test / fallback-boot variant
     |
     v
-normal boot: PIT 100 Hz -> IRQ0 on BSP; AP LAPIC timers -> per-CPU ticks
+normal boot: CPU 0 and AP LAPIC timers at 100 Hz -> per-CPU ticks
+             (PIT IRQ0 remains the fallback timer path)
 ```
 
-Every CPU runs its own scheduler state and tick counter. IRQ0 drives preemption
-on the BSP; APs enter their idle tasks and are preempted by their LAPIC timers,
-which also wake local timed sleepers. APs additionally receive reschedule (240)
+Every CPU runs its own scheduler state and tick counter. CPU 0 and every AP use
+their LAPIC timer; ISA IRQ0 can be routed through the MADT ISO to an IOAPIC pin
+and acknowledged with a Local APIC EOI. APs additionally receive reschedule (240)
 and TLB-shootdown (241) IPIs. Blocking primitives wake tasks across CPUs. Heap,
 PMM, VMM, console, and serial state use IRQ-safe locks; `unmapPage` issues a
 lock-free shootdown after releasing the page-table lock.
@@ -97,8 +106,9 @@ lock-free shootdown after releasing the page-table lock.
 | --- | --- |
 | [`boot/limine.conf`](../../boot/limine.conf) | Limine menu and kernel path. |
 | [`linker.ld`](../../linker.ld) | Higher-half layout and page-aligned `PT_LOAD` segments. |
-| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M13 self-tests. |
-| [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests. |
+| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M14 self-tests. |
+| [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests, including the RSDP request. |
+| [`src/acpi.zig`](../../src/acpi.zig) | RSDP/XSDT/RSDT/MADT parsing, table validation, and ISA IRQ-to-GSI resolution. |
 | [`src/console.zig`](../../src/console.zig) | Framebuffer text console with serial mirroring. |
 | [`src/font.zig`](../../src/font.zig) | 8x16 bitmap font. |
 | [`src/sched.zig`](../../src/sched.zig) | Per-CPU scheduler, wait queues, mutex/condition, FPU state, idle tasks, IPIs, TLB shootdown. |
@@ -109,12 +119,13 @@ lock-free shootdown after releasing the page-table lock.
 | [`src/memory/heap.zig`](../../src/memory/heap.zig) | IRQ-safe, lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
 | [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement and GS-based per-CPU state. |
 | [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, IPIs, and the periodic LAPIC timer. |
+| [`src/arch/x86_64/ioapic.zig`](../../src/arch/x86_64/ioapic.zig) | IOAPIC MMIO mapping, redirection entries, mask/unmask, and ISO-based ISA IRQ routing. |
 | [`src/arch/x86_64/gdt.zig`](../../src/arch/x86_64/gdt.zig) | GDT, per-CPU TSS, #DF IST stacks. |
 | [`src/arch/x86_64/idt.zig`](../../src/arch/x86_64/idt.zig) | IDT, exception dispatch, IRQ dispatch. |
 | [`src/arch/x86_64/interrupts.S`](../../src/arch/x86_64/interrupts.S) | Exception/IRQ/scheduler stubs and FPU save/restore. |
 | [`src/arch/x86_64/smp_entry.S`](../../src/arch/x86_64/smp_entry.S) | AP entry: private stack, kernel CR3, `ap_main`. |
 | [`src/arch/x86_64/pic.zig`](../../src/arch/x86_64/pic.zig) | 8259 PIC remap, mask, EOI. |
-| [`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig) | 8253/8254 PIT channel 0. |
+| [`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig) | 8253/8254 PIT channel 0 and the channel-2 calibration reference. |
 | [`src/arch/x86_64/port.zig`](../../src/arch/x86_64/port.zig) | Port I/O helpers. |
 | [`src/arch/x86_64/serial.zig`](../../src/arch/x86_64/serial.zig) | COM1 serial driver. |
 | [`src/arch/x86_64/qemu.zig`](../../src/arch/x86_64/qemu.zig) | `isa-debug-exit` helper. |

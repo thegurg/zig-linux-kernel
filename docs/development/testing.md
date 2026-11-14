@@ -1,7 +1,7 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-harness assertions, and the validation recorded for M13.
+fallback boot test, the harness assertions, and the validation recorded for M14.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -12,11 +12,13 @@ verification path for each milestone. Coverage gaps are documented below and in
 | Layer | Command | What it proves |
 | --- | --- | --- |
 | Host unit tests | part of `zig build test` | The host harness and the pure Limine binding test run. |
-| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, per-CPU timers, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
+| QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, per-CPU timers, ACPI/IOAPIC delivery, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
+| QEMU fallback boot | `tools/run.sh <fallback> --test-boot` | A `force_pit` image reaches the legacy PIT timer path and the idle transition. |
 
-`zig build test` runs all three. It builds the selftest and fault-test images
-with the same optimization mode as the normal build (default `ReleaseSafe`).
+`zig build test` runs all four. It builds the selftest, fault-test, and fallback
+images with the same optimization mode as the normal build (default
+`ReleaseSafe`).
 
 ## Host unit tests
 
@@ -72,8 +74,14 @@ initialization, `kmain` runs the checks in this order.
 | M13 AP sleep | `timer: per-cpu ticks=<n>, sleepers=<aps>, ...` | One sleeper per AP records its CPU's tick counter, sleeps for 3 ticks, and records the delta; the selftest requires the summed deltas to reach 3 ticks per AP, proving the AP LAPIC timer fires and wakes local deadlines. |
 | M13 AP preemption | `preempted=1` | Two CPU-bound tasks pinned to CPU 1 each observe the other's counter while both are still running, which requires timer-driven preemption. |
 | M13 result | `timer: per-cpu ticks=..., sleepers=..., preempted=1`, `M13 checks passed` | The per-CPU timer group completed with the expected sleeper count and preemption. |
-| `int3` | `returned from int3`, `M13 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
-| Success | `M13 checks passed` | Exits QEMU successfully. |
+| M14 ACPI/MADT | `acpi: madt revision=...`, `acpi: madt cpus matched limine=...` | ACPI is ready, the MADT CPU count matches Limine, and the BSP LAPIC ID is present. |
+| M14 ISO route | `m14: irq0 gsi=..., polarity=..., trigger=..., overridden=...` | IRQ0 is resolved through the MADT ISO rather than a hardcoded GSI. |
+| M14 IOAPIC readback | `ioapic: id=... version=... entries=... gsi_base=...`, `m14: ioapic entry low=... high=...` | The IOAPIC is mapped and the redirection entry has vector 242, the BSP destination, the ISO polarity/trigger, and no mask bit. |
+| M14 IOAPIC delivery | `m14: ioapic ticks=5` | PIT IRQ0 routed through the IOAPIC reaches vector 242 and is acknowledged with a LAPIC EOI; the pin is then masked and checked. |
+| M14 CPU 0 timer | `timer: source=lapic`, `m14: cpu0 sleep ticks=5`, `m14: cpu0 preempted=1` | CPU 0's LAPIC timer wakes a local sleeper and preempts two CPU-bound tasks. |
+| M14 result | `M14 checks passed` | The ACPI/IOAPIC/CPU 0 timer group completed. |
+| `int3` | `returned from int3`, `M14 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
+| Success | `M14 checks passed` | Exits QEMU successfully. |
 
 The selftest logs diagnostic lines such as:
 
@@ -96,11 +104,21 @@ heap: concurrent allocs=4000, errors=0
 tlb: irq-off=1, concurrent shootdowns=150, errors=0
 timer: LAPIC 625396 counts per tick
 timer: per-cpu ticks=9, sleepers=3, preempted=1
+acpi: madt revision=3 cpus=4/4 ioapics=1 isos=5 lapic=0xfee00000
+ioapic: id=0 version=17 entries=24 gsi_base=0 address=0xfec00000
+acpi: madt cpus matched limine=4, bsp_lapic_id=0
+m14: irq0 gsi=2, polarity=active_high, trigger=edge, overridden=1
+m14: ioapic entry low=0xf2 high=0x0
+m14: ioapic ticks=5
+timer: source=lapic
+m14: cpu0 sleep ticks=5
+m14: cpu0 preempted=1 a=2339567 b=1 ticks=3
 ```
 
-The `preempt_a`/`preempt_b`/`preempt_ticks` fields are diagnostics only and are
-not asserted. Timing values vary by host and acceleration mode; the assertions check
-conditions rather than exact tick counts except where a minimum is required.
+The `preempt_a`/`preempt_b`/`preempt_ticks` and `m14` counter fields are
+diagnostics only and are not asserted. Timing values vary by host and
+acceleration mode; the assertions check conditions rather than exact tick counts
+except where a minimum is required.
 
 ## QEMU fault test
 
@@ -136,9 +154,18 @@ example below shows the default:
 
 ```text
 returned from int3
+M14 checks passed
 M13 checks passed
 M12 checks passed
 M11 checks passed
+acpi: madt revision=.* cpus=.* ioapics=.* isos=
+ioapic: id=.* version=.* entries=.* gsi_base=
+acpi: madt cpus matched limine=
+m14: irq0 gsi=.* polarity=.* trigger=.* overridden=
+m14: ioapic ticks=
+m14: cpu0 sleep ticks=
+m14: cpu0 preempted=1
+timer: source=lapic
 timer: per-cpu ticks=.*sleepers=.*preempted=1
 heap: concurrent allocs=.*errors=0
 tlb: irq-off=1
@@ -180,20 +207,34 @@ If QEMU exits 33 but a marker is missing, the harness exits 1 with
 The harness requires QEMU status 35 and the `#PF`/`CR2` markers described above.
 A status of 124 is reported as a timeout; any other status is unexpected.
 
+### Fallback-boot mode
+
+The fallback image is built with `force_pit = true`. The normal kernel idles
+after boot, so the harness runs QEMU with a 20-second timeout and then accepts
+the run only if the serial log contains both:
+
+```text
+timer: source=pit
+scheduler: boot task exiting to idle
+```
+
+A missing marker, or any other failure before the timeout, exits 1.
+
 ### Exit-status handling
 
-| Status | Selftest | Fault test |
-| --- | --- | --- |
-| 33 | Accepted only with all log markers. | Unexpected. |
-| 35 | Reported as a kernel panic. | Accepted only with the #PF markers. |
-| 124 | Reported as a timeout. | Reported as a timeout. |
-| Other | Unexpected status. | Unexpected status. |
+| Status | Selftest | Fault test | Fallback boot |
+| --- | --- | --- | --- |
+| 33 | Accepted only with all log markers. | Unexpected. | Unexpected. |
+| 35 | Reported as a kernel panic. | Accepted only with the #PF markers. | Reported as a kernel panic. |
+| 124 | Reported as a timeout. | Reported as a timeout. | Expected; accepted only with the fallback markers. |
+| Other | Unexpected status. | Unexpected status. | Unexpected status. |
 
-The test modes time out after 90 seconds.
+The selftest and fault-test modes time out after 90 seconds. The fallback-boot
+mode times out after 20 seconds because the guest is expected to stay idle.
 
 ## Recorded validation
 
-M13 validation ran the full matrix:
+M14 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -212,21 +253,29 @@ selftest: M11 checks passed
 heap: concurrent allocs=4000, errors=0
 tlb: irq-off=1, concurrent shootdowns=150, errors=0
 selftest: M12 checks passed
-timer: LAPIC 625396 counts per tick
-timer: per-cpu ticks=9, sleepers=3, preempted=1
+timer: per-cpu ticks=9, sleepers=3, preempted=1 (a=1, b=2082676, ticks=1)
 selftest: M13 checks passed
+acpi: madt revision=3 cpus=4/4 ioapics=1 isos=5 lapic=0xfee00000
+ioapic: id=0 version=17 entries=24 gsi_base=0 address=0xfec00000
+acpi: madt cpus matched limine=4, bsp_lapic_id=0
+m14: irq0 gsi=2, polarity=active_high, trigger=edge, overridden=1
+m14: ioapic entry low=0xf2 high=0x0
+m14: ioapic ticks=5
+timer: source=lapic
+m14: cpu0 sleep ticks=5
+m14: cpu0 preempted=1 a=2339567 b=1 ticks=3
+selftest: M14 checks passed
 selftest: exiting QEMU
 ```
 
-With `ZIG_KERNEL_SMP=2`, one AP sleeper reported three ticks and the preemption
-test passed. With `ZIG_KERNEL_SMP=1`, the AP-only timer part was skipped and the
-result reported zero sleepers and `preempted=1` without running the two
-preemption workers, because the test requires an AP. TCG
-(`timer: per-cpu ticks=9, sleepers=3, preempted=1`) and repeated KVM runs also
-passed.
+The `force_pit` image booted through `timer: source=pit, 100 Hz, IRQ0 unmasked`
+and `scheduler: boot task exiting to idle`; the `--test-boot` harness accepted
+the 20-second idle timeout. With `ZIG_KERNEL_SMP=2`, one AP sleeper reported
+ticks and the preemption test passed. With `ZIG_KERNEL_SMP=1`, the AP-only timer
+part was skipped, while the M14 CPU 0 sleeper and preemption tests still ran.
 
-`zig fmt --check build.zig src` and `git diff --check` were run before the M13
-commit. Earlier M10, pre-M11, M11, and M12 validation remains in
+`zig fmt --check build.zig src` and `git diff --check` were run before the M14
+commit. Earlier M10-M13 validation remains in
 [SMP](../architecture/smp.md#recorded-validation) and the roadmap.
 
 ## Coverage gaps
@@ -234,9 +283,11 @@ commit. Earlier M10, pre-M11, M11, and M12 validation remains in
 - There is no AP NMI test. AP `int3` and FPU-state preservation are covered.
 - The M12 tests cover a target with interrupts disabled and several concurrent
   shootdowns, but not a CPU that never re-enables interrupts.
-- `selftestSmp` masks the BSP PIT before running the M11/M12/M13 tests, so CPU 0
-  tick behaviour during those tests is not exercised; AP LAPIC timers remain
-  active. There is no test for a CPU 0 LAPIC timer or IOAPIC routing.
+- M14 exercises ISA IRQ0 only. Other ISAs, level-triggered ISOs, multiple
+  IOAPICs, and general PCI interrupt routing are not tested.
+- There is no test that ACPI tables are rejected when a checksum or length is
+  deliberately corrupted; validation paths are exercised only by the real
+  firmware tables.
 - There is no cross-CPU mutex/condition stress test; the cross-CPU wake test
   covers the wait-queue/IPI path.
 - The concurrent heap test does not force PMM exhaustion or page-table
@@ -249,9 +300,10 @@ commit. Earlier M10, pre-M11, M11, and M12 validation remains in
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M13 behavior, AP scheduling, IPIs, per-CPU timers, concurrent allocation, TLB hardening, and `int3`. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M14 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11/M12/M13 test results. |
+| QEMU fallback boot test | **IMPLEMENTED** | `force_pit` image reaches the PIT timer path and idle transition. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M14 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
 | TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |
@@ -260,8 +312,9 @@ commit. Earlier M10, pre-M11, M11, and M12 validation remains in
 | Concurrent heap test | **IMPLEMENTED** | All CPUs allocate/write/verify/free concurrently. |
 | AP timer / sleep test | **IMPLEMENTED** | One LAPIC-timer sleeper per AP; local deadline wakeup. |
 | AP timer preemption test | **IMPLEMENTED** | Two CPU-bound CPU 1 tasks must observe each other. |
+| ACPI/MADT/IOAPIC test | **IMPLEMENTED** | ISO-resolved IRQ0, redirection readback, end-to-end delivery, mask check. |
+| CPU 0 LAPIC timer test | **IMPLEMENTED** | Local sleeper and two preempted CPU-bound tasks. |
 | AP NMI test | **PLANNED** | NMI is not tested. |
-| CPU 0 LAPIC timer / IOAPIC test | **PLANNED** | CPU 0 still uses PIT IRQ0. |
 | Allocator failure-path test | **PLANNED** | No PMM-exhaustion or mapping-failure test. |
 
 ## Related documentation

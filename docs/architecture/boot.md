@@ -35,6 +35,7 @@ kernel requests:
 | Memory map | Supplies the physical ranges used to initialize the PMM. |
 | Executable address | Supplies the kernel's physical and virtual base addresses. |
 | Paging mode | Forces 4-level paging; the VMM also rejects a set `CR4.LA57`. |
+| RSDP | Supplies the ACPI root pointer (physical under base revision 3) used to locate the MADT. |
 | MP | Asks Limine to bootstrap and park secondary CPUs until the kernel publishes `goto_address`. |
 
 The request structures are placed in `.limine_requests` by the linker script.
@@ -95,37 +96,46 @@ initialization print an error and exit QEMU with the failure code.
     mark the framebuffer uncached, enable `CR0.WP`, and switch `CR3`.
 11. `heap.init()`: reset the heap free list and break to the reserved base.
 12. `console.init()`, `banner()`, and `reportBootInfo()`.
-13. `smp.init()`: record Limine's MP response and per-AP contexts. An
+13. `acpi.init()`: validate `RSDP -> XSDT/RSDT -> MADT`, then log the MADT
+    revision, CPU/IOAPIC/ISO counts, and LAPIC address. A failure is logged and
+    leaves the PIC/PIT fallback available.
+14. `ioapic.init()`: map each MADT-described IOAPIC window uncached and mask
+    every redirection entry. A failure is logged and is not fatal.
+15. `smp.init()`: record Limine's MP response and per-AP contexts. An
     initialization failure is logged but does not abort boot.
-14. `lapic.init()`, read the BSP LAPIC ID, reinstall the per-CPU block with that
+16. `lapic.init()`, read the BSP LAPIC ID, reinstall the per-CPU block with that
     ID, call `sched.init()`, and register `vmm.setTlbShootdownHandler`.
-15. If an MP response exists, print CPU statistics (`cpus`, `aps`,
+17. `lapic.calibrateTimer(100)` on the BSP, before AP release, using PIT channel
+    2 as a blocking reference. The reload value is reused by every AP.
+18. If an MP response exists, print CPU statistics (`cpus`, `aps`,
     `bsp_lapic_id`, `x2apic`). On a normal boot with APs, release them with
     `smp.start()` and wait with `waitOnline()`. Each AP installs its per-CPU
-    state and enters its scheduler idle loop.
-16. Branch into the test variant or normal operation. The normal path prints
-    the version summary immediately before initializing the PIT and entering
-    the scheduler; no milestone-specific line is printed unconditionally.
+    state, starts its LAPIC timer, and enters its scheduler idle loop.
+19. Branch into the test variant or normal operation. The normal path prints the
+    version summary, starts CPU 0's periodic LAPIC timer (or the PIT fallback),
+    and exits the boot task into the BSP idle task.
 
 ## Boot variants
 
-The build creates three images from the same source using `build_options` in
+The build creates four images from the same source using `build_options` in
 [`build.zig`](../../build.zig).
 
 | Variant | Options | Behavior |
 | --- | --- | --- |
-| Normal kernel | `exit_after_boot = false`, `test_page_fault = false` | Reports boot information, starts the APs into their scheduler idle loops, initializes the PIT, unmasks IRQ0, and exits the boot task into the BSP idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false` | Skips the early AP release, runs the M1c-M13 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, and M13 per-CPU timer checks, triggers `int3`, and exits QEMU with success. |
-| Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
+| Normal kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = false` | Reports boot information, starts the APs into their scheduler idle loops, starts CPU 0's LAPIC timer (PIT fallback if calibration failed), and exits the boot task into the BSP idle task. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M14 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, and M14 ACPI/IOAPIC/CPU 0 timer checks, triggers `int3`, and exits QEMU with success. |
+| Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true`, `force_pit = false` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
+| Fallback kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = true` | Boots normally but forces the PIT IRQ0 timer path so `--test-boot` can assert the fallback. |
 
 Normal operation after the report is:
 
 ```text
-console.print("\nboot: " ++ version ++ " initialized (memory, scheduler, SMP)\n")
-sched.init()
-pit.init(100)
-pic.unmask(0)
-console.print("timer: PIT 100 Hz, IRQ0 unmasked\n")
+console.print("\nboot: " ++ version ++ " initialized (memory, per-CPU scheduler, SMP)\n")
+if (!force_pit and lapic_timer_ready and lapic.startPeriodicTimer(sched.timer_vector))
+    console.write("timer: source=lapic\n")
+else
+    pit.init(100); pic.unmask(0)
+    console.print("timer: source=pit, 100 Hz, IRQ0 unmasked\n")
 console.write("scheduler: boot task exiting to idle (interrupts enabled there)\n")
 sched.exit()
 ```
@@ -134,9 +144,11 @@ Unmasking IRQ0 does not enable interrupts by itself. The boot task exits into
 the BSP idle task, whose `idleEntry` executes `sti; hlt`; the log wording
 reflects that exact transition.
 
-In the selftest variant, the normal scheduler/PIT setup is skipped. The tests
-call `sched.init()`, program the PIT, and manage `sti`/`cli` themselves. The
-fault-test variant starts APs through the normal path and then faults.
+In the selftest variant, the normal timer setup is skipped. The tests call
+`sched.init()`, program the PIT, and manage `sti`/`cli` themselves; M14 later
+stops the CPU 0 timer, exercises IOAPIC delivery, and restarts the LAPIC timer.
+The fault-test variant starts APs through the normal path and then faults. The
+fallback variant uses the normal path with `force_pit` set.
 
 ## Console
 
@@ -160,7 +172,7 @@ time out after roughly one million polls instead of hanging on a dead UART.
 | Own kernel stack | **IMPLEMENTED** | 64 KiB `kernel_stack`; 8 KiB per-CPU #DF IST. |
 | Limine base-revision check | **IMPLEMENTED** | Rejects unsupported revisions. |
 | Framebuffer + serial console | **IMPLEMENTED** | Requires 32-bpp framebuffer; serial always available. |
-| Normal/selftest/fault variants | **IMPLEMENTED** | Selected at build time. |
+| Normal/selftest/fault/fallback variants | **IMPLEMENTED** | Selected at build time. |
 | BIOS boot path | **PLANNED** | Not present in the current build. |
 
 ## Related documentation

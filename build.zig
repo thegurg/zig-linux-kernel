@@ -15,16 +15,17 @@ pub fn build(b: *std.Build) void {
     });
 
     // Normal kernel image: stays alive after boot so it can be explored in QEMU.
-    const kernel = makeKernel(b, target, optimize, "zig-kernel", false, false);
+    const kernel = makeKernel(b, target, optimize, "zig-kernel", false, false, false);
     b.installArtifact(kernel);
 
     // Smoke-test image: exercises the PMM, page tables, heap, PIT/IRQ0,
     // preemptive/cooperative scheduler, task lifecycle, blocking sleep,
     // explicit block/wake, wait queues, timed waits, mutexes, condition
     // variables, FPU/SIMD context switching, SMP bring-up/spinlocks and
-    // exception path, then reports success to QEMU's
-    // isa-debug-exit so CI (and `zig build test`) can assert the exit code.
-    const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false);
+    // exception path, ACPI/IOAPIC discovery and the CPU 0 LAPIC timer, then
+    // reports success to QEMU's isa-debug-exit so CI (and `zig build test`) can
+    // assert the exit code.
+    const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false, false);
     const smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     smoke.addArtifactArg(selftest_kernel);
     smoke.addArg("--test");
@@ -32,11 +33,19 @@ pub fn build(b: *std.Build) void {
 
     // Fault-test image: deliberately dereferences a null pointer to verify the
     // #PF gate, the CR2 report and the fatal-exception exit path.
-    const fault_kernel = makeKernel(b, target, optimize, "zig-kernel-fault-test", false, true);
+    const fault_kernel = makeKernel(b, target, optimize, "zig-kernel-fault-test", false, true, false);
     const fault_smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     fault_smoke.addArtifactArg(fault_kernel);
     fault_smoke.addArg("--test-fault");
     fault_smoke.has_side_effects = true;
+
+    // Fallback image: force the legacy PIT IRQ0 path so the boot fallback is
+    // exercised by the test suite rather than only by code inspection.
+    const fallback_kernel = makeKernel(b, target, optimize, "zig-kernel-fallback", false, false, true);
+    const fallback_test = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
+    fallback_test.addArtifactArg(fallback_kernel);
+    fallback_test.addArg("--test-boot");
+    fallback_test.has_side_effects = true;
 
     // Host-side unit tests for pure logic (no arch/IO dependencies).
     const test_mod = b.createModule(.{
@@ -50,6 +59,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&smoke.step);
     test_step.dependOn(&fault_smoke.step);
+    test_step.dependOn(&fallback_test.step);
 
     const run_cmd = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     run_cmd.addArtifactArg(kernel);
@@ -65,10 +75,12 @@ fn makeKernel(
     name: []const u8,
     exit_after_boot: bool,
     test_page_fault: bool,
+    force_pit: bool,
 ) *std.Build.Step.Compile {
     const opts = b.addOptions();
     opts.addOption(bool, "exit_after_boot", exit_after_boot);
     opts.addOption(bool, "test_page_fault", test_page_fault);
+    opts.addOption(bool, "force_pit", force_pit);
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

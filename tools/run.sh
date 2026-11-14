@@ -5,17 +5,19 @@
 #   tools/run.sh <kernel.elf>                interactive, serial on stdio
 #   tools/run.sh <kernel.elf> --test         headless smoke test, exit code = verdict
 #   tools/run.sh <kernel.elf> --test-fault   headless fault test, expects a handled #PF
+#   tools/run.sh <kernel.elf> --test-boot    headless boot test, checks the fallback timer
 #
 # The ESP is exposed to QEMU as a synthesized FAT (vvfat) drive backed by a
 # directory, so no root, loop devices, mtools or ISO tooling are required.
 
 set -euo pipefail
 
-KERNEL="${1:?usage: run.sh <kernel.elf> [--test|--test-fault]}"
+KERNEL="${1:?usage: run.sh <kernel.elf> [--test|--test-fault|--test-boot]}"
 MODE=run
 case "${2:-}" in
   --test) MODE=smoke ;;
   --test-fault) MODE=fault ;;
+  --test-boot) MODE=boot ;;
   "") ;;
   *) echo "run.sh: unknown mode: ${2:-}" >&2; exit 2 ;;
 esac
@@ -68,8 +70,10 @@ QEMU=(
 )
 
 if [ "$MODE" != "run" ]; then
+  TIMEOUT=90
+  if [ "$MODE" = "boot" ]; then TIMEOUT=20; fi
   set +e
-  timeout 90 "${QEMU[@]}" -serial "file:$WORK/serial.log"
+  timeout "$TIMEOUT" "${QEMU[@]}" -serial "file:$WORK/serial.log"
   status=$?
   set -e
   if [ -f "$WORK/serial.log" ]; then
@@ -81,9 +85,18 @@ if [ "$MODE" != "run" ]; then
     case $status in
       33)
         if grep -q "returned from int3" "$WORK/serial.log" &&
+           grep -q "M14 checks passed" "$WORK/serial.log" &&
            grep -q "M13 checks passed" "$WORK/serial.log" &&
            grep -q "M12 checks passed" "$WORK/serial.log" &&
            grep -q "M11 checks passed" "$WORK/serial.log" &&
+           grep -q "acpi: madt revision=.* cpus=.* ioapics=.* isos=" "$WORK/serial.log" &&
+           grep -q "ioapic: id=.* version=.* entries=.* gsi_base=" "$WORK/serial.log" &&
+           grep -q "acpi: madt cpus matched limine=" "$WORK/serial.log" &&
+           grep -q "m14: irq0 gsi=.* polarity=.* trigger=.* overridden=" "$WORK/serial.log" &&
+           grep -q "m14: ioapic ticks=" "$WORK/serial.log" &&
+           grep -q "m14: cpu0 sleep ticks=" "$WORK/serial.log" &&
+           grep -q "m14: cpu0 preempted=1" "$WORK/serial.log" &&
+           grep -q "timer: source=lapic" "$WORK/serial.log" &&
            grep -q "timer: per-cpu ticks=.*sleepers=.*preempted=1" "$WORK/serial.log" &&
            grep -q "heap: concurrent allocs=.*errors=0" "$WORK/serial.log" &&
            grep -q "tlb: irq-off=1" "$WORK/serial.log" &&
@@ -124,6 +137,17 @@ if [ "$MODE" != "run" ]; then
       124) echo "run.sh: timed out waiting for kernel" >&2; exit 1 ;;
       *) echo "run.sh: unexpected QEMU exit status $status" >&2; exit 1 ;;
     esac
+  fi
+
+  if [ "$MODE" = "boot" ]; then
+    # The normal kernel idles after boot, so the timeout is expected. Assert
+    # that boot reached the forced PIT fallback and handed control to idle.
+    if grep -q "timer: source=pit" "$WORK/serial.log" &&
+       grep -q "scheduler: boot task exiting to idle" "$WORK/serial.log"; then
+      exit 0
+    fi
+    echo "run.sh: fallback boot did not reach the PIT timer path" >&2
+    exit 1
   fi
 
   # Fault test: the kernel must catch #PF, report CR2 and exit through

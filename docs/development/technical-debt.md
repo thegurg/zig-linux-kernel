@@ -2,14 +2,14 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M13; **RESOLVED** entries are kept so the audit trail and the remaining
+after M14; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
-> issue was fixed in the pre-M11 bugfix pass, M11, M12, or M13.
+> issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, or M14.
 
 ## Critical
 
@@ -57,7 +57,7 @@ allocate/write/verify/free loops on every CPU and reports zero errors.
 The grow path deliberately does not unmap pages on failure: it returns the
 mapped prefix to the free list and leaves the rest of that reserved range unused.
 This avoids holding `heap_lock` across a TLB shootdown. The lost address space
-is recorded as issue 15.
+is recorded as issue 16.
 
 ### 4. TLB shootdown had a bounded, best-effort wait
 
@@ -84,24 +84,25 @@ a target with interrupts disabled and several CPUs shooting down concurrently.
 
 ### 5. The timer was BSP-only and APs were not preempted by a timer
 
-**Status: RESOLVED (M13).** **Sources:**
+**Status: RESOLVED (M14).** **Sources:**
 [`src/sched.zig`](../../src/sched.zig),
 [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig),
-[`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig).
+[`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig),
+[`src/acpi.zig`](../../src/acpi.zig),
+[`src/arch/x86_64/ioapic.zig`](../../src/arch/x86_64/ioapic.zig).
 
-Each CPU now owns a `cpu_ticks` entry. CPU 0 keeps the 100 Hz PIT on IRQ0; every
-AP starts a periodic LAPIC timer on vector 242 after bring-up. The shared
-`timerInterrupt` path advances only the local counter, wakes only blocked tasks
-pinned to that CPU, and can preempt the local task. The reload value is calibrated
-once on the BSP against a 50 ms PIT channel-2 reference, so no IOAPIC or ACPI
-support is required.
+Each CPU owns a `cpu_ticks` entry. M13 gave every AP a periodic LAPIC timer on
+vector 242; M14 moved CPU 0 onto the same vector after calibrating the timer on
+the BSP against a 50 ms PIT channel-2 reference. The shared `timerInterrupt` path
+advances only the local counter, wakes only blocked tasks pinned to that CPU, and
+can preempt the local task.
 
-The M13 test creates a timed sleeper on every AP and runs two CPU-bound tasks on
-CPU 1 that must observe each other while both are running. `selftestSmp` still
-masks the BSP PIT during the SMP tests, but AP timers remain active.
-
-CPU 0 still uses the PIT rather than its LAPIC timer, and there is no IOAPIC
-routing; that remaining work is tracked in the roadmap.
+M14 also parses the ACPI MADT, resolves ISA IRQ0 through its Interrupt Source
+Override, and drives an IOAPIC redirection entry. The PIT IRQ0/PIC path remains
+the documented fallback and is exercised by the `force_pit` boot image. PIT
+channel 2 remains a calibration-only reference and is never an interrupt source.
+An IOAPIC-delivered fixed interrupt is acknowledged with a LAPIC EOI; the legacy
+PIC path keeps its separate PIC EOI.
 
 ### 6. AP NMI handling is not tested
 
@@ -153,7 +154,7 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11, M12, and M13:
+Covered in M11, M12, M13, and M14:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
@@ -161,38 +162,64 @@ Covered in M11, M12, and M13:
 - TLB shootdown to a CPU with interrupts disabled;
 - several CPUs issuing TLB shootdowns concurrently;
 - per-AP tick counters, local AP sleep wakeup, and timer-driven AP preemption;
+- ACPI/MADT discovery, ISO-resolved IRQ0, IOAPIC redirection readback, end-to-end
+  IOAPIC delivery with a LAPIC EOI, pin masking, and the CPU 0 LAPIC timer;
+- the `force_pit` fallback boot path;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11, M12, and M13 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11-M14 result markers.
 
 Still open:
 
 - no AP NMI test;
-- no IOAPIC routing or CPU 0 LAPIC timer test;
+- no test for ISA IRQs other than IRQ0, level-triggered ISOs, multiple IOAPICs,
+  or MSI/MSI-X;
+- no corrupted-ACPI-table injection test;
 - no cross-CPU mutex/condition stress test;
 - no allocator test under PMM exhaustion or mapping failure.
 
+### 12. ACPI/IOAPIC platform assumptions are narrow
+
+**Status: PARTIAL.** **Sources:**
+[`src/acpi.zig`](../../src/acpi.zig),
+[`src/arch/x86_64/ioapic.zig`](../../src/arch/x86_64/ioapic.zig).
+
+- ACPI discovery runs only on the BSP and assumes the tables remain valid in
+  memory for the kernel lifetime.
+- The MADT Local APIC Address Override is parsed and logged, but the LAPIC driver
+  continues to derive its base from `IA32_APIC_BASE`. The MSR value is
+  authoritative.
+- `ioapic.init()` marks the 2 MiB HHDM chunk containing each IOAPIC window
+  uncached. This assumes the window lies within a single mapped 2 MiB chunk and
+  that `vmm.markUncached` succeeds; a failure skips that controller.
+- IOAPIC programming is BSP-only at boot and has no lock. It is not yet called
+  concurrently from other CPUs or from a general interrupt-routing API.
+- Only ISA IRQ0 is exercised end-to-end. The resolution helper is generic, but
+  other bus/IRQ combinations and level-triggered semantics are untested.
+- MSI/MSI-X, PCI interrupt routing, and full AML/namespace evaluation are
+  deferred to M18 or later.
+
 ## Low
 
-### 12. Heap lacks `resize`/`remap`
+### 13. Heap lacks `resize`/`remap`
 
 **Status: DEFERRED.** [`src/memory/heap.zig`](../../src/memory/heap.zig) sets
 `std.mem.Allocator.noResize` and `noRemap`, so callers fall back to
 allocate-copy-free. There is no shrinking or in-place growth.
 
-### 13. No NX-bit policy
+### 14. No NX-bit policy
 
 **Status: DEFERRED.** The VMM defines and uses present/writable/user/cache
 bits, but not the NX bit. Kernel mappings are separated into read-only and
 read-write segments, not executable and non-executable ones.
 
-### 14. No user mode or address-space isolation
+### 15. No user mode or address-space isolation
 
 **Status: DEFERRED.** All tasks share the kernel page tables. There are no user
 page tables, privilege transitions, or per-process address spaces. The IDT
 dispatcher has a `from_user` branch for reporting, but user mode is not
 implemented.
 
-### 15. Partial heap growth leaks reserved virtual address space
+### 16. Partial heap growth leaks reserved virtual address space
 
 **Status: PARTIAL.** **Source:**
 [`src/memory/heap.zig`](../../src/memory/heap.zig).
@@ -216,8 +243,11 @@ which the allocator deliberately avoids.
 | TLB shootdown | **IMPLEMENTED** | Lock-free mailboxes; waits for every acknowledgement. |
 | Allocator thread safety | **IMPLEMENTED** | Heap, PMM, VMM, console, and serial use IRQ-safe locks. |
 | AP setup ordering | **RESOLVED** | SSE and `CR0.WP` set in the assembly stub; global TLB flushed after `CR3`. |
-| AP timer / per-CPU ticks | **IMPLEMENTED** | LAPIC timer vector 242; CPU 0 keeps the PIT. |
-| Test coverage | **PARTIAL** | M11/M12/M13 tests added; gaps listed above. |
+| Per-CPU timer / ticks | **IMPLEMENTED** | LAPIC timer vector 242 on CPU 0 and APs; PIT IRQ0 fallback. |
+| ACPI/MADT discovery | **IMPLEMENTED** | Validated RSDP/XSDT/RSDT/MADT; BSP-only; narrow table coverage. |
+| IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection read/write, mask/unmask, IRQ0 delivery test. |
+| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M14. |
+| Test coverage | **PARTIAL** | M11-M14 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 8 CPUs. |
 
 ## Related documentation

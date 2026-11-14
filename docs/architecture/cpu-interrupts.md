@@ -1,14 +1,15 @@
 # CPU and interrupts
 
 **Purpose:** document x86_64 CPU mode setup, per-CPU state, descriptor tables,
-interrupt and exception handling, the legacy PIC/PIT, the local APIC/IPIs, and
-the interrupt-facing FPU state.
+interrupt and exception handling, the legacy PIC/PIT, ACPI/MADT discovery, the
+I/O APIC, the local APIC/IPIs, and the interrupt-facing FPU state.
 
 **Implementation status:** CPU bring-up, GDT/TSS, IDT, exception dispatch,
-PIC/PIT, LAPIC/x2APIC, IPI dispatch, per-CPU LAPIC timer bring-up, and per-CPU
-interrupt-time FPU save/restore are **IMPLEMENTED** on every online CPU. CPU 0
-keeps the PIT; APs use their LAPIC timer and receive reschedule and TLB IPIs.
-See [technical debt](../development/technical-debt.md).
+PIC/PIT, ACPI/MADT parsing, IOAPIC redirection, LAPIC/x2APIC, IPI dispatch,
+per-CPU LAPIC timers, and per-CPU interrupt-time FPU save/restore are
+**IMPLEMENTED**. CPU 0 and every AP use a periodic LAPIC timer on vector 242;
+the PIT IRQ0 path remains the fallback. See
+[technical debt](../development/technical-debt.md).
 
 ## SSE and FPU enablement
 
@@ -102,7 +103,7 @@ of 16-byte gates. `idt.init()` installs:
 | 32-47 | `irq_stub_table` | PIC IRQs; only IRQ0 is unmasked. |
 | 48-53 | `sched_stub_table` | Scheduler software interrupts. |
 | 240, 241 | `ipi_stub_table[0..2]` | Reschedule and TLB-shootdown IPIs. |
-| 242 | `timer_stub_table[0]` | Periodic LAPIC timer on application processors. |
+| 242 | `timer_stub_table[0]` | Periodic LAPIC timer on every CPU, including CPU 0. |
 | 255 | `ipi_stub_table[2]` | LAPIC spurious-interrupt gate. |
 
 Every gate is a present, DPL0, 64-bit interrupt gate (`type_attr = 0x8e`).
@@ -183,12 +184,13 @@ this order:
    `saved_rsp` unchanged. The handler scans the lock-free per-CPU mailboxes and
    takes no kernel locks, so it can run while another CPU is waiting for
    shootdown acknowledgements.
-3. **Timer 242**: send LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
-   This is the AP timer path.
+3. **Timer 242**: send a LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
+   This is the timer path on CPU 0 and every AP. An ISA IRQ routed through the
+   IOAPIC uses this vector too, so it is acknowledged with a LAPIC EOI only.
 4. **Spurious vector 255**: return `saved_rsp` without an EOI.
 5. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
    `sched.timerInterrupt(saved_rsp)`; all other IRQs return `saved_rsp`
-   unchanged.
+   unchanged. This path is used only for legacy PIC-delivered interrupts.
 6. **Scheduler vectors 48-53**: call the matching scheduler entry and return
    the saved-register base it selects.
 7. **Other exceptions**: print vector number and name, error code, RIP, CS,
@@ -220,13 +222,74 @@ before accessing APIC registers.
 - `sendIpi(destination, vector)` sends a fixed-delivery edge IPI.
 - `sendIpiAllButSelf(vector)` uses the all-but-self shorthand.
 - `calibrateTimer(hz)` programs a masked one-shot timer, measures 50 ms against
-  PIT channel 2, and stores the reload count for that tick rate.
+  PIT channel 2, and stores the reload count for that tick rate. It runs on the
+  BSP before the APs are released; every CPU reuses the result.
 - `startPeriodicTimer(vector)` programs a divided-by-16 periodic timer;
-  `stopTimer()` masks it.
+  `stopTimer()` masks it. Normal boot starts it on CPU 0; each AP starts it
+  during bring-up.
 
 The scheduler uses vector 240 for reschedule, 241 for TLB shootdown, and 242 for
-the AP timer. See [SMP](smp.md) and [synchronization](synchronization.md) for the
-protocols.
+the per-CPU timer. The timer gate sends a LAPIC EOI, which is also the correct
+acknowledgement when vector 242 is reached through an IOAPIC redirection entry.
+See [SMP](smp.md) and [synchronization](synchronization.md) for the protocols.
+
+## ACPI and the I/O APIC
+
+### ACPI discovery
+
+[`src/acpi.zig`](../../src/acpi.zig) obtains the RSDP from the Limine request in
+[`src/limine.zig`](../../src/limine.zig). Under base revision 3 the response is a
+physical address, so every table is validated and then read through the HHDM.
+
+`acpi.init()`:
+
+1. checks the `RSD PTR ` signature, the revision, the 20-byte checksum, and, for
+   revision 2 or later, the extended length and full checksum;
+2. follows the XSDT (or the RSDT on older tables) after validating its
+   signature, length, checksum, and physical range;
+3. finds the `APIC` MADT, validates it, and parses its entries.
+
+The parser records:
+
+- Processor Local APIC and Processor Local x2APIC entries, including the
+  enabled flag;
+- I/O APIC entries with their ID, 32-bit MMIO address, and GSI base;
+- the Local APIC Address Override;
+- every Interrupt Source Override (bus, source IRQ, GSI, polarity, trigger).
+
+Unsupported entry types are skipped. A malformed length or a table that exceeds
+the parser's fixed entry limits is rejected rather than read out of bounds. Only
+the MADT is interpreted; AML and the ACPI namespace are not.
+
+`acpi.isaIrqRoute(irq)` resolves a bus-0 ISA IRQ. An ISO is authoritative: for
+IRQ0 on QEMU q35 it reports GSI 2, active-high, edge-triggered. Only when no ISO
+exists does the identity mapping (`GSI == IRQ`) apply, which is GSI 0 for IRQ0.
+
+### IOAPIC driver
+
+[`src/arch/x86_64/ioapic.zig`](../../src/arch/x86_64/ioapic.zig) maps every
+MADT-described IOAPIC through the HHDM and marks the covering 2 MiB chunk
+uncached with `vmm.markUncached` before the first register access.
+
+`ioapic.init()` reads the IOAPIC ID and version register, derives the number of
+redirection entries from the version, and masks every pin. `program()` writes a
+redirection entry with:
+
+- the vector and destination APIC ID;
+- ISO polarity (`active_low` sets bit 13);
+- trigger mode (`level` sets bit 15);
+- the mask bit.
+
+The high word is written while the entry is masked, then the low word is
+published and unmasked, avoiding a transient mixed destination/vector pair.
+`routeIsaIrq()` combines `acpi.isaIrqRoute()` with `program()`, reads the entry
+back, and returns both words so the caller can verify vector, destination,
+polarity, trigger, and mask state. `setMasked()` and `isMasked()` operate on a
+single pin.
+
+An IOAPIC has no EOI register. A fixed interrupt delivered through the IOAPIC is
+acknowledged with a Local APIC EOI by the vector's normal handler; no PIC EOI is
+sent for an IOAPIC-delivered vector.
 
 ## PIC and PIT
 
@@ -239,21 +302,25 @@ the master at `0x20`, the slave at `0x28`, the cascade through master IRQ2, and
 data ports as appropriate. Unmasking an IRQ 8-15 also unmasks the master
 cascade line.
 
-The kernel unmasks only IRQ0 for the PIT. CPU 0 uses the PIT as its timer source;
-application processors use their own LAPIC timers and never take IRQ0. There is
-still no IOAPIC routing.
+The kernel unmasks only IRQ0 for the PIT. In normal operation CPU 0 uses its
+LAPIC timer, and the PIT path is selected only when ACPI/LAPIC calibration is
+unavailable or the `force_pit` test image requests it. Application processors
+use their own LAPIC timers and never take IRQ0. The M14 test additionally routes
+ISA IRQ0 through its MADT-resolved GSI to vector 242 to verify IOAPIC delivery.
 
 ### 8253/8254 PIT
 
 [`src/arch/x86_64/pit.zig`](../../src/arch/x86_64/pit.zig) programs PIT channel
 0 as a square-wave generator (`mode 3`, lobyte/hibyte, binary) with
 `base_frequency = 1_193_182` and a divisor clamped to `1..0xffff`. The kernel
-uses 100 Hz. The PIT line remains masked until the caller explicitly unmasks
-IRQ0.
+uses 100 Hz when the PIT is the fallback timer. The PIT line remains masked until
+the caller explicitly unmasks IRQ0.
 
 Channel 2 provides a blocking millisecond reference used to calibrate the LAPIC
-timer before the APs are released. It runs in one-shot mode with the speaker
-output off, so it does not depend on interrupts or on channel 0 being active.
+timer before the APs are released and before CPU 0 starts its timer. It runs in
+one-shot mode with the speaker output off, so it does not depend on interrupts
+or on channel 0 being active. PIT channel 2 is calibration-only and is never
+programmed as an interrupt source.
 
 ## Implementation status
 
@@ -265,12 +332,17 @@ output off, so it does not depend on interrupts or on channel 0 being active.
 | IDT and exception dispatch | **IMPLEMENTED** | Vectors 0-31, CR2 reporting for #PF. |
 | IRQ stubs and full GPR save | **IMPLEMENTED** | 15 GPRs; scheduler resumption via returned base. |
 | Interrupt-time FPU save/restore | **IMPLEMENTED** | Per-CPU `%gs:0`; AP `int3` test. |
-| PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled. |
-| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; CPU 0 timer source. |
-| PIT channel 2 reference | **IMPLEMENTED** | Blocking millisecond delay for LAPIC calibration. |
+| PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled; legacy fallback path. |
+| PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; fallback CPU 0 timer source. |
+| PIT channel 2 reference | **IMPLEMENTED** | Calibration-only blocking millisecond delay; never an interrupt source. |
 | LAPIC/x2APIC and IPIs | **IMPLEMENTED** | Vectors 240/241; spurious gate 255. |
-| AP LAPIC timer | **IMPLEMENTED** | Vector 242, periodic, calibrated from PIT channel 2. |
-| CPU 0 LAPIC timer / IOAPIC routing | **PLANNED** | CPU 0 still uses the PIT; no IOAPIC yet. |
+| Per-CPU LAPIC timer | **IMPLEMENTED** | Vector 242, periodic, calibrated from PIT channel 2; CPU 0 and APs. |
+| ACPI RSDP/XSDT/RSDT/MADT parsing | **IMPLEMENTED** | Signature, length, checksum, and range validation; fixed entry limits. |
+| MADT CPU/IOAPIC/ISO data | **IMPLEMENTED** | Local/x2APIC, IOAPIC address/GSI base, LAPIC override, ISOs. |
+| ISA IRQ-to-GSI resolution | **IMPLEMENTED** | ISO authoritative; identity mapping only when no ISO exists. |
+| IOAPIC driver and routing | **IMPLEMENTED** | Uncached HHDM mapping, mask-all init, redirection read/write, readback. |
+| IOAPIC EOI rule | **IMPLEMENTED** | Fixed IOAPIC-delivered vectors use a LAPIC EOI only. |
+| MSI/MSI-X and general PCI routing | **PLANNED** | Not implemented; belongs to M18. |
 | User-mode interrupt frames | **PLANNED** | `from_user` reporting exists, but user mode is not implemented. |
 
 ## Related documentation

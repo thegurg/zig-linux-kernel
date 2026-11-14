@@ -11,12 +11,14 @@ const build_options = @import("build_options");
 
 const limine = @import("limine.zig");
 const console = @import("console.zig");
+const acpi = @import("acpi.zig");
 const pmm = @import("memory/pmm.zig");
 const vmm = @import("memory/vmm.zig");
 const heap = @import("memory/heap.zig");
 const serial = @import("arch/x86_64/serial.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
+const ioapic = @import("arch/x86_64/ioapic.zig");
 const gdt = @import("arch/x86_64/gdt.zig");
 const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
@@ -26,12 +28,15 @@ const smp = @import("smp.zig");
 const sync = @import("sync.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.16.0-m13";
+pub const version = "0.17.0-m14";
 
 const timer_hz: u32 = 100;
 const timer_test_ticks: u64 = 30;
 const sleep_ticks: u64 = 5;
 const task_stack_size = 16 * 1024;
+const m14_ioapic_ticks: u64 = 5;
+const m14_preempt_iterations: u64 = 200_000_000;
+const m14_max_spin: u64 = 200_000_000;
 
 var task_a_stack: [task_stack_size]u8 align(16) = undefined;
 var task_b_stack: [task_stack_size]u8 align(16) = undefined;
@@ -60,6 +65,14 @@ var condition_waiting: u64 = 0;
 var condition_waiter_done: u64 = 0;
 var condition_signaler_done: u64 = 0;
 var condition_signals: u64 = 0;
+
+var m14_sleep_ticks: u64 = 0;
+var m14_sleep_done: u64 = 0;
+var m14_preempt_a: u64 = 0;
+var m14_preempt_b: u64 = 0;
+var m14_preempt_a_observed: u64 = 0;
+var m14_preempt_b_observed: u64 = 0;
+var m14_stacks: [3][task_stack_size]u8 align(16) = undefined;
 
 const fpu_pattern_a = [16]u8{
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -246,6 +259,34 @@ fn workerFpuB() callconv(.c) void {
     sched.exit();
 }
 
+fn m14Sleeper() callconv(.c) void {
+    const before = sched.ticksOn(0);
+    sched.sleep(sleep_ticks);
+    m14_sleep_ticks = sched.ticksOn(0) -% before;
+    _ = @atomicRmw(u64, &m14_sleep_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+fn m14PreemptA() callconv(.c) void {
+    m14PreemptWorkload(&m14_preempt_a, &m14_preempt_b, &m14_preempt_a_observed);
+}
+
+fn m14PreemptB() callconv(.c) void {
+    m14PreemptWorkload(&m14_preempt_b, &m14_preempt_a, &m14_preempt_b_observed);
+}
+
+fn m14PreemptWorkload(own: *u64, other: *u64, observed: *u64) void {
+    var iteration: u64 = 0;
+    while (iteration < m14_preempt_iterations) : (iteration += 1) {
+        _ = @atomicRmw(u64, own, .Add, 1, .monotonic);
+        if (@atomicLoad(u64, other, .acquire) != 0) {
+            @atomicStore(u64, observed, 1, .release);
+            break;
+        }
+    }
+    sched.exit();
+}
+
 /// ELF entry point. Limine gives us a valid stack, but it lives in
 /// bootloader-reclaimable memory that later milestones will hand back to the
 /// allocator. Switch to the kernel's own stack before entering Zig code.
@@ -302,6 +343,35 @@ export fn kmain() callconv(.c) noreturn {
     banner();
     reportBootInfo();
 
+    // ACPI discovery needs the HHDM, so it runs after `vmm.init`. A failure is
+    // not fatal: the kernel keeps the legacy PIC/PIT path available.
+    acpi.init() catch |err| {
+        console.print("acpi: unavailable: {s}\n", .{@errorName(err)});
+    };
+    if (acpi.isReady()) {
+        const madt = acpi.getInfo();
+        console.print("acpi: madt revision={d} cpus={d}/{d} ioapics={d} isos={d} lapic=0x{x}\n", .{
+            madt.revision,     madt.enabled_local_apics, madt.local_apic_count,
+            madt.ioapic_count, madt.iso_count,           madt.local_apic_address,
+        });
+        if (madt.lapic_address_override) |address| {
+            console.print("acpi: lapic address override=0x{x}\n", .{address});
+        }
+    }
+
+    const ioapic_ready = ioapic.init();
+    if (ioapic_ready) {
+        var index: usize = 0;
+        while (index < ioapic.controllerCount()) : (index += 1) {
+            const controller = ioapic.controllerAt(index) orelse continue;
+            console.print("ioapic: id={d} version={d} entries={d} gsi_base={d} address=0x{x}\n", .{
+                controller.id, controller.version, controller.entries, controller.gsi_base, controller.phys,
+            });
+        }
+    } else {
+        console.write("ioapic: unavailable\n");
+    }
+
     smp.init() catch |err| {
         console.print("smp: initialization failed: {s}\n", .{@errorName(err)});
     };
@@ -313,12 +383,15 @@ export fn kmain() callconv(.c) noreturn {
     sched.init();
     vmm.setTlbShootdownHandler(&sched.shootdownTlb);
 
-    // APs program their LAPIC timers with this reload value during bring-up.
-    if (smp.getStats().aps != 0) {
+    // Measure the LAPIC timer on the BSP before releasing the APs; they reuse
+    // the same reload value. PIT channel 2 is only the calibration reference.
+    var lapic_timer_ready = false;
+    if (lapic_ready) {
         if (lapic.calibrateTimer(timer_hz)) |count| {
             console.print("timer: LAPIC {d} counts per tick\n", .{count});
+            lapic_timer_ready = true;
         } else {
-            console.write("timer: LAPIC calibration failed; AP timers disabled\n");
+            console.write("timer: LAPIC calibration failed; PIT fallback available\n");
         }
     }
 
@@ -473,6 +546,13 @@ export fn kmain() callconv(.c) noreturn {
         }
         serial.write("selftest: M13 checks passed\n");
 
+        serial.write("selftest: checking M14 ACPI, IOAPIC and CPU 0 timer\n");
+        if (!selftestM14()) {
+            serial.write("selftest: M14 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M14 checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
@@ -481,9 +561,17 @@ export fn kmain() callconv(.c) noreturn {
     }
 
     console.print("\nboot: {s} initialized (memory, per-CPU scheduler, SMP)\n", .{version});
-    pit.init(timer_hz);
-    pic.unmask(0);
-    console.print("timer: PIT {d} Hz, IRQ0 unmasked\n", .{timer_hz});
+
+    // CPU 0 uses the same LAPIC timer as the APs whenever calibration
+    // succeeded. The legacy PIT path remains the fallback and is selected
+    // explicitly by the `force_pit` test image.
+    if (!build_options.force_pit and lapic_timer_ready and lapic.startPeriodicTimer(sched.timer_vector)) {
+        console.write("timer: source=lapic\n");
+    } else {
+        pit.init(timer_hz);
+        pic.unmask(0);
+        console.print("timer: source=pit, {d} Hz, IRQ0 unmasked\n", .{timer_hz});
+    }
     console.write("scheduler: boot task exiting to idle (interrupts enabled there)\n");
     sched.exit();
 }
@@ -1127,6 +1215,163 @@ fn selftestM13() bool {
     return result.preempted;
 }
 
+/// M14: prove that ACPI/MADT and the IOAPIC are usable, deliver the still
+/// running PIT through ISA IRQ 0 -> MADT ISO -> GSI, acknowledge it through the
+/// Local APIC, then switch CPU 0 to its own LAPIC timer and exercise a local
+/// sleeper and timer-driven preemption.
+fn selftestM14() bool {
+    if (!acpi.isReady()) {
+        console.write("m14: ACPI MADT unavailable\n");
+        return false;
+    }
+    const madt = acpi.getInfo();
+    if (madt.ioapic_count == 0 or ioapic.controllerCount() == 0) {
+        console.write("m14: no usable IOAPIC\n");
+        return false;
+    }
+    if (!lapic.isInitialized() or lapic.timerCountPerTick() == 0) {
+        console.write("m14: LAPIC timer not calibrated\n");
+        return false;
+    }
+
+    // Cross-check the MADT CPU list against Limine's MP response.
+    const smp_stats = smp.getStats();
+    if (madt.enabled_local_apics < smp_stats.cpus) {
+        console.print("m14: MADT cpus={d} below limine cpus={d}\n", .{
+            madt.enabled_local_apics, smp_stats.cpus,
+        });
+        return false;
+    }
+    var bsp_found = false;
+    var index: usize = 0;
+    while (index < madt.local_apic_count) : (index += 1) {
+        const entry = madt.local_apics[index];
+        if (entry.enabled and entry.id == smp_stats.bsp_lapic_id) bsp_found = true;
+    }
+    if (!bsp_found) {
+        console.print("m14: BSP LAPIC {d} missing from MADT\n", .{smp_stats.bsp_lapic_id});
+        return false;
+    }
+    console.print("acpi: madt cpus matched limine={d}, bsp_lapic_id={d}\n", .{
+        smp_stats.cpus, smp_stats.bsp_lapic_id,
+    });
+
+    const route = acpi.isaIrqRoute(0) orelse return false;
+    console.print("m14: irq0 gsi={d}, polarity={s}, trigger={s}, overridden={d}\n", .{
+        route.gsi,
+        @tagName(route.polarity),
+        @tagName(route.trigger),
+        @intFromBool(route.overridden),
+    });
+
+    // The legacy PIC line is masked by `stopTimer`; the PIT itself keeps
+    // running. Route its IRQ 0 through the ISO-resolved GSI to the scheduler
+    // timer vector and observe LAPIC-EOI'd ticks.
+    asm volatile ("cli");
+    lapic.stopTimer();
+    const start_ticks = sched.ticksOn(0);
+    const result = ioapic.routeIsaIrq(0, sched.timer_vector, cpu.per_cpu[0].lapic_id) orelse {
+        console.write("m14: IOAPIC IRQ0 routing failed\n");
+        return false;
+    };
+
+    const expected_polarity: u32 = if (route.polarity == .active_low) 1 else 0;
+    const expected_trigger: u32 = if (route.trigger == .level) 1 else 0;
+    const vector_ok = @as(u8, @truncate(result.low & 0xff)) == sched.timer_vector;
+    const dest_ok = ((result.high >> 24) & 0xff) == (cpu.per_cpu[0].lapic_id & 0xff);
+    const polarity_ok = ((result.low >> 13) & 1) == expected_polarity;
+    const trigger_ok = ((result.low >> 15) & 1) == expected_trigger;
+    const unmasked = (result.low & (1 << 16)) == 0;
+    console.print("m14: ioapic entry low=0x{x} high=0x{x}\n", .{ result.low, result.high });
+    if (!(vector_ok and dest_ok and polarity_ok and trigger_ok and unmasked)) {
+        console.write("m14: IOAPIC redirection readback mismatch\n");
+        return false;
+    }
+
+    asm volatile ("sti");
+    var spins: u64 = 0;
+    while (sched.ticksOn(0) - start_ticks < m14_ioapic_ticks) {
+        if (spins >= m14_max_spin) {
+            asm volatile ("cli");
+            console.write("m14: IOAPIC interrupt timeout\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+    const ioapic_ticks = sched.ticksOn(0) - start_ticks;
+    console.print("m14: ioapic ticks={d}\n", .{ioapic_ticks});
+
+    asm volatile ("cli");
+    if (!ioapic.setMasked(result.gsi, true)) return false;
+    const masked = ioapic.isMasked(result.gsi) orelse return false;
+    if (!masked) {
+        console.write("m14: IOAPIC mask readback failed\n");
+        return false;
+    }
+
+    // CPU 0 now uses the same timer mechanism as every AP.
+    if (!lapic.startPeriodicTimer(sched.timer_vector)) return false;
+    console.write("timer: source=lapic\n");
+
+    m14_sleep_ticks = 0;
+    m14_sleep_done = 0;
+    const sleep_base = sched.finishedCount();
+    if (sched.createOn(0, "cpu0-sleeper", m14Sleeper, m14_stacks[0][0..]) == null) return false;
+
+    asm volatile ("sti");
+    spins = 0;
+    while (@atomicLoad(u64, &m14_sleep_done, .acquire) == 0 or
+        sched.finishedCount() < sleep_base + 1)
+    {
+        if (spins >= m14_max_spin) {
+            asm volatile ("cli");
+            console.write("m14: CPU 0 sleep timed out\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+    asm volatile ("cli");
+
+    const slept = @atomicLoad(u64, &m14_sleep_ticks, .acquire);
+    console.print("m14: cpu0 sleep ticks={d}\n", .{slept});
+    if (slept < sleep_ticks) return false;
+
+    m14_preempt_a = 0;
+    m14_preempt_b = 0;
+    m14_preempt_a_observed = 0;
+    m14_preempt_b_observed = 0;
+    const preempt_base = sched.finishedCount();
+    const preempt_start = sched.ticksOn(0);
+    if (sched.createOn(0, "cpu0-preempt-a", m14PreemptA, m14_stacks[1][0..]) == null) return false;
+    if (sched.createOn(0, "cpu0-preempt-b", m14PreemptB, m14_stacks[2][0..]) == null) return false;
+
+    asm volatile ("sti");
+    spins = 0;
+    while (sched.finishedCount() < preempt_base + 2) {
+        if (spins >= m14_max_spin) {
+            asm volatile ("cli");
+            console.write("m14: CPU 0 preemption timed out\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+    asm volatile ("cli");
+
+    const observed_a = @atomicLoad(u64, &m14_preempt_a_observed, .acquire) != 0;
+    const observed_b = @atomicLoad(u64, &m14_preempt_b_observed, .acquire) != 0;
+    const preempt_ticks = sched.ticksOn(0) - preempt_start;
+    console.print("m14: cpu0 preempted={d} a={d} b={d} ticks={d}\n", .{
+        @intFromBool(observed_a and observed_b),
+        @atomicLoad(u64, &m14_preempt_a, .acquire),
+        @atomicLoad(u64, &m14_preempt_b, .acquire),
+        preempt_ticks,
+    });
+    return observed_a and observed_b and preempt_ticks > 0;
+}
+
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that
 /// every online CPU acknowledges.
 fn selftestTlbShootdown() bool {
@@ -1170,6 +1415,7 @@ fn selftestLockGuards() bool {
 fn stopTimer() void {
     asm volatile ("cli");
     pic.mask(0);
+    lapic.stopTimer();
     sched.stop();
 }
 

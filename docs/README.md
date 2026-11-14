@@ -19,7 +19,8 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.16.0-m13`. Milestones M0 through M13 are implemented; M14 is planned.
+`0.17.0-m14`. Milestones M0 through M14 are implemented, and M15-M20 are planned
+in the [roadmap](development/roadmap.md).
 
 ## Architecture
 
@@ -28,7 +29,7 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | [Overview](architecture/overview.md) | Goals, constraints, milestone status, source layout, and how the subsystems fit together. |
 | [Boot and early bring-up](architecture/boot.md) | Limine/UEFI handoff, linker layout, `_start`, `kmain`, boot variants, and the console. |
 | [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, the kernel heap, and TLB shootdown. |
-| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, and the LAPIC timer. |
+| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, ACPI/MADT, IOAPIC, and the LAPIC timer. |
 | [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, per-CPU timer ticks, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
 | [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
 | [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs/timers, and the SMP tests. |
@@ -38,9 +39,9 @@ The current release string in [`src/main.zig`](../src/main.zig) is
 | Document | Scope |
 | --- | --- |
 | [Building](development/building.md) | Toolchain requirements, build options, kernel variants, and the QEMU harness. |
-| [Testing](development/testing.md) | Host tests, QEMU smoke and fault tests, assertions, exit codes, and recorded results. |
+| [Testing](development/testing.md) | Host tests, QEMU smoke, fault, and fallback-boot tests, assertions, exit codes, and recorded results. |
 | [Technical debt and known issues](development/technical-debt.md) | Correctness hazards, unsafe assumptions, and current limitations. |
-| [Roadmap](development/roadmap.md) | M12 results and the deferred work planned beyond it. |
+| [Roadmap](development/roadmap.md) | M14 results and the deferred work planned beyond it. |
 
 ## Suggested reading paths
 
