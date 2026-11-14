@@ -21,6 +21,7 @@ const gdt = @import("arch/x86_64/gdt.zig");
 const cpu = @import("arch/x86_64/cpu.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
 const sync = @import("sync.zig");
+const time = @import("time.zig");
 
 pub const max_tasks = 32;
 pub const max_cpus = cpu.max_cpus;
@@ -35,12 +36,35 @@ pub const sleep_vector: u8 = 50;
 pub const block_vector: u8 = 51;
 pub const wait_vector: u8 = 52;
 pub const wait_timeout_vector: u8 = 53;
+pub const join_vector: u8 = 54;
 
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const TaskState = enum { idle, ready, running, blocked, finished };
 pub const WakeReason = enum { none, signal, timeout };
 pub const FpuState = [512]u8;
+
+/// Base scheduling weight. Wait ageing is added to this score on every tick, so
+/// a low-priority task matches normal after 10 ticks and high after 20 ticks.
+/// This is the documented starvation policy: priorities bias but never starve.
+pub const Priority = enum(u8) {
+    low = 0,
+    normal = 1,
+    high = 2,
+
+    pub fn weight(self: Priority) u64 {
+        return @as(u64, @backingInt(self)) * 10;
+    }
+};
+
+pub const JoinOutcome = enum { joined, already_finished, timeout, invalid };
+
+pub const JoinResult = struct {
+    outcome: JoinOutcome,
+    status: i32,
+};
+
+const no_waiter: u32 = ~@as(u32, 0);
 
 pub const Task = struct {
     name: []const u8,
@@ -50,6 +74,12 @@ pub const Task = struct {
     wake_tick: u64,
     wake_reason: WakeReason,
     fpu_state: FpuState align(16),
+    priority: Priority,
+    ready_tick: u64,
+    exit_status: i32,
+    joinable: bool,
+    join_reaped: bool,
+    join_waiter_id: u32,
     id: u32,
     index: usize,
     cpu: u32,
@@ -68,6 +98,95 @@ const CpuState = struct {
     sleep_request: u64 = 0,
     wait_request: ?*WaitQueue = null,
     wait_timeout_request: ?WaitTimeoutRequest = null,
+    join_target: ?*Task = null,
+    exit_status: i32 = 0,
+};
+
+const Deadline = struct {
+    deadline: u64,
+    task_id: u32,
+};
+
+/// Per-CPU min-heap of finite wakeup deadlines. An entry exists only while its
+/// task is blocked with a finite deadline; `wakeLocked` removes it on an early
+/// signal and the timer pops it on expiry. The heap therefore holds at most one
+/// entry per blocked task.
+const DeadlineQueue = struct {
+    entries: [max_tasks]Deadline = undefined,
+    len: usize = 0,
+
+    fn push(self: *DeadlineQueue, task_id: u32, deadline: u64) bool {
+        if (self.len >= self.entries.len) return false;
+        var index = self.len;
+        self.len += 1;
+        const entry = Deadline{ .deadline = deadline, .task_id = task_id };
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!less(entry, self.entries[parent])) break;
+            self.entries[index] = self.entries[parent];
+            index = parent;
+        }
+        self.entries[index] = entry;
+        return true;
+    }
+
+    fn pop(self: *DeadlineQueue) ?Deadline {
+        if (self.len == 0) return null;
+        const root = self.entries[0];
+        self.len -= 1;
+        if (self.len != 0) {
+            self.entries[0] = self.entries[self.len];
+            self.siftDown(0);
+        }
+        return root;
+    }
+
+    fn remove(self: *DeadlineQueue, task_id: u32) void {
+        var index: usize = 0;
+        while (index < self.len) : (index += 1) {
+            if (self.entries[index].task_id == task_id) break;
+        }
+        if (index == self.len) return;
+
+        self.len -= 1;
+        if (index == self.len) return;
+        self.entries[index] = self.entries[self.len];
+        self.siftUp(index);
+        self.siftDown(index);
+    }
+
+    fn siftUp(self: *DeadlineQueue, start: usize) void {
+        var index = start;
+        const entry = self.entries[index];
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!less(entry, self.entries[parent])) break;
+            self.entries[index] = self.entries[parent];
+            index = parent;
+        }
+        self.entries[index] = entry;
+    }
+
+    fn siftDown(self: *DeadlineQueue, start: usize) void {
+        var index = start;
+        const entry = self.entries[index];
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.len) break;
+            const right = left + 1;
+            var child = left;
+            if (right < self.len and less(self.entries[right], self.entries[left])) child = right;
+            if (!less(self.entries[child], entry)) break;
+            self.entries[index] = self.entries[child];
+            index = child;
+        }
+        self.entries[index] = entry;
+    }
+
+    fn less(a: Deadline, b: Deadline) bool {
+        if (a.deadline != b.deadline) return a.deadline < b.deadline;
+        return a.task_id < b.task_id;
+    }
 };
 
 pub const WaitQueue = struct {
@@ -302,6 +421,9 @@ var enabled = false;
 var initialized = false;
 
 var cpu_state: [max_cpus]CpuState = @splat(.{});
+var deadlines: [max_cpus]DeadlineQueue = @splat(.{});
+var deadline_pushes: u64 = 0;
+var deadline_pops: u64 = 0;
 var idle_stacks: [max_cpus][idle_stack_size]u8 align(16) = undefined;
 
 var fpu_template: FpuState align(16) = @splat(0);
@@ -342,6 +464,9 @@ pub fn init() void {
     enabled = true;
     initialized = true;
     cpu_state = @splat(.{});
+    deadlines = @splat(.{});
+    deadline_pushes = 0;
+    deadline_pops = 0;
     online_mask = 0;
     tlb_virt = @splat(@splat(0));
     tlb_request_seq = @splat(@splat(0));
@@ -357,6 +482,12 @@ pub fn init() void {
         .wake_tick = 0,
         .wake_reason = .none,
         .fpu_state = fpu_template,
+        .priority = .normal,
+        .ready_tick = 0,
+        .exit_status = 0,
+        .joinable = false,
+        .join_reaped = true,
+        .join_waiter_id = no_waiter,
         .id = 0,
         .index = 0,
         .cpu = 0,
@@ -371,21 +502,60 @@ pub fn init() void {
     cpu.setFpuState(@intFromPtr(&tasks[0].fpu_state));
 }
 
+pub const CreateOptions = struct {
+    /// Null pins the task to the calling CPU.
+    cpu: ?u32 = null,
+    priority: Priority = .normal,
+    /// A joinable task is not recycled until `join` consumes its exit status
+    /// (or `detach` releases it). In exchange, its `*Task` stays valid.
+    joinable: bool = false,
+};
+
 pub fn create(name: []const u8, entry: Entry, stack: []u8) ?*Task {
-    return createOn(cpu.currentIndex(), name, entry, stack);
+    return createEx(name, entry, stack, .{});
 }
 
 /// Create a task pinned to `target_cpu`. A remote target receives a
 /// reschedule IPI so it enters its run queue promptly.
 pub fn createOn(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*Task {
+    return createEx(name, entry, stack, .{ .cpu = target_cpu });
+}
+
+pub fn createJoinable(name: []const u8, entry: Entry, stack: []u8) ?*Task {
+    return createEx(name, entry, stack, .{ .joinable = true });
+}
+
+pub fn createJoinableOn(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*Task {
+    return createEx(name, entry, stack, .{ .cpu = target_cpu, .joinable = true });
+}
+
+pub fn createWithPriorityOn(
+    target_cpu: u32,
+    name: []const u8,
+    entry: Entry,
+    stack: []u8,
+    priority: Priority,
+) ?*Task {
+    return createEx(name, entry, stack, .{ .cpu = target_cpu, .priority = priority });
+}
+
+pub fn createEx(name: []const u8, entry: Entry, stack: []u8, options: CreateOptions) ?*Task {
+    const target_cpu = options.cpu orelse cpu.currentIndex();
     if (!initialized or target_cpu >= max_cpus) return null;
 
     const guard = task_lock.acquire();
     defer guard.release();
-    return createLocked(target_cpu, name, entry, stack);
+    return createLocked(target_cpu, name, entry, stack, options.priority, options.joinable);
 }
 
-fn createLocked(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*Task {
+fn createLocked(
+    target_cpu: u32,
+    name: []const u8,
+    entry: Entry,
+    stack: []u8,
+    priority: Priority,
+    joinable: bool,
+) ?*Task {
     const index = findSlotLocked() orelse return null;
     const rsp = initialFrame(stack, entry) orelse return null;
     const id = next_id;
@@ -399,6 +569,12 @@ fn createLocked(target_cpu: u32, name: []const u8, entry: Entry, stack: []u8) ?*
         .wake_tick = 0,
         .wake_reason = .none,
         .fpu_state = fpu_template,
+        .priority = priority,
+        .ready_tick = @atomicLoad(u64, &cpu_ticks[target_cpu], .monotonic),
+        .exit_status = 0,
+        .joinable = joinable,
+        .join_reaped = !joinable,
+        .join_waiter_id = no_waiter,
         .id = id,
         .index = index,
         .cpu = target_cpu,
@@ -422,6 +598,7 @@ pub fn initCpu(index: u32, lapic_id: u32) bool {
     const idle = ensureIdleLocked(index) orelse return false;
     cpu_state[index].current = idle;
     cpu_state[index].next_scan = idle.index;
+    deadlines[index] = .{};
     idle.state = .running;
     _ = @atomicRmw(u64, &online_mask, .Or, @as(u64, 1) << @intCast(index), .release);
     cpu.setFpuState(@intFromPtr(&idle.fpu_state));
@@ -457,7 +634,8 @@ pub fn timerInterrupt(saved_rsp: u64) u64 {
     defer guard.release();
 
     const now = @atomicRmw(u64, &cpu_ticks[index], .Add, 1, .monotonic) + 1;
-    wakeBlockedLocked(index, now);
+    time.timerTick(index);
+    wakeExpiredLocked(index, now);
 
     const current_task = cpu_state[index].current orelse return saved_rsp;
     current_task.rsp = saved_rsp;
@@ -472,6 +650,7 @@ pub fn timerInterrupt(saved_rsp: u64) u64 {
             current_task.state = .idle;
         } else {
             current_task.state = .ready;
+            current_task.ready_tick = now;
         }
         return switchTaskLocked(index, next);
     }
@@ -498,6 +677,7 @@ pub fn rescheduleInterrupt(saved_rsp: u64) u64 {
             current_task.state = .idle;
         } else {
             current_task.state = .ready;
+            current_task.ready_tick = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
         }
         return switchTaskLocked(index, next);
     }
@@ -519,6 +699,7 @@ pub fn yieldCurrent(saved_rsp: u64) u64 {
 
     if (pickNextLocked(index)) |next| {
         current_task.state = .ready;
+        current_task.ready_tick = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
         return switchTaskLocked(index, next);
     }
     return saved_rsp;
@@ -536,7 +717,10 @@ pub fn exitCurrent(saved_rsp: u64) u64 {
     if (current_task.is_idle) haltForever();
 
     current_task.state = .finished;
+    current_task.exit_status = cpu_state[index].exit_status;
+    cpu_state[index].exit_status = 0;
     _ = @atomicRmw(u64, &finished_counter, .Add, 1, .monotonic);
+    wakeJoinWaiterLocked(current_task);
 
     if (pickNextLocked(index)) |next| return switchTaskLocked(index, next);
     const idle = cpu_state[index].idle orelse haltForever();
@@ -569,6 +753,16 @@ pub fn sleepCurrent(saved_rsp: u64) u64 {
     const now = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
     blockCurrentLocked(current_task, now +% duration);
     return switchBlockedLocked(index, current_task);
+}
+
+/// Sleep for at least `ms` milliseconds, rounded up to the next scheduler tick.
+pub fn sleepMs(ms: u64) void {
+    sleep(time.msToTicks(ms));
+}
+
+/// Sleep for at least `ns` nanoseconds, rounded up to the next scheduler tick.
+pub fn sleepNs(ns: u64) void {
+    sleep(time.nsToTicks(ns));
 }
 
 pub fn block() void {
@@ -649,6 +843,117 @@ pub fn waitTimeoutCurrent(saved_rsp: u64) u64 {
     return switchBlockedLocked(index, current_task);
 }
 
+/// Wait for a joinable task to finish. `timeout_ms == 0` waits indefinitely.
+///
+/// A task that already finished but has not been reaped returns
+/// `already_finished` with its stored status; repeating the join afterwards
+/// returns `invalid` because the slot may be reused. Only one joiner is allowed
+/// per task. `join` blocks the caller with a finite tick deadline, so it uses
+/// the same deadline queue as sleep and timed waits.
+pub fn join(task: *Task, timeout_ms: u64) JoinResult {
+    const flags = sync.irqSave();
+    asm volatile ("cli");
+    const guard = task_lock.acquire();
+
+    const current_task = currentTask() orelse {
+        guard.release();
+        sync.irqRestore(flags);
+        return .{ .outcome = .invalid, .status = 0 };
+    };
+
+    if (!initialized or !enabled or current_task.is_idle or task == current_task or
+        !task.joinable or task.join_reaped)
+    {
+        guard.release();
+        sync.irqRestore(flags);
+        return .{ .outcome = .invalid, .status = 0 };
+    }
+
+    if (task.state == .finished) {
+        task.join_reaped = true;
+        const status = task.exit_status;
+        guard.release();
+        sync.irqRestore(flags);
+        return .{ .outcome = .already_finished, .status = status };
+    }
+
+    if (task.join_waiter_id != no_waiter) {
+        guard.release();
+        sync.irqRestore(flags);
+        return .{ .outcome = .invalid, .status = 0 };
+    }
+
+    const index = cpu.currentIndex();
+    task.join_waiter_id = current_task.id;
+    cpu_state[index].join_target = task;
+    const duration = if (timeout_ms == 0) ~@as(u64, 0) else time.msToTicks(timeout_ms);
+    blockCurrentLocked(current_task, duration);
+    guard.release();
+
+    asm volatile ("int $54" ::: .{ .memory = true });
+
+    const wake_reason = current_task.wake_reason;
+    const guard_after = task_lock.acquire();
+    if (task.join_waiter_id == current_task.id) task.join_waiter_id = no_waiter;
+
+    var result: JoinResult = .{ .outcome = .invalid, .status = 0 };
+    if (wake_reason == .timeout) {
+        result = .{ .outcome = .timeout, .status = 0 };
+    } else if (wake_reason == .signal and task.state == .finished) {
+        task.join_reaped = true;
+        result = .{ .outcome = .joined, .status = task.exit_status };
+    }
+    guard_after.release();
+    sync.irqRestore(flags);
+    return result;
+}
+
+/// Software-interrupt handler for `join`. `join` has already inserted the
+/// caller into the target's single waiter slot and marked it blocked.
+pub fn joinCurrent(saved_rsp: u64) u64 {
+    if (!initialized) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    cpu_state[index].join_target = null;
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle) return saved_rsp;
+
+    current_task.rsp = saved_rsp;
+    if (!enabled) {
+        if (current_task.state == .blocked) {
+            current_task.state = .running;
+            current_task.wake_tick = ~@as(u64, 0);
+            _ = @atomicRmw(u64, &blocked_counter, .Sub, 1, .monotonic);
+            deadlines[index].remove(current_task.id);
+        }
+        return saved_rsp;
+    }
+
+    if (current_task.state != .blocked) blockCurrentLocked(current_task, ~@as(u64, 0));
+    return switchBlockedLocked(index, current_task);
+}
+
+/// Release a joinable task's slot once it finishes. The task pointer becomes
+/// unsafe as soon as the slot is reused.
+pub fn detach(task: *Task) void {
+    const guard = task_lock.acquire();
+    defer guard.release();
+    task.joinable = false;
+    if (task.state == .finished) task.join_reaped = true;
+}
+
+fn wakeJoinWaiterLocked(task: *Task) void {
+    if (task.join_waiter_id == no_waiter) return;
+    const joiner_id = task.join_waiter_id;
+    task.join_waiter_id = no_waiter;
+    if (findTaskById(joiner_id)) |joiner| {
+        _ = wakeLocked(joiner, .signal);
+    }
+}
+
 pub fn wake(task: *Task) bool {
     if (!initialized) return false;
     const guard = task_lock.acquire();
@@ -658,8 +963,10 @@ pub fn wake(task: *Task) bool {
 
 fn wakeLocked(task: *Task, reason: WakeReason) bool {
     if (task.state != .blocked) return false;
+    if (task.cpu < max_cpus) deadlines[task.cpu].remove(task.id);
     task.state = .ready;
     task.wake_reason = reason;
+    task.ready_tick = @atomicLoad(u64, &cpu_ticks[task.cpu], .monotonic);
     _ = @atomicRmw(u64, &blocked_counter, .Sub, 1, .monotonic);
     if (task.cpu != cpu.currentIndex()) sendRescheduleLocked(task.cpu);
     return true;
@@ -669,9 +976,16 @@ pub fn yield() void {
     asm volatile ("int $48" ::: .{ .memory = true });
 }
 
-pub fn exit() noreturn {
+/// Exit with a status observable through `join`.
+pub fn exitWith(status: i32) noreturn {
+    const index = cpu.currentIndex();
+    cpu_state[index].exit_status = status;
     asm volatile ("int $49" ::: .{ .memory = true });
     haltForever();
+}
+
+pub fn exit() noreturn {
+    exitWith(0);
 }
 
 pub fn stop() void {
@@ -706,6 +1020,28 @@ pub fn blockedCount() u64 {
 
 pub fn onlineCount() u64 {
     return @popCount(@atomicLoad(u64, &online_mask, .acquire));
+}
+
+/// Bit N is set when CPU N has installed scheduler state. The time module uses
+/// this mask to broadcast its TSC synchronization IPI.
+pub fn onlineMask() u64 {
+    return @atomicLoad(u64, &online_mask, .acquire);
+}
+
+/// Number of finite deadlines currently queued on `index`.
+pub fn deadlineDepthOn(index: u32) usize {
+    if (index >= max_cpus) return 0;
+    const guard = task_lock.acquire();
+    defer guard.release();
+    return deadlines[index].len;
+}
+
+pub fn deadlinePushCount() u64 {
+    return @atomicLoad(u64, &deadline_pushes, .monotonic);
+}
+
+pub fn deadlinePopCount() u64 {
+    return @atomicLoad(u64, &deadline_pops, .monotonic);
 }
 
 pub fn tlbShootdownCount() u64 {
@@ -791,10 +1127,17 @@ fn currentTask() ?*Task {
 }
 
 fn blockCurrentLocked(task: *Task, wake_tick: u64) void {
+    if (task.cpu < max_cpus) deadlines[task.cpu].remove(task.id);
     task.state = .blocked;
     task.wake_tick = wake_tick;
     task.wake_reason = .none;
     _ = @atomicRmw(u64, &blocked_counter, .Add, 1, .monotonic);
+
+    // `~0` is an indefinite block; only finite deadlines enter the heap.
+    if (wake_tick != ~@as(u64, 0)) {
+        if (!deadlines[task.cpu].push(task.id, wake_tick)) unreachable;
+        _ = @atomicRmw(u64, &deadline_pushes, .Add, 1, .monotonic);
+    }
 }
 
 /// Switch away from a task that has just been marked blocked or finished.
@@ -814,16 +1157,30 @@ fn pickNextLocked(index: u32) ?*Task {
     var start = cpu_state[index].next_scan;
     if (start >= task_count) start = 0;
 
+    const now = @atomicLoad(u64, &cpu_ticks[index], .monotonic);
+    var best: ?*Task = null;
+    var best_score: u64 = 0;
+
     var offset: usize = 0;
     while (offset < task_count) : (offset += 1) {
         const slot = (start + offset) % task_count;
         const task = &tasks[slot];
-        if (task.state == .ready and task.cpu == index and !task.is_idle) {
-            cpu_state[index].next_scan = (slot + 1) % task_count;
-            return task;
+        if (task.state != .ready or task.cpu != index or task.is_idle) continue;
+
+        // Base priority plus ticks spent waiting. The scan order breaks ties,
+        // preserving round-robin behaviour within a score.
+        const age = now -% task.ready_tick;
+        const score = task.priority.weight() +% age;
+        if (best == null or score > best_score) {
+            best = task;
+            best_score = score;
         }
     }
-    return null;
+
+    if (best) |task| {
+        cpu_state[index].next_scan = (task.index + 1) % task_count;
+    }
+    return best;
 }
 
 fn switchTaskLocked(index: u32, next: *Task) u64 {
@@ -849,6 +1206,12 @@ fn ensureIdleLocked(index: u32) ?*Task {
         .wake_tick = 0,
         .wake_reason = .none,
         .fpu_state = fpu_template,
+        .priority = .normal,
+        .ready_tick = 0,
+        .exit_status = 0,
+        .joinable = false,
+        .join_reaped = true,
+        .join_waiter_id = no_waiter,
         .id = id,
         .index = slot,
         .cpu = index,
@@ -861,11 +1224,18 @@ fn ensureIdleLocked(index: u32) ?*Task {
     return idle;
 }
 
-fn wakeBlockedLocked(index: u32, now: u64) void {
-    var task_index: usize = 0;
-    while (task_index < task_count) : (task_index += 1) {
-        const task = &tasks[task_index];
-        if (task.cpu == index and task.state == .blocked and now >= task.wake_tick) {
+/// Pop expired deadlines for this CPU. Entries are stale only if the task was
+/// woken early, re-armed, or moved; those cases never match both the state and
+/// the recorded deadline.
+fn wakeExpiredLocked(index: u32, now: u64) void {
+    while (deadlines[index].pop()) |entry| {
+        if (entry.deadline > now) {
+            if (!deadlines[index].push(entry.task_id, entry.deadline)) unreachable;
+            break;
+        }
+        _ = @atomicRmw(u64, &deadline_pops, .Add, 1, .monotonic);
+        const task = findTaskById(entry.task_id) orelse continue;
+        if (task.cpu == index and task.state == .blocked and task.wake_tick == entry.deadline) {
             _ = wakeLocked(task, .timeout);
         }
     }
@@ -882,7 +1252,11 @@ fn findTaskById(id: u32) ?*Task {
 fn findSlotLocked() ?usize {
     var index: usize = 1;
     while (index < task_count) : (index += 1) {
-        if (tasks[index].state == .finished) return index;
+        const task = &tasks[index];
+        if (task.state != .finished) continue;
+        // A joinable task keeps its slot and status until `join` or `detach`
+        // releases it, so a saved task pointer cannot silently alias a new task.
+        if (!task.joinable or task.join_reaped) return index;
     }
     if (task_count < max_tasks) return task_count;
     return null;

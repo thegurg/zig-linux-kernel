@@ -74,10 +74,12 @@ ISR_NOERR 50   /* scheduler sleep */
 ISR_NOERR 51   /* scheduler block */
 ISR_NOERR 52   /* scheduler wait queue */
 ISR_NOERR 53   /* scheduler timed wait */
+ISR_NOERR 54   /* scheduler join */
 
 ISR_NOERR 240  /* IPI: reschedule */
 ISR_NOERR 241  /* IPI: TLB shootdown */
 ISR_NOERR 242  /* LAPIC timer */
+ISR_NOERR 243  /* IPI: TSC synchronization */
 ISR_NOERR 255  /* LAPIC spurious interrupt */
 
 IRQ_NOERR 32   /* IRQ0: PIT */
@@ -213,11 +215,11 @@ irq_stub_table:
 
 .globl sched_stub_table
 sched_stub_table:
-    .quad isr_48, isr_49, isr_50, isr_51, isr_52, isr_53
+    .quad isr_48, isr_49, isr_50, isr_51, isr_52, isr_53, isr_54
 
 .globl ipi_stub_table
 ipi_stub_table:
-    .quad isr_240, isr_241, isr_255
+    .quad isr_240, isr_241, isr_243, isr_255
 
 .globl timer_stub_table
 timer_stub_table:

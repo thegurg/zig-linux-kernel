@@ -8,6 +8,7 @@
 const std = @import("std");
 const console = @import("../../console.zig");
 const sched = @import("../../sched.zig");
+const time = @import("../../time.zig");
 const gdt = @import("gdt.zig");
 const pic = @import("pic.zig");
 const lapic = @import("lapic.zig");
@@ -23,8 +24,8 @@ var idtr: [10]u8 align(8) = @splat(0);
 /// `interrupts.S` in .rodata.
 extern const isr_stub_table: [32]u64;
 extern const irq_stub_table: [16]u64;
-extern const sched_stub_table: [6]u64;
-extern const ipi_stub_table: [3]u64;
+extern const sched_stub_table: [7]u64;
+extern const ipi_stub_table: [4]u64;
 extern const timer_stub_table: [1]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
@@ -83,14 +84,15 @@ pub fn init() void {
     inline for (0..16) |irq| {
         setGate(32 + irq, irq_stub_table[irq], 0);
     }
-    inline for (0..6) |index| {
+    inline for (0..7) |index| {
         setGate(@as(usize, sched.yield_vector) + index, sched_stub_table[index], 0);
     }
 
     setGate(sched.reschedule_vector, ipi_stub_table[0], 0);
     setGate(sched.tlb_vector, ipi_stub_table[1], 0);
+    setGate(time.sync_vector, ipi_stub_table[2], 0);
     setGate(sched.timer_vector, timer_stub_table[0], 0);
-    setGate(255, ipi_stub_table[2], 0); // LAPIC spurious
+    setGate(255, ipi_stub_table[3], 0); // LAPIC spurious
 
     idtr = @splat(0);
     std.mem.writeInt(u16, idtr[0..2], @sizeOf(@TypeOf(idt)) - 1, .little);
@@ -140,6 +142,11 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
         sched.tlbInterrupt();
         return saved_rsp;
     }
+    if (vector == time.sync_vector) {
+        lapic.eoi();
+        time.tscSyncInterrupt();
+        return saved_rsp;
+    }
     if (vector == sched.timer_vector) {
         lapic.eoi();
         return sched.timerInterrupt(saved_rsp);
@@ -162,6 +169,7 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
     if (vector == sched.block_vector) return sched.blockCurrent(saved_rsp);
     if (vector == sched.wait_vector) return sched.waitQueueCurrent(saved_rsp);
     if (vector == sched.wait_timeout_vector) return sched.waitTimeoutCurrent(saved_rsp);
+    if (vector == sched.join_vector) return sched.joinCurrent(saved_rsp);
 
     const from_user = (frame.cs & 3) == 3;
 

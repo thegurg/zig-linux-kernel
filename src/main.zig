@@ -26,17 +26,27 @@ const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
 const smp = @import("smp.zig");
 const sync = @import("sync.zig");
+const time = @import("time.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 
-pub const version = "0.17.0-m14";
+pub const version = "0.17.0-m15";
 
-const timer_hz: u32 = 100;
+const timer_hz: u32 = time.tick_hz;
 const timer_test_ticks: u64 = 30;
 const sleep_ticks: u64 = 5;
 const task_stack_size = 16 * 1024;
 const m14_ioapic_ticks: u64 = 5;
 const m14_preempt_iterations: u64 = 200_000_000;
 const m14_max_spin: u64 = 200_000_000;
+
+const m15_rate_ticks: u64 = 20;
+const m15_rate_tolerance_percent: u64 = 20;
+const m15_cross_cpu_tolerance_ns: u64 = 50_000_000;
+const m15_sleep_ms: u64 = 50;
+const m15_sleep_min_ns: u64 = 40_000_000;
+const m15_sleep_max_ns: u64 = 80_000_000;
+const m15_join_timeout_ms: u64 = 50;
+const m15_max_spin: u64 = 200_000_000;
 
 var task_a_stack: [task_stack_size]u8 align(16) = undefined;
 var task_b_stack: [task_stack_size]u8 align(16) = undefined;
@@ -73,6 +83,28 @@ var m14_preempt_b: u64 = 0;
 var m14_preempt_a_observed: u64 = 0;
 var m14_preempt_b_observed: u64 = 0;
 var m14_stacks: [3][task_stack_size]u8 align(16) = undefined;
+
+var m15_barrier_ready: u64 = 0;
+var m15_barrier_go: u64 = 0;
+var m15_probe_ns: [sched.max_cpus]u64 = @splat(0);
+var m15_probe_sleep_ns: [sched.max_cpus]u64 = @splat(0);
+var m15_probe_monotonic: [sched.max_cpus]u64 = @splat(0);
+var m15_probe_done: u64 = 0;
+var m15_probe_stacks: [sched.max_cpus][task_stack_size]u8 align(16) = undefined;
+
+var m15_sleep_ns: u64 = 0;
+var m15_sleep_ticks: u64 = 0;
+var m15_sleep_done: u64 = 0;
+var m15_sleep_stack: [task_stack_size]u8 align(16) = undefined;
+
+var m15_join_status: i32 = -1;
+var m15_join_done: u64 = 0;
+var m15_join_blocker: ?*sched.Task = null;
+var m15_join_stacks: [4][task_stack_size]u8 align(16) = undefined;
+
+var m15_priority_order: [3]i32 = @splat(-1);
+var m15_priority_count: u64 = 0;
+var m15_priority_stacks: [3][task_stack_size]u8 align(16) = undefined;
 
 const fpu_pattern_a = [16]u8{
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -383,6 +415,21 @@ export fn kmain() callconv(.c) noreturn {
     sched.init();
     vmm.setTlbShootdownHandler(&sched.shootdownTlb);
 
+    // Establish the time base before any AP is released. The TSC calibration
+    // uses PIT channel 2, which is free at this point and independent of the
+    // scheduler's channel 0 tick. `force_pit` also forces the tick fallback so
+    // the fallback boot image exercises both timer and time fallbacks.
+    time.init(build_options.force_pit);
+    const boot_time = time.info();
+    console.print("time: tsc={d} invariant={d} calibrated={d} hz={d} source={s} reason={s}\n", .{
+        @intFromBool(boot_time.tsc_supported),
+        @intFromBool(boot_time.invariant_tsc),
+        @intFromBool(boot_time.tsc_calibrated),
+        boot_time.tsc_hz,
+        @tagName(boot_time.source),
+        @tagName(boot_time.fallback_reason),
+    });
+
     // Measure the LAPIC timer on the BSP before releasing the APs; they reuse
     // the same reload value. PIT channel 2 is only the calibration reference.
     var lapic_timer_ready = false;
@@ -403,6 +450,7 @@ export fn kmain() callconv(.c) noreturn {
         if (!build_options.exit_after_boot and smp_stats.aps != 0) {
             if (smp.start() and smp.waitOnline()) {
                 console.print("smp: {d} APs online, scheduler idle\n", .{smp.onlineCount()});
+                if (!syncTimeOffsets()) console.write("time: TSC synchronization failed\n");
             } else {
                 console.write("smp: failed to bring APs online\n");
             }
@@ -552,6 +600,13 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: M14 checks passed\n");
+
+        serial.write("selftest: checking M15 time and scheduler contracts\n");
+        if (!selftestM15()) {
+            serial.write("selftest: M15 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M15 checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
@@ -1144,6 +1199,7 @@ fn selftestSmp() bool {
     // The M12 shootdown tests need the BSP to accept remote IPIs while the APs
     // are running. IRQ0 stays masked by `stopTimer`.
     asm volatile ("sti" ::: .{ .memory = true });
+    if (!syncTimeOffsets()) console.write("time: TSC synchronization failed\n");
 
     const result = smp.runTest() orelse {
         console.print("smp: did not complete: cpus={d}, aps={d}, online={d}\n", .{
@@ -1370,6 +1426,406 @@ fn selftestM14() bool {
         preempt_ticks,
     });
     return observed_a and observed_b and preempt_ticks > 0;
+}
+
+fn syncTimeOffsets() bool {
+    if (time.currentSource() != .tsc) return true;
+    if (!time.syncAll(sched.onlineMask())) return false;
+    const info = time.info();
+    console.print("time: sync cpus={d} skew={d} ns\n", .{ info.synced_cpus, info.sync_skew_ns });
+    return true;
+}
+
+fn m15MonotonicCheck() bool {
+    var previous = time.nowNs();
+    var sample: usize = 0;
+    while (sample < 1000) : (sample += 1) {
+        const current = time.nowNs();
+        if (current < previous) return false;
+        previous = current;
+    }
+    return true;
+}
+
+/// Measure 20 CPU 0 ticks against the nanosecond clock. The caller checks the
+/// result against the expected 200 ms window.
+fn m15RateCheck() u64 {
+    const start_ns = time.nowNs();
+    const start_ticks = sched.ticksOn(0);
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    while (sched.ticksOn(0) - start_ticks < m15_rate_ticks) {
+        asm volatile ("hlt");
+    }
+    asm volatile ("cli");
+
+    return time.nowNs() -% start_ns;
+}
+
+fn m15TimeProbe() callconv(.c) void {
+    const index = cpu.currentIndex();
+    _ = @atomicRmw(u64, &m15_barrier_ready, .Add, 1, .seq_cst);
+
+    var spins: u64 = 0;
+    while (@atomicLoad(u64, &m15_barrier_go, .acquire) == 0) {
+        if (spins >= m15_max_spin) break;
+        spins += 1;
+        asm volatile ("pause");
+    }
+
+    const stamp = time.nowNs();
+    m15_probe_ns[index] = stamp;
+
+    var monotonic: u64 = 1;
+    var previous = stamp;
+    var sample: usize = 0;
+    while (sample < 1000) : (sample += 1) {
+        const current = time.nowNs();
+        if (current < previous) {
+            monotonic = 0;
+            break;
+        }
+        previous = current;
+    }
+    m15_probe_monotonic[index] = monotonic;
+
+    // Each CPU also proves that sleepMs is driven by its own timer and that
+    // the resulting nanosecond delta matches the requested duration.
+    const sleep_start = time.nowNs();
+    sched.sleepMs(m15_sleep_ms);
+    const sleep_end = time.nowNs();
+    m15_probe_sleep_ns[index] = sleep_end -% sleep_start;
+
+    _ = @atomicRmw(u64, &m15_probe_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+fn m15SleepWorker() callconv(.c) void {
+    const before_ns = time.nowNs();
+    const before_ticks = sched.ticksOn(0);
+    sched.sleepMs(m15_sleep_ms);
+    m15_sleep_ns = time.nowNs() -% before_ns;
+    m15_sleep_ticks = sched.ticksOn(0) -% before_ticks;
+    _ = @atomicRmw(u64, &m15_sleep_done, .Add, 1, .seq_cst);
+    sched.exit();
+}
+
+fn m15JoinStatusWorker() callconv(.c) void {
+    _ = @atomicRmw(u64, &m15_join_done, .Add, 1, .seq_cst);
+    sched.exitWith(42);
+}
+
+fn m15JoinAlreadyWorker() callconv(.c) void {
+    sched.exitWith(7);
+}
+
+fn m15JoinBlockWorker() callconv(.c) void {
+    sched.block();
+    sched.exitWith(9);
+}
+
+fn m15PriorityWorker(priority: i32) void {
+    const slot = @atomicRmw(u64, &m15_priority_count, .Add, 1, .seq_cst);
+    if (slot < m15_priority_order.len) m15_priority_order[@intCast(slot)] = priority;
+    sched.exit();
+}
+
+fn m15PriorityLow() callconv(.c) void {
+    m15PriorityWorker(0);
+}
+
+fn m15PriorityNormal() callconv(.c) void {
+    m15PriorityWorker(1);
+}
+
+fn m15PriorityHigh() callconv(.c) void {
+    m15PriorityWorker(2);
+}
+
+fn m15CrossCpu() bool {
+    const aps = smp.getStats().aps;
+    if (aps == 0) return true;
+
+    if (time.currentSource() == .tsc and !time.syncAll(sched.onlineMask())) {
+        console.write("m15: TSC synchronization failed\n");
+        return false;
+    }
+    const sync_info = time.info();
+    console.print("m15: sync cpus={d} skew={d} ns\n", .{
+        sync_info.synced_cpus, sync_info.sync_skew_ns,
+    });
+
+    m15_barrier_ready = 0;
+    m15_barrier_go = 0;
+    m15_probe_done = 0;
+    m15_probe_ns = @splat(0);
+    m15_probe_sleep_ns = @splat(0);
+    m15_probe_monotonic = @splat(0);
+
+    var ap: usize = 0;
+    while (ap < aps) : (ap += 1) {
+        const cpu_index: u32 = @intCast(ap + 1);
+        if (sched.createOn(cpu_index, "m15-time", m15TimeProbe, m15_probe_stacks[ap][0..]) == null) {
+            return false;
+        }
+    }
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    var spins: u64 = 0;
+    while (@atomicLoad(u64, &m15_barrier_ready, .acquire) < aps) {
+        if (spins >= m15_max_spin) {
+            asm volatile ("cli");
+            console.write("m15: time probe barrier timed out\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+
+    @atomicStore(u64, &m15_barrier_go, 1, .release);
+    const bsp_stamp = time.nowNs();
+
+    spins = 0;
+    while (@atomicLoad(u64, &m15_probe_done, .acquire) < aps) {
+        if (spins >= m15_max_spin) {
+            asm volatile ("cli");
+            console.write("m15: time probe timed out\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+    asm volatile ("cli");
+
+    var minimum = bsp_stamp;
+    var maximum = bsp_stamp;
+    var all_ok = true;
+    var sleep_total: u64 = 0;
+
+    ap = 0;
+    while (ap < aps) : (ap += 1) {
+        const index = ap + 1;
+        if (@atomicLoad(u64, &m15_probe_monotonic[index], .acquire) == 0) all_ok = false;
+
+        const stamp = m15_probe_ns[index];
+        minimum = @min(minimum, stamp);
+        maximum = @max(maximum, stamp);
+
+        const slept = m15_probe_sleep_ns[index];
+        sleep_total +%= slept;
+        if (slept < m15_sleep_min_ns or slept > m15_sleep_max_ns) all_ok = false;
+    }
+
+    const skew = maximum - minimum;
+    console.print("m15: cross-cpu skew_ns={d} sleep_ns={d} tolerance_ns={d}\n", .{
+        skew, sleep_total / aps, m15_cross_cpu_tolerance_ns,
+    });
+    return all_ok and skew <= m15_cross_cpu_tolerance_ns;
+}
+
+fn m15DeadlineQueue() bool {
+    m15_sleep_done = 0;
+    m15_sleep_ns = 0;
+    m15_sleep_ticks = 0;
+    const pushes_before = sched.deadlinePushCount();
+    const pops_before = sched.deadlinePopCount();
+
+    if (sched.createOn(0, "m15-deadline", m15SleepWorker, m15_sleep_stack[0..]) == null) {
+        return false;
+    }
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    var spins: u64 = 0;
+    while (sched.deadlineDepthOn(0) == 0) {
+        if (spins >= m15_max_spin) {
+            asm volatile ("cli");
+            console.write("m15: deadline queue never populated\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+
+    spins = 0;
+    while (@atomicLoad(u64, &m15_sleep_done, .acquire) == 0) {
+        if (spins >= m15_max_spin) {
+            asm volatile ("cli");
+            console.write("m15: deadline sleeper timed out\n");
+            return false;
+        }
+        spins += 1;
+        asm volatile ("pause");
+    }
+    asm volatile ("cli");
+
+    const pushes = sched.deadlinePushCount() - pushes_before;
+    const pops = sched.deadlinePopCount() - pops_before;
+    console.print("m15: deadlines pushes={d} pops={d} sleep_ns={d} ticks={d}\n", .{
+        pushes, pops, m15_sleep_ns, m15_sleep_ticks,
+    });
+
+    return pushes > 0 and pops > 0 and
+        m15_sleep_ns >= m15_sleep_min_ns and m15_sleep_ns <= m15_sleep_max_ns and
+        m15_sleep_ticks >= 5;
+}
+
+fn m15Join() bool {
+    asm volatile ("sti" ::: .{ .memory = true });
+
+    m15_join_done = 0;
+    const status_task = sched.createJoinableOn(0, "m15-join-status", m15JoinStatusWorker, m15_join_stacks[0][0..]) orelse {
+        asm volatile ("cli");
+        return false;
+    };
+    const joined = sched.join(status_task, 1000);
+
+    const already_task = sched.createJoinableOn(0, "m15-join-already", m15JoinAlreadyWorker, m15_join_stacks[1][0..]) orelse {
+        asm volatile ("cli");
+        return false;
+    };
+    // Run the already-exited worker to completion before joining it, so the
+    // join observes the `already_finished` outcome rather than blocking.
+    sched.yield();
+    const already = sched.join(already_task, 1000);
+    const twice = sched.join(already_task, 0);
+
+    const blocked_task = sched.createJoinableOn(0, "m15-join-block", m15JoinBlockWorker, m15_join_stacks[2][0..]) orelse {
+        asm volatile ("cli");
+        return false;
+    };
+    const timed = sched.join(blocked_task, m15_join_timeout_ms);
+    if (timed.outcome != .timeout) {
+        asm volatile ("cli");
+        console.print("m15: join timeout path returned {s}\n", .{@tagName(timed.outcome)});
+        return false;
+    }
+
+    if (!sched.wake(blocked_task)) {
+        asm volatile ("cli");
+        return false;
+    }
+    const retried = sched.join(blocked_task, 1000);
+    asm volatile ("cli");
+
+    console.print("m15: join joined={s}/{d} already={s}/{d} twice={s} timeout={s} retry={s}/{d}\n", .{
+        @tagName(joined.outcome),  joined.status,
+        @tagName(already.outcome), already.status,
+        @tagName(twice.outcome),   @tagName(timed.outcome),
+        @tagName(retried.outcome), retried.status,
+    });
+
+    return joined.outcome == .joined and joined.status == 42 and
+        already.outcome == .already_finished and already.status == 7 and
+        twice.outcome == .invalid and
+        timed.outcome == .timeout and
+        retried.outcome == .joined and retried.status == 9;
+}
+
+fn m15Priority() bool {
+    m15_priority_count = 0;
+    m15_priority_order = @splat(-1);
+
+    if (sched.createWithPriorityOn(0, "m15-low", m15PriorityLow, m15_priority_stacks[0][0..], .low) == null) {
+        return false;
+    }
+    if (sched.createWithPriorityOn(0, "m15-normal", m15PriorityNormal, m15_priority_stacks[1][0..], .normal) == null) {
+        return false;
+    }
+    if (sched.createWithPriorityOn(0, "m15-high", m15PriorityHigh, m15_priority_stacks[2][0..], .high) == null) {
+        return false;
+    }
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    sched.sleepMs(m15_sleep_ms);
+    asm volatile ("cli");
+
+    const order = m15_priority_order;
+    const count = @atomicLoad(u64, &m15_priority_count, .acquire);
+    console.print("m15: priority order={d},{d},{d} count={d}\n", .{
+        order[0], order[1], order[2], count,
+    });
+
+    return count == 3 and order[0] == 2 and order[1] == 1 and order[2] == 0;
+}
+
+fn m15Fallback() bool {
+    const original = time.currentSource();
+    time.selectSourceForTest(.ticks);
+    if (time.currentSource() != .ticks) return false;
+
+    var previous = time.nowNs();
+    var sample: usize = 0;
+    while (sample < 1000) : (sample += 1) {
+        const current = time.nowNs();
+        if (current < previous) {
+            time.selectSourceForTest(original);
+            return false;
+        }
+        previous = current;
+    }
+
+    asm volatile ("sti" ::: .{ .memory = true });
+    const start = time.nowNs();
+    sched.sleepMs(m15_sleep_ms);
+    const elapsed = time.nowNs() -% start;
+    asm volatile ("cli");
+    time.selectSourceForTest(original);
+
+    console.print("m15: fallback source=ticks monotonic=1 sleep_ns={d}\n", .{elapsed});
+    return elapsed >= m15_sleep_min_ns and elapsed <= m15_sleep_max_ns;
+}
+
+fn selftestM15() bool {
+    const info = time.info();
+    console.print("m15: tsc supported={d} invariant={d} calibrated={d} hz={d} source={s} reason={s}\n", .{
+        @intFromBool(info.tsc_supported),
+        @intFromBool(info.invariant_tsc),
+        @intFromBool(info.tsc_calibrated),
+        info.tsc_hz,
+        @tagName(info.source),
+        @tagName(info.fallback_reason),
+    });
+    if (info.source == .tsc and !info.tsc_calibrated) return false;
+
+    if (!m15MonotonicCheck()) {
+        console.write("m15: monotonic clock moved backwards\n");
+        return false;
+    }
+
+    const elapsed = m15RateCheck();
+    const expected = m15_rate_ticks * (1_000_000_000 / time.tick_hz);
+    const tolerance = expected * m15_rate_tolerance_percent / 100;
+    console.print("m15: rate_ns={d} expected_ns={d} tolerance_ns={d}\n", .{
+        elapsed, expected, tolerance,
+    });
+    if (elapsed + tolerance < expected or elapsed > expected + tolerance) {
+        console.write("m15: monotonic rate outside tolerance\n");
+        return false;
+    }
+
+    if (!m15CrossCpu()) {
+        console.write("m15: cross-CPU time check failed\n");
+        return false;
+    }
+    if (!m15DeadlineQueue()) {
+        console.write("m15: deadline queue check failed\n");
+        return false;
+    }
+    if (!m15Join()) {
+        console.write("m15: join check failed\n");
+        return false;
+    }
+    if (!m15Priority()) {
+        console.write("m15: priority check failed\n");
+        return false;
+    }
+    if (!m15Fallback()) {
+        console.write("m15: fallback clocksource check failed\n");
+        return false;
+    }
+
+    asm volatile ("cli");
+    return true;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

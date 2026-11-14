@@ -85,6 +85,14 @@ if [ "$MODE" != "run" ]; then
     case $status in
       33)
         if grep -q "returned from int3" "$WORK/serial.log" &&
+           grep -q "M15 checks passed" "$WORK/serial.log" &&
+           grep -q "m15: tsc supported=.* invariant=.* calibrated=.* hz=.* source=.*" "$WORK/serial.log" &&
+           grep -q "m15: rate_ns=.* expected_ns=.* tolerance_ns=" "$WORK/serial.log" &&
+           grep -q "m15: cross-cpu skew_ns=.* sleep_ns=.* tolerance_ns=" "$WORK/serial.log" &&
+           grep -q "m15: deadlines pushes=.* pops=.*" "$WORK/serial.log" &&
+           grep -q "m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9" "$WORK/serial.log" &&
+           grep -q "m15: priority order=2,1,0" "$WORK/serial.log" &&
+           grep -q "m15: fallback source=ticks monotonic=1" "$WORK/serial.log" &&
            grep -q "M14 checks passed" "$WORK/serial.log" &&
            grep -q "M13 checks passed" "$WORK/serial.log" &&
            grep -q "M12 checks passed" "$WORK/serial.log" &&
