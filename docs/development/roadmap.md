@@ -4,8 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M14 are complete and validated through the QEMU test
-flow. M15 is the next milestone. M15-M20 are planned and are recorded below with
+**Current status:** M0-M15 are complete and validated through the QEMU test
+flow. M16 is the next milestone. M16-M20 are planned and are recorded below with
 their scope and verification criteria.
 
 ## Pre-M11 bugfix pass (complete)
@@ -315,7 +315,7 @@ it. `zig fmt --check src build.zig` and `git diff --check` also passed. See
 - LAPIC timer replacement of the PIT calibration reference.
 - Full AML parsing or ACPI namespace evaluation.
 
-## M15: timekeeping and scheduler contracts (planned)
+## M15: timekeeping and scheduler contracts (complete)
 
 ### Goal
 
@@ -351,6 +351,63 @@ code, without yet adding process isolation.
 - `sleepMs` wakes within bounds; join returns success, timeout, and
   already-exited statuses correctly; priority ordering is asserted.
 - The fallback clocksource passes the same monotonicity and sleep tests.
+
+### Implementation
+
+[`src/time.zig`](../../src/time.zig) is the clocksource module. It detects the
+TSC and invariant-TSC CPUID bits, calibrates a usable TSC with three 20 ms
+PIT-channel-2 samples (median rate, 2% stability bound, 100 MHz-10 GHz range),
+and exposes `nowNs()`, `info()`, and `msToTicks`/`nsToTicks`. `syncAll()` stamps
+every online CPU through IPI 243 and stores a per-CPU offset to the BSP timeline;
+`nowNs()` applies a global atomic maximum clamp so no caller sees a backward
+step. When the TSC is forced off, missing, non-invariant, unstable, or out of
+range, CPU 0's 100 Hz ticks drive the same API and `info()` reports the reason.
+
+[`src/sched.zig`](../../src/sched.zig) replaces the full blocked-task scan with a
+per-CPU binary min-heap of finite deadlines. `sleepMs`/`sleepNs` round a
+duration up to ticks, `join` supports a stored exit status and a millisecond
+timeout, and `Priority` (`low`/`normal`/`high`) adds a base score to a task's
+waiting age. The starvation policy is explicit: low catches normal after 10
+ticks and high after 20, so priorities bias latency but never starve. Join is
+single-waiter per task; unreaped joinable slots are retained until `join` or
+`detach`. Vectors 54 (join) and 243 (TSC sync) were added to the IDT and stub
+tables.
+
+Task migration and load balancing were deliberately left for M20.
+
+### Recorded validation
+
+`zig build test` passed with the normal selftest, the fault test, and the
+fallback boot image. The KVM run exposed `+invtsc` and reported:
+
+```text
+time: tsc=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+m15: tsc supported=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+m15: rate_ns=198760384 expected_ns=200000000 tolerance_ns=40000000
+m15: sync cpus=4 skew=190817 ns
+m15: cross-cpu skew_ns=48841 sleep_ns=49120356 tolerance_ns=50000000
+m15: deadlines pushes=1 pops=1 sleep_ns=49930354 ticks=5
+m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9
+m15: priority order=2,1,0 count=3
+m15: fallback source=ticks monotonic=1 sleep_ns=50000000
+selftest: M15 checks passed
+```
+
+The TCG run correctly reported `invariant=0` and
+`source=ticks reason=non_invariant`, and passed the same checks. The `force_pit`
+image additionally reported `time: tsc=1 invariant=1 calibrated=0 hz=0
+source=ticks reason=forced` and `timer: source=pit, 100 Hz, IRQ0 unmasked`.
+`zig fmt --check src build.zig` and `git diff --check` passed. See
+[testing](testing.md) for the full matrix and limitations.
+
+### Non-goals
+
+- Task migration and load balancing; these remain in M20.
+- Multiple concurrent joiners or a general process-reaping API; M17 owns the
+  process lifecycle.
+- Replacing the 100 Hz scheduler tick with high-resolution timers.
+- TSC-deadline mode, per-CPU clocksource selection, or NTP-style rate
+  correction.
 
 ## M16: ring 3, address spaces, and syscalls (planned)
 
@@ -540,7 +597,7 @@ dependency, not by priority.
 | M12 | **IMPLEMENTED** | IRQ-safe heap lock, concurrent allocator stress, lock-free TLB mailboxes, IRQ-off and concurrent shootdown tests. |
 | M13 | **IMPLEMENTED** | Per-CPU tick counters, AP LAPIC timers, local deadline wakeups, timer-driven AP preemption, calibration and tests. |
 | M14 | **IMPLEMENTED** | ACPI/MADT discovery, ISO-based ISA IRQ resolution, IOAPIC driver, CPU 0 LAPIC timer, PIC/PIT fallback, IOAPIC delivery and fallback boot tests. |
-| M15 | **PLANNED** | Invariant-TSC detection, cross-CPU clock synchronization, monotonic time, fallback clocksource, deadline queue, sleep/join/priorities. |
+| M15 | **IMPLEMENTED** | Invariant-TSC detection and calibration, cross-CPU sync, monotonic nanosecond clock, tick fallback, deadline queue, sleep helpers, join, priorities with ageing. |
 | M16 | **PLANNED** | Ring 3, per-task address spaces, syscall gate, user memory validation, minimal test-only ELF loader. |
 | M17 | **PLANNED** | General ELF64 validation, W^X/NX, argv, spawn/wait/reap, process table, address-space teardown. |
 | M18 | **PLANNED** | PCI enumeration, virtio-blk polling, optional MSI-X extension, block layer, VFS, FAT, initramfs. |

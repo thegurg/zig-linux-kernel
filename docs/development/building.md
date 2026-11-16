@@ -66,7 +66,7 @@ different `build_options`:
 | `zig-kernel` | `false` | `false` | `false` | Installed normal kernel; `zig build run`. |
 | `zig-kernel-selftest` | `true` | `false` | `false` | Smoke tests; `zig build test`. |
 | `zig-kernel-fault-test` | `false` | `true` | `false` | Deliberate `#PF`; `zig build test`. |
-| `zig-kernel-fallback` | `false` | `false` | `true` | Forces the PIT timer path; `zig build test`. |
+| `zig-kernel-fallback` | `false` | `false` | `true` | Forces the PIT timer path and the tick clocksource; `zig build test`. |
 
 `zig build test` runs:
 
@@ -142,7 +142,7 @@ zig fmt --check build.zig src
 git diff --check
 ```
 
-Both were part of the M14 validation and passed. Running `zig fmt` on
+Both were part of the M15 validation and passed. Running `zig fmt` on
 `build.zig` and `src` keeps the Zig sources formatted; `git diff --check`
 catches trailing whitespace and conflict markers.
 
@@ -160,6 +160,11 @@ If `/dev/kvm` is not readable and writable, the harness automatically uses TCG.
 Force TCG with `ZIG_KERNEL_NO_KVM=1` to reproduce emulator-only behavior. On
 some nested-KVM hosts, `ldmxcsr` has been observed to fault; the kernel leaves
 `MXCSR` at its reset value rather than programming it.
+
+KVM hides the invariant-TSC CPUID bit by default. When `/proc/cpuinfo`
+advertises `nonstop_tsc`, `tools/run.sh` requests `-cpu host,+invtsc` so the TSC
+clocksource is actually exercised. TCG does not support `invtsc`, so a TCG run
+logs `source=ticks reason=non_invariant` and validates the fallback path.
 
 ### Exercising a non-default CPU count
 

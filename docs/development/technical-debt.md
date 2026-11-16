@@ -2,14 +2,14 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M14; **RESOLVED** entries are kept so the audit trail and the remaining
+after M15; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
-> issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, or M14.
+> issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, M14, or M15.
 
 ## Critical
 
@@ -129,11 +129,12 @@ would still see the normal exception path rather than an NMI-safe path.
   stack is 8 KiB.
 - Wait queues hold at most `max_tasks` waiters.
 
-### 8. No priorities, migration, or join
+### 8. No task migration or load balancing
 
-**Status: DEFERRED.** The scheduler is round-robin over ready tasks on each CPU.
-Tasks are pinned at creation and never migrate. There are no priority levels and
-no join/wait-for-exit API; tests poll `finishedCount()`.
+**Status: DEFERRED (M20).** Every task is pinned at creation and never migrates.
+M15 added priority levels and single-waiter join, so the scheduler now has
+weighted selection and exit statuses, but a ready task cannot move to an idle
+CPU. Tests still poll `finishedCount()` for tasks that are not joinable.
 
 ### 9. Static, caller-owned task stacks
 
@@ -154,7 +155,7 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11, M12, M13, and M14:
+Covered in M11, M12, M13, M14, and M15:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
@@ -164,9 +165,12 @@ Covered in M11, M12, M13, and M14:
 - per-AP tick counters, local AP sleep wakeup, and timer-driven AP preemption;
 - ACPI/MADT discovery, ISO-resolved IRQ0, IOAPIC redirection readback, end-to-end
   IOAPIC delivery with a LAPIC EOI, pin masking, and the CPU 0 LAPIC timer;
+- invariant-TSC detection, PIT-based calibration, cross-CPU sync, monotonic
+  samples on every AP, deadline heap push/pop, `sleepMs`, join outcomes,
+  priority order, and the tick fallback;
 - the `force_pit` fallback boot path;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11-M14 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11-M15 result markers.
 
 Still open:
 
@@ -175,7 +179,9 @@ Still open:
   or MSI/MSI-X;
 - no corrupted-ACPI-table injection test;
 - no cross-CPU mutex/condition stress test;
-- no allocator test under PMM exhaustion or mapping failure.
+- no allocator test under PMM exhaustion or mapping failure;
+- no TSC-sync timeout or out-of-tolerance-offset test;
+- no concurrent-joiner, `detach`-race, or joined-slot-reuse stress test.
 
 ### 12. ACPI/IOAPIC platform assumptions are narrow
 
@@ -231,6 +237,52 @@ failures could exhaust the 64 MiB virtual reservation. Reclaiming the range
 would require unmapping pages and a TLB shootdown while the heap lock is held,
 which the allocator deliberately avoids.
 
+## Timekeeping limitations (M15)
+
+### 17. TSC selection depends on CPUID and one calibration pass
+
+**Status: PARTIAL.** **Source:**
+[`src/time.zig`](../../src/time.zig).
+
+The TSC is used only when CPUID advertises both TSC support and the invariant
+(non-stop) bit. Calibration runs once on the BSP with three 20 ms PIT-channel-2
+samples and rejects a spread above 2%, a zero delta, or a rate outside
+100 MHz-10 GHz. A platform whose TSC drifts after boot, whose PIT reference is
+inaccurate, or whose CPUID lies about invariance is not re-checked. A rejected
+or absent TSC silently falls back to ticks and records the reason in `info()`;
+there is no runtime re-calibration or migration back to the TSC.
+
+KVM hides the invariant-TSC bit by default for migration safety. The test harness
+requests `+invtsc` when the host advertises `nonstop_tsc`; a host without that
+CPU feature, or TCG, exercises only the tick fallback.
+
+### 18. TSC sync skew is measured, not corrected iteratively
+
+**Status: PARTIAL.** **Sources:**
+[`src/time.zig`](../../src/time.zig),
+[`src/arch/x86_64/idt.zig`](../../src/arch/x86_64/idt.zig).
+
+`syncAll()` broadcasts one reference sample with IPI 243 and stores each CPU's
+raw offset. The measured spread includes IPI delivery and sampling jitter; it is
+reported but not used to refine offsets or compensate for oscillator drift. The
+BSP waits up to 100,000,000 `pause` iterations for acknowledgements and returns
+false on timeout, but callers may continue with unsynchronized clocks. No CPU is
+periodically resynchronized after the initial pass. A CPU that never
+acknowledges is not isolated or marked offline.
+
+### 19. Sleep and join are tick-granular, and join has one waiter
+
+**Status: PARTIAL.** **Source:** [`src/sched.zig`](../../src/sched.zig).
+
+`sleepMs`/`sleepNs` round up to the 100 Hz scheduler tick, so the minimum sleep
+is 10 ms and a wakeup can be up to one tick late. A timed `join` uses the same
+deadline heap and inherits that granularity. Each task has one
+`join_waiter_id`; a concurrent join returns `invalid`. A joinable task retains
+its slot and `*Task` pointer until joined or detached, so unreaped tasks can
+exhaust the 32-slot table. There is no `join`-all, no process reaping, and no
+test for a `detach`/`join` race. Priority ageing prevents starvation but is not
+strict priority scheduling and has no priority inheritance.
+
 ## Implementation status summary
 
 | Area | Status | Notes |
@@ -244,10 +296,15 @@ which the allocator deliberately avoids.
 | Allocator thread safety | **IMPLEMENTED** | Heap, PMM, VMM, console, and serial use IRQ-safe locks. |
 | AP setup ordering | **RESOLVED** | SSE and `CR0.WP` set in the assembly stub; global TLB flushed after `CR3`. |
 | Per-CPU timer / ticks | **IMPLEMENTED** | LAPIC timer vector 242 on CPU 0 and APs; PIT IRQ0 fallback. |
+| Monotonic time base | **IMPLEMENTED** | Invariant TSC or 100 Hz ticks; atomic maximum clamp. |
+| Cross-CPU TSC sync | **PARTIAL** | One IPI pass and per-CPU offsets; measured skew, no drift correction. |
+| Deadline queue | **IMPLEMENTED** | Per-CPU min-heap; finite deadlines only. |
+| Join and priorities | **PARTIAL** | Single waiter; tick-granular timeout; priority ageing. |
+| Task migration | **DEFERRED** | Planned for M20. |
 | ACPI/MADT discovery | **IMPLEMENTED** | Validated RSDP/XSDT/RSDT/MADT; BSP-only; narrow table coverage. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection read/write, mask/unmask, IRQ0 delivery test. |
-| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M14. |
-| Test coverage | **PARTIAL** | M11-M14 tests added; gaps listed above. |
+| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M15. |
+| Test coverage | **PARTIAL** | M11-M15 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 8 CPUs. |
 
 ## Related documentation

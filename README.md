@@ -21,7 +21,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M12 complete:** IRQ-safe heap locking with a concurrent allocator stress test, lock-free per-CPU TLB-shootdown mailboxes, and tests for interrupts-disabled targets and concurrent shootdowns.
 - **M13 complete:** per-CPU tick counters, AP LAPIC timers calibrated against PIT channel 2, local deadline wakeups, and timer-driven AP preemption.
 - **M14 complete:** ACPI RSDP/XSDT/RSDT/MADT parsing, ISO-resolved ISA IRQ0, an IOAPIC redirection driver, a CPU 0 LAPIC timer, a PIT fallback boot image, and IOAPIC delivery tests.
-- **Next:** M15 (planned). See the [roadmap](docs/development/roadmap.md).
+- **M15 complete:** invariant-TSC detection and PIT calibration, cross-CPU TSC synchronization, a monotonic nanosecond clock with a calibrated-tick fallback, a per-CPU deadline queue, `sleepMs`/`sleepNs`, join with exit status and timeout, and priority levels with an explicit anti-starvation policy.
+- **Next:** M16 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -61,8 +62,12 @@ Build options:
   ISA IRQ0 through its Interrupt Source Override, program and read back the
   IOAPIC redirection entry, observe IOAPIC delivery with a LAPIC EOI, mask the
   pin, then start CPU 0's LAPIC timer and verify a local sleeper and timer-driven
-  preemption; it then triggers `int3` and must return from the handler (QEMU
-  status 33);
+  preemption; the M15 checks detect and calibrate the TSC (or report why they
+  fall back), sample the monotonic clock on every CPU around a barrier, verify
+  cross-CPU agreement and per-AP `sleepMs`, exercise the deadline heap, join
+  tasks with success/already-finished/timeout/retry outcomes, assert priority
+  order, and switch to the tick clocksource for monotonicity and sleep checks; it
+  then triggers `int3` and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35);
 - the fallback image boots with `force_pit` and must log the PIT timer path and
@@ -83,11 +88,12 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M14 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M15 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch, TLB shootdown hook
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
-  sched.zig        per-CPU scheduler, wait queues, mutex/condition, IPIs, TLB shootdown
+  sched.zig        per-CPU scheduler, priorities, deadline heaps, join, wait queues, mutex/condition, IPIs, TLB shootdown
+  time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback
   smp.zig          Limine MP bring-up, AP scheduler entry and M11-M13 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
 tools/run.sh       Build ESP (vvfat) and launch QEMU

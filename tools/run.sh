@@ -28,6 +28,16 @@ LIMINE_BIN="${LIMINE_BIN:-$ROOT/third_party/limine}"
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 
+# The cross-CPU time probe needs an AP. A single-CPU run logs an explicit skip
+# marker instead of the skew/sleep line.
+has_m15_cross_cpu() {
+  if [ "$SMP" -le 1 ]; then
+    grep -q "m15: cross-cpu skipped cpus=1" "$WORK/serial.log"
+  else
+    grep -q "m15: cross-cpu skew_ns=.* sleep_ns=.* tolerance_ns=" "$WORK/serial.log"
+  fi
+}
+
 missing=0
 for f in "$KERNEL" "$LIMINE_BIN/BOOTX64.EFI" "$OVMF_CODE" "$OVMF_VARS_SRC"; do
   if [ ! -e "$f" ]; then echo "run.sh: missing $f" >&2; missing=1; fi
@@ -49,7 +59,14 @@ chmod u+w "$WORK/OVMF_VARS.fd"
 
 ACCEL=(-accel tcg -cpu max)
 if [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${ZIG_KERNEL_NO_KVM:-0}" != "1" ]; then
-  ACCEL=(-accel kvm -cpu host)
+  # KVM hides the invariant-TSC CPUID bit by default for migration safety. On a
+  # host that advertises nonstop_tsc, expose it so the TSC clocksource path is
+  # actually tested instead of only the tick fallback.
+  if grep -qw nonstop_tsc /proc/cpuinfo 2>/dev/null; then
+    ACCEL=(-accel kvm -cpu host,+invtsc)
+  else
+    ACCEL=(-accel kvm -cpu host)
+  fi
 fi
 
 QEMU=(
@@ -88,7 +105,7 @@ if [ "$MODE" != "run" ]; then
            grep -q "M15 checks passed" "$WORK/serial.log" &&
            grep -q "m15: tsc supported=.* invariant=.* calibrated=.* hz=.* source=.*" "$WORK/serial.log" &&
            grep -q "m15: rate_ns=.* expected_ns=.* tolerance_ns=" "$WORK/serial.log" &&
-           grep -q "m15: cross-cpu skew_ns=.* sleep_ns=.* tolerance_ns=" "$WORK/serial.log" &&
+           has_m15_cross_cpu &&
            grep -q "m15: deadlines pushes=.* pops=.*" "$WORK/serial.log" &&
            grep -q "m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9" "$WORK/serial.log" &&
            grep -q "m15: priority order=2,1,0" "$WORK/serial.log" &&

@@ -146,10 +146,12 @@ pass removes them.
 
 ### Cross-CPU wakeups
 
-`wakeLocked` marks a blocked task `ready` and, when the task is pinned to a
-different CPU, sends a reschedule IPI (vector 240) to that CPU. The target's
-`rescheduleInterrupt` then selects the task from its run queue. No waiter state
-is CPU-local after enqueueing, so a wakeup may originate from any CPU.
+`wakeLocked` removes any finite deadline from the task CPU's heap, marks the
+blocked task `ready`, and, when the task is pinned to a different CPU, sends a
+reschedule IPI (vector 240) to that CPU. The target's `rescheduleInterrupt` then
+selects the task from its run queue. No waiter state is CPU-local after
+enqueueing, so a wakeup may originate from any CPU. An early wake removes the
+pending heap entry, so the task is not woken a second time on expiry.
 
 `WaitQueue.wait()` has the usual condition-variable race: a signal that arrives
 before the task has enqueued itself is not remembered. Callers must protect the

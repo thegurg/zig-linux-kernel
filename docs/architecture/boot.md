@@ -105,13 +105,18 @@ initialization print an error and exit QEMU with the failure code.
     initialization failure is logged but does not abort boot.
 16. `lapic.init()`, read the BSP LAPIC ID, reinstall the per-CPU block with that
     ID, call `sched.init()`, and register `vmm.setTlbShootdownHandler`.
-17. `lapic.calibrateTimer(100)` on the BSP, before AP release, using PIT channel
+17. `time.init(force_pit)`: detect the TSC/invariant bit, then calibrate the TSC
+    against PIT channel 2 or select the tick clocksource. Log
+    `time: tsc=... invariant=... calibrated=... hz=... source=... reason=...`.
+18. `lapic.calibrateTimer(100)` on the BSP, before AP release, using PIT channel
     2 as a blocking reference. The reload value is reused by every AP.
-18. If an MP response exists, print CPU statistics (`cpus`, `aps`,
+19. If an MP response exists, print CPU statistics (`cpus`, `aps`,
     `bsp_lapic_id`, `x2apic`). On a normal boot with APs, release them with
     `smp.start()` and wait with `waitOnline()`. Each AP installs its per-CPU
-    state, starts its LAPIC timer, and enters its scheduler idle loop.
-19. Branch into the test variant or normal operation. The normal path prints the
+    state, starts its LAPIC timer, and enters its scheduler idle loop. The BSP
+    then calls `time.syncAll(sched.onlineMask())`, which broadcasts IPI 243 and
+    logs `time: sync cpus=<N> skew=<ns> ns`.
+20. Branch into the test variant or normal operation. The normal path prints the
     version summary, starts CPU 0's periodic LAPIC timer (or the PIT fallback),
     and exits the boot task into the BSP idle task.
 
@@ -123,9 +128,9 @@ The build creates four images from the same source using `build_options` in
 | Variant | Options | Behavior |
 | --- | --- | --- |
 | Normal kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = false` | Reports boot information, starts the APs into their scheduler idle loops, starts CPU 0's LAPIC timer (PIT fallback if calibration failed), and exits the boot task into the BSP idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M14 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, and M14 ACPI/IOAPIC/CPU 0 timer checks, triggers `int3`, and exits QEMU with success. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M15 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, M14 ACPI/IOAPIC/CPU 0 timer, and M15 time/join/priority/deadline checks, triggers `int3`, and exits QEMU with success. |
 | Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true`, `force_pit = false` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
-| Fallback kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = true` | Boots normally but forces the PIT IRQ0 timer path so `--test-boot` can assert the fallback. |
+| Fallback kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = true` | Boots normally but forces the PIT IRQ0 timer path and the tick clocksource so `--test-boot` can assert the fallback. |
 
 Normal operation after the report is:
 
@@ -145,10 +150,13 @@ the BSP idle task, whose `idleEntry` executes `sti; hlt`; the log wording
 reflects that exact transition.
 
 In the selftest variant, the normal timer setup is skipped. The tests call
-`sched.init()`, program the PIT, and manage `sti`/`cli` themselves; M14 later
-stops the CPU 0 timer, exercises IOAPIC delivery, and restarts the LAPIC timer.
-The fault-test variant starts APs through the normal path and then faults. The
-fallback variant uses the normal path with `force_pit` set.
+`sched.init()`, program the PIT, and manage `sti`/`cli` themselves. M14 stops the
+CPU 0 timer, exercises IOAPIC delivery, and restarts the LAPIC timer; M15 then
+synchronizes the already-online APs' TSC offsets and runs the time, deadline,
+join, priority, and fallback-clock checks. The fault-test variant starts APs
+through the normal path and then faults. The fallback variant uses the normal
+path with `force_pit` set, which forces both the PIT timer source and the tick
+clocksource.
 
 ## Console
 

@@ -380,14 +380,53 @@ The `force_pit` fallback image skips the normal LAPIC start and reports
 `timer: source=pit, 100 Hz, IRQ0 unmasked`; `tools/run.sh --test-boot` asserts
 that path.
 
+### M15 time and scheduler contracts
+
+`selftestM15()` runs after the M14 checks and, when APs are online, syncs their
+TSC offsets and runs a barrier probe on every AP. With no AP it logs
+`m15: cross-cpu skipped cpus=1` and continues with the single-CPU checks:
+
+1. reports the TSC/invariant bits, calibrated rate, selected source, and fallback
+   reason;
+2. takes 1000 monotonic samples and measures 20 CPU 0 ticks against the
+   nanosecond clock (200 ms expected, 20% tolerance);
+3. calls `time.syncAll(sched.onlineMask())`, which broadcasts IPI 243, then
+   starts one probe task per AP;
+4. each probe samples `nowNs()` after a shared barrier, verifies 1000 monotonic
+   samples, and sleeps for 50 ms; the BSP requires the timestamp spread to stay
+   within 50 ms;
+5. runs a deadline sleeper and requires both a heap push and pop plus at least
+   five ticks of sleep;
+6. joins a status-42 task, an already-finished status-7 task, rejects a repeated
+   join, times out a blocked task at 50 ms, wakes it, and joins it with status 9;
+7. creates low/normal/high tasks and requires the observed order 2,1,0;
+8. switches to the tick clocksource, rechecks monotonicity and a bounded
+   `sleepMs(50)`, then restores the original source.
+
+The selftest log is:
+
+```text
+time: tsc=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+time: sync cpus=4 skew=133473 ns
+m15: tsc supported=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+m15: rate_ns=198760384 expected_ns=200000000 tolerance_ns=40000000
+m15: sync cpus=4 skew=190817 ns
+m15: cross-cpu skew_ns=48841 sleep_ns=49120356 tolerance_ns=50000000
+m15: deadlines pushes=1 pops=1 sleep_ns=49930354 ticks=5
+m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9
+m15: priority order=2,1,0 count=3
+m15: fallback source=ticks monotonic=1 sleep_ns=50000000
+selftest: M15 checks passed
+```
+
 ## Boot-mode behavior
 
 | Mode | AP behavior |
 | --- | --- |
-| Normal kernel | `kmain` parses ACPI, initializes the IOAPICs, calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. CPU 0 then starts its own LAPIC timer. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, and M14 tests. |
+| Normal kernel | `kmain` parses ACPI, initializes the IOAPICs, calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. The BSP then synchronizes TSC offsets. CPU 0 starts its own LAPIC timer. The log is `smp: 3 APs online, scheduler idle`. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, M14, and M15 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
-| Fallback kernel | `kmain` follows the normal path but `force_pit` makes CPU 0 select PIT IRQ0 instead of its LAPIC timer. |
+| Fallback kernel | `kmain` follows the normal path but `force_pit` makes CPU 0 select PIT IRQ0 instead of its LAPIC timer, and the tick clocksource instead of the TSC. |
 
 The normal-run log is:
 
@@ -399,7 +438,7 @@ timer: source=lapic
 
 ## Recorded validation
 
-M14 validation ran the full matrix:
+M15 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -409,13 +448,14 @@ M14 validation ran the full matrix:
 - `zig build -Doptimize=Debug test`: passed;
 - the default smoke result included `acpi: madt revision=3 ...`,
   `ioapic: id=0 version=17 entries=24 gsi_base=0`, `m14: irq0 gsi=2 ...`,
-  `m14: ioapic ticks=5`, `timer: source=lapic`, `m14: cpu0 sleep ticks=5`, and
-  `m14: cpu0 preempted=1`;
+  `m14: ioapic ticks=5`, `timer: source=lapic`, `m14: cpu0 sleep ticks=5`,
+  `m14: cpu0 preempted=1`, and the M15 time/join/priority markers;
+- the TCG run selected `source=ticks reason=non_invariant` and still passed;
 - the `force_pit` image booted through `timer: source=pit, 100 Hz, IRQ0
   unmasked` and the `--test-boot` harness accepted it;
 - `zig fmt --check src build.zig` and `git diff --check`: passed.
 
-The earlier M11-M13 validation and the M14 roadmap record are in the
+The earlier M11-M14 validation and the M15 roadmap record are in the
 [roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
@@ -427,8 +467,9 @@ The earlier M11-M13 validation and the M14 roadmap record are in the
 | Pre-Zig AP setup | **IMPLEMENTED** | SSE, `CR0.WP`, and global TLB flush in `smp_entry.S`. |
 | Per-CPU scheduler/run queues | **IMPLEMENTED** | Pinned tasks; one global task table guarded by `task_lock`. |
 | Local APIC and x2APIC | **IMPLEMENTED** | xAPIC MMIO through HHDM; x2APIC MSRs. |
-| IPIs and cross-CPU wakeups | **IMPLEMENTED** | Vectors 240 and 241; spurious gate 255. |
+| IPIs and cross-CPU wakeups | **IMPLEMENTED** | Vectors 240, 241, and 243; spurious gate 255. |
 | TLB shootdown | **IMPLEMENTED** | Lock-free mailboxes; waits for every online CPU to acknowledge. |
+| Cross-CPU TSC sync | **IMPLEMENTED** | IPI 243; BSP reference offsets; skew reported. |
 | AP exception and FPU state | **IMPLEMENTED** | `%gs:0` per-CPU FXSAVE pointer; AP `int3` test. |
 | PMM/VMM/console/serial locking | **IMPLEMENTED** | IRQ-safe locks; VMM page-table lock plus TLB callback. |
 | Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
@@ -437,7 +478,7 @@ The earlier M11-M13 validation and the M14 roadmap record are in the
 | Timer-driven preemption | **IMPLEMENTED** | CPU 1 AP test plus the M14 CPU 0 preemption test. |
 | ACPI/MADT discovery | **IMPLEMENTED** | RSDP/XSDT/RSDT/MADT validation; BSP-only. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection entries, mask/unmask, ISA IRQ0 delivery test. |
-| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M14; deferred to M18. |
+| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M15; deferred to M18. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |
 
 ## Related documentation

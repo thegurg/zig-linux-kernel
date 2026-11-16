@@ -1544,7 +1544,10 @@ fn m15PriorityHigh() callconv(.c) void {
 
 fn m15CrossCpu() bool {
     const aps = smp.getStats().aps;
-    if (aps == 0) return true;
+    if (aps == 0) {
+        console.write("m15: cross-cpu skipped cpus=1\n");
+        return true;
+    }
 
     if (time.currentSource() == .tsc and !time.syncAll(sched.onlineMask())) {
         console.write("m15: TSC synchronization failed\n");

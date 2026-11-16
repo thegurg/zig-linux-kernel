@@ -1,34 +1,43 @@
 # Scheduling
 
-**Purpose:** describe the task model, per-CPU round-robin scheduler, task
-lifecycle operations, idle tasks, blocking primitives, and FPU/SIMD context
-switching.
+**Purpose:** describe the task model, per-CPU scheduler, task lifecycle
+operations, priorities, the deadline queue, join, idle tasks, blocking
+primitives, and FPU/SIMD context switching.
 
 **Implementation status:** per-CPU scheduling, pinned task creation, AP idle
-tasks, cross-CPU wakeups, per-CPU FPU context, and timer-driven preemption on
-every CPU are **IMPLEMENTED**. CPU 0 and every AP use a periodic LAPIC timer;
+tasks, cross-CPU wakeups, per-CPU FPU context, timer-driven preemption on every
+CPU, a per-CPU deadline heap, priority levels with ageing, and single-waiter
+task join are **IMPLEMENTED**. CPU 0 and every AP use a periodic LAPIC timer;
 CPU 0 keeps the PIT IRQ0 path as a fallback. Deadlines and tick counters are per
-CPU. See [technical debt](../development/technical-debt.md).
+CPU. Task migration and load balancing remain **PLANNED** for M20. See
+[technical debt](../development/technical-debt.md).
 
 ## Scope
 
 The scheduler in [`src/sched.zig`](../../src/sched.zig) provides:
 
-- preemptive round-robin scheduling on every CPU: a periodic LAPIC timer on
-  vector 242, with the 100 Hz PIT IRQ0 path as CPU 0's fallback;
+- preemptive per-CPU scheduling with round-robin tie-breaking: a periodic LAPIC
+  timer on vector 242, with the 100 Hz PIT IRQ0 path as CPU 0's fallback;
 - per-CPU tick counters, current task, idle task, scan cursor, and pending
   sleep/wait state;
 - cooperative `yield` and `exit` software interrupts;
 - timer-based sleep and indefinite block/wake;
+- `sleepMs`/`sleepNs` helpers that round a duration up to scheduler ticks;
+- a per-CPU min-heap of finite deadlines, replacing the full blocked-task scan;
+- priority levels (`low`, `normal`, `high`) with wait-ageing starvation
+  avoidance;
+- single-waiter `join` with an exit status and a millisecond timeout, plus
+  `detach` and `exitWith`;
 - wait queues, mutexes, and condition variables that wake tasks across CPUs;
 - one idle task per online CPU, each halting when no task is ready;
-- reuse of finished task slots;
+- reuse of finished task slots once joinable tasks are reaped or detached;
 - per-task FPU/SIMD state saved with `fxsave64`/`fxrstor64`;
 - reschedule IPIs and TLB-shootdown IPIs on the target CPU.
 
-It does **not** provide priorities, load balancing, task migration, an APIC
-timer on CPU 0, IOAPIC routing, address-space switching, or task join. Tasks are
-pinned to the CPU selected at creation.
+It does **not** provide task migration, load balancing, multiple joiners per
+task, general PCI/MSI interrupt routing, or address-space switching. Tasks are
+pinned to the CPU selected at creation. The monotonic clocksource itself is
+documented in [CPU and interrupts](cpu-interrupts.md#timekeeping-and-the-tsc).
 
 ## Task model
 
@@ -43,7 +52,13 @@ pinned to the CPU selected at creation.
 | `wake_tick` | `u64` | Deadline for sleep/timed wait; `~0` for indefinite block. |
 | `wake_reason` | `WakeReason` | `none`, `signal`, or `timeout`. |
 | `fpu_state` | `FpuState align(16)` | 512-byte FXSAVE area. |
-| `id` | `u32` | Monotonic task ID used by wait queues. |
+| `priority` | `Priority` | `low`, `normal`, or `high`; biases selection. |
+| `ready_tick` | `u64` | Tick at which the task last became ready; used for ageing. |
+| `exit_status` | `i32` | Status published by `exitWith` for a joiner. |
+| `joinable` | `bool` | Whether the slot is retained for `join`/`detach`. |
+| `join_reaped` | `bool` | True once the exit status has been consumed or detached. |
+| `join_waiter_id` | `u32` | Single joiner task ID, or `no_waiter`. |
+| `id` | `u32` | Monotonic task ID used by wait queues and deadlines. |
 | `index` | `usize` | Slot in the global task table. |
 | `cpu` | `u32` | CPU this task is pinned to. |
 | `is_idle` | `bool` | True for a per-CPU idle task. |
@@ -84,6 +99,18 @@ User tasks use caller-owned stacks; the selftests use static 16 KiB stacks in
 | `sleep_request` | Pending duration stored before `int $50`. |
 | `wait_request` | Pending `WaitQueue` stored before `int $52`. |
 | `wait_timeout_request` | Pending queue/duration stored before `int $53`. |
+| `join_target` | Joinable task stored before `int $54`. |
+| `exit_status` | Pending status copied into the task by `exitCurrent`. |
+
+Each CPU also owns a `DeadlineQueue`, a binary min-heap of at most `max_tasks`
+`(deadline, task_id)` entries ordered by deadline and then task ID. An entry
+exists only while a task blocked on that CPU has a finite deadline; an
+indefinite block or wait-queue block does not enter the heap. `sleep`,
+`WaitQueue.waitTimeout`, and a timed `join` push an entry; expiry pops it, and an
+explicit `wake` removes it early so the task is not woken twice. The heap holds
+at most one entry per blocked task, so a stale entry cannot accumulate.
+`deadlinePushCount()`, `deadlinePopCount()`, and `deadlineDepthOn(cpu)` are
+diagnostic counters.
 
 The `cpu.PerCpu` block holds the FPU pointer at `%gs:0`, the CPU index at
 `%gs:8`, and the LAPIC ID at `%gs:12`. See [SMP](smp.md) for the layout and GS
@@ -111,7 +138,9 @@ original state. New tasks and idle tasks inherit this clean template.
 ## Creating a task
 
 `sched.create(name, entry, stack)` pins the task to the calling CPU.
-`sched.createOn(cpu, name, entry, stack)` pins it to an explicit CPU:
+`sched.createOn(cpu, name, entry, stack)` pins it to an explicit CPU.
+`createJoinable`/`createJoinableOn` retain the slot until `join` or `detach`, and
+`createWithPriorityOn` selects a priority. All variants share `createLocked`:
 
 1. rejects calls before initialization or an out-of-range CPU;
 2. acquires `task_lock` through its per-acquisition `IrqSpinLock` guard;
@@ -149,10 +178,12 @@ scheduler.
 
 ### Slot reuse
 
-`findSlotLocked` scans from slot 1 for a task in the `finished` state. If none is
-found and the table is not full, it returns `task_count` as the next slot. A
-finished slot keeps its old stack pointer until it is overwritten, but the caller
-must supply a valid stack to `create`.
+`findSlotLocked` scans from slot 1 for a task in the `finished` state whose
+exit status has been consumed or that was never joinable (`join_reaped`). A
+finished joinable task that has not been joined or detached keeps its slot and
+`*Task` pointer valid. If no reusable slot is found and the table is not full,
+the next slot is `task_count`. A finished slot keeps its old stack pointer until
+it is overwritten, but the caller must supply a valid stack to `create`.
 
 ## Scheduling operations
 
@@ -179,12 +210,14 @@ on each AP:
 
 1. if the scheduler is not initialized, return the saved frame;
 2. acquire `task_lock`;
-3. increment this CPU's `cpu_ticks` entry;
-4. wake every blocked task pinned to this CPU whose deadline has passed
-   (`wakeBlockedLocked`);
+3. increment this CPU's `cpu_ticks` entry and call `time.timerTick(cpu)` so the
+   fallback clocksource advances from CPU 0 ticks;
+4. pop every deadline at or before the new tick from this CPU's heap and wake
+   those tasks (`wakeExpiredLocked`);
 5. save the current task's `rsp` and increment its `ticks`;
 6. if scheduling is disabled, return the saved frame;
-7. find the next `ready` task pinned to this CPU (`pickNextLocked`);
+7. find the next runnable task pinned to this CPU (`pickNextLocked`, highest
+   effective priority score first);
 8. if one exists, park the current task (`running` -> `ready`, except an idle
    task which becomes `idle`) and switch to the next task;
 9. otherwise return the saved frame and continue the current task.
@@ -233,20 +266,72 @@ not run deadline wakeups; those are handled by the timer tick.
 
 ### Exit
 
-`exitCurrent(saved_rsp)` marks the current task `finished`, increments
-`finished_counter`, and switches to the next ready task. If none exists, it
-switches to this CPU's idle task. If an idle task itself exits, the CPU halts
-forever. `sched.exit()` is declared `noreturn` and halts if the software
-interrupt ever returns.
+`exitCurrent(saved_rsp)` marks the current task `finished`, copies the CPU's
+pending `exit_status` into the task, increments `finished_counter`, and wakes a
+single registered joiner with `WakeReason.signal`. It then switches to the next
+runnable task. If none exists, it switches to this CPU's idle task. If an idle
+task itself exits, the CPU halts forever. `sched.exit()` is declared `noreturn`
+and halts if the software interrupt ever returns; `sched.exitWith(status)` sets
+the status that `join` reports.
+
+A non-joinable finished slot is immediately reusable. A joinable slot stays
+allocated with its status until `join` consumes it or `detach` releases it, so a
+`*Task` pointer passed to `join` cannot be recycled underneath the joiner.
+
+### Join
+
+`sched.createJoinable`/`createJoinableOn` create a task with
+`joinable = true`. `sched.join(task, timeout_ms)`:
+
+1. saves interrupts, acquires `task_lock`, and validates that the scheduler is
+   enabled, the target is joinable, not already reaped, and not the caller;
+2. if the target is already `finished`, marks it reaped and returns
+   `already_finished` with its status;
+3. rejects a second concurrent joiner with `invalid`;
+4. records the caller in the target's single `join_waiter_id` slot, sets a
+   finite deadline in the deadline heap (or an indefinite deadline when
+   `timeout_ms == 0`), and executes `int $54` to block;
+5. on wake, returns `joined` with the status if a signal arrived after the target
+   finished, or `timeout` if the deadline expired first.
+
+Only one joiner is supported per task. Calling `join` again after a successful
+join returns `invalid` because the slot may have been reused by another task.
+`sched.detach(task)` clears `joinable` and releases a finished slot without
+waiting; the task pointer becomes unsafe as soon as that slot is reused.
+
+### Priorities and starvation policy
+
+`Priority` has three levels and a base score:
+
+| Priority | Base score | Matches `normal` after |
+| --- | --- | --- |
+| `low` | 0 | 10 waiting ticks |
+| `normal` | 10 | — |
+| `high` | 20 | 20 waiting ticks |
+
+`pickNextLocked` scans ready tasks pinned to this CPU and selects the highest
+`base_score + waiting_age`, where waiting age is the current CPU tick minus
+`ready_tick`. A low-priority task therefore catches up with a normal task after
+10 ticks and with a high task after 20 ticks. Priorities bias latency but cannot
+starve a runnable task: every ready task eventually becomes the highest score.
+Ties fall back to the round-robin scan order. The M15 priority test creates one
+task at each level and observes the order high, normal, low.
 
 ### Sleep
 
 `sched.sleep(duration)` saves interrupts, stores a pending duration in the
 current CPU's `sleep_request`, and executes `int $50`. `sleepCurrent` marks the
-task `blocked`, sets `wake_tick = cpu_ticks[this_cpu] + duration`, increments
-`blocked_counter`, and switches to the next ready task or the idle task. The
-owning CPU's timer tick wakes the task with `WakeReason.timeout` once the
-deadline is reached. A duration of zero is a no-op. The idle task cannot sleep.
+task `blocked`, sets `wake_tick = cpu_ticks[this_cpu] + duration`, pushes the
+deadline into this CPU's heap, increments `blocked_counter`, and switches to the
+next runnable task or the idle task. The owning CPU's timer tick pops the entry
+and wakes the task with `WakeReason.timeout` once the deadline is reached. A
+duration of zero is a no-op. The idle task cannot sleep.
+
+`sched.sleepMs(ms)` and `sched.sleepNs(ns)` convert the duration with
+`time.msToTicks`/`time.nsToTicks`, rounding up, and then call `sleep`. The
+10 ms scheduler tick therefore bounds wakeup granularity: a request is satisfied
+on the first tick at or after the converted deadline, not at an arbitrary
+nanosecond.
 
 ### Indefinite block and wake
 
@@ -304,8 +389,12 @@ IPI.
 | `sched.finishedCount()` | Tasks that have exited. |
 | `sched.blockedCount()` | Tasks currently blocked. |
 | `sched.onlineCount()` | CPUs with scheduler state installed. |
+| `sched.onlineMask()` | Bit mask of online CPUs, used by TSC synchronization. |
 | `sched.rescheduleCount()` | Reschedule IPIs handled. |
 | `sched.tlbShootdownCount()` | TLB shootdown requests issued. |
+| `sched.deadlinePushCount()` | Finite deadlines inserted into a CPU heap. |
+| `sched.deadlinePopCount()` | Deadlines popped on expiry. |
+| `sched.deadlineDepthOn(cpu)` | Current heap depth for one CPU. |
 | `sched.stats()` | Snapshot of ticks, task count, finished, blocked, current ID, enabled, and online CPUs. |
 
 These are global counters read with atomic loads; most are not protected by a
@@ -353,40 +442,58 @@ The scheduler is exercised by the selftest image described in
 | M13 AP preemption | Two CPU-bound tasks pinned to CPU 1 each observe the other's counter while both are running, proving timer-driven preemption. |
 | M14 IOAPIC delivery | ISA IRQ0 is resolved through its MADT ISO, programmed into the IOAPIC, observed on vector 242 with a LAPIC EOI, then masked. |
 | M14 CPU 0 timer | CPU 0 starts its LAPIC timer, a sleeper wakes after five ticks, and two CPU-bound tasks are preempted by the local timer. |
+| M15 deadline queue | A `sleepMs` worker pushes and pops a finite deadline; the observed sleep is at least 40 ms and spans at least five ticks. |
+| M15 join | A worker exits with status 42 and is joined; an already-finished task returns status 7; a repeated join is `invalid`; a blocked task times out at 50 ms and is then woken and joined with status 9. |
+| M15 priorities | Three tasks at `low`/`normal`/`high` run in the order high, normal, low. |
+| M15 sleep helpers | `sleepMs(50)` is used on the BSP, every AP, and through the tick fallback; the elapsed nanosecond delta is bounded. |
 
 ## Limitations
 
-- **No migration or balancing:** every task is pinned at creation.
-- **No priorities:** round-robin over ready tasks per CPU.
+- **No migration or balancing:** every task is pinned at creation; migration is
+  planned for M20.
+- **Priorities bias, they do not partition:** there is no strict priority
+  scheduling and no priority inheritance. The wait-age policy prevents
+  starvation but allows a low-priority task to run ahead of an older normal task
+  once its score catches up.
+- **Single joiner:** a task has one `join_waiter_id`; concurrent `join` calls
+  return `invalid`, and a `*Task` is only safe to retain while it is joinable and
+  not yet reaped.
+- **Tick-granularity sleep:** `sleepNs` is converted to ticks, so 10 ms is the
+  smallest effective sleep and a wakeup can be up to one tick late.
 - **Fixed task limit:** 32 slots total, including the boot task and one idle task
-  per CPU.
+  per CPU. Unreaped joinable tasks hold their slots.
 - **Static stacks:** tasks use caller-owned stacks; there is no guard page or
   automatic stack allocation.
-- **No join/wait-for-exit API**; tests poll `finishedCount()`.
 - **No address-space switching**; all tasks share the kernel page tables.
 - **Idle cannot block**; blocking calls return immediately for idle tasks.
 - **Fallback timer:** CPU 0 uses the PIT if LAPIC calibration fails or the
   `force_pit` image is built. Normal operation uses the same LAPIC mechanism as
   the APs, but the per-CPU counters are not phase-locked.
+- **Fallback clocksource:** when the TSC is absent or non-invariant, `nowNs`
+  advances from CPU 0's 100 Hz ticks, which has the same 10 ms granularity.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Per-CPU round-robin scheduler | **IMPLEMENTED** | Pinned tasks, per-CPU idle and current state. |
+| Per-CPU scheduler | **IMPLEMENTED** | Pinned tasks, per-CPU idle and current state; priority score with round-robin ties. |
 | Per-CPU timer preemption | **IMPLEMENTED** | LAPIC vector 242 on CPU 0 and APs; PIT IRQ0 fallback on CPU 0. |
 | Per-CPU tick counters | **IMPLEMENTED** | Independent `cpu_ticks` entries; `ticksOn(cpu)`. |
 | Cooperative yield/exit | **IMPLEMENTED** | Vectors 48 and 49. |
-| Sleep and explicit block/wake | **IMPLEMENTED** | Vectors 50 and 51; local deadline scanning. |
-| Wait queues and timed waits | **IMPLEMENTED** | Vectors 52 and 53; SMP-aware task IDs. |
+| Sleep and explicit block/wake | **IMPLEMENTED** | Vectors 50 and 51; per-CPU deadline heap for finite sleeps. |
+| `sleepMs`/`sleepNs` helpers | **IMPLEMENTED** | Converted to ticks, rounded up; 10 ms granularity. |
+| Wait queues and timed waits | **IMPLEMENTED** | Vectors 52 and 53; SMP-aware task IDs and finite deadlines. |
 | Mutex and condition variable | **IMPLEMENTED** | Ownership transfer; blocked-before-unlock. |
-| Per-CPU idle tasks and slot reuse | **IMPLEMENTED** | 8 KiB idle stacks; task limit 32. |
+| Per-CPU idle tasks and slot reuse | **IMPLEMENTED** | 8 KiB idle stacks; task limit 32; joinable slots retained. |
 | FPU/SIMD context switching | **IMPLEMENTED** | Per-task 512-byte FXSAVE area; `%gs:0` pointer. |
 | Cross-CPU wakeups | **IMPLEMENTED** | Reschedule IPI 240. |
 | TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241; waits for every acknowledgement. |
 | AP timer preemption | **IMPLEMENTED** | Periodic LAPIC timer, vector 242, calibrated from the PIT. |
 | CPU 0 LAPIC timer | **IMPLEMENTED** | Same vector and reload as the APs; PIT fallback retained. |
-| Priorities, migration, join | **PLANNED** | Not implemented. |
+| Deadline queue | **IMPLEMENTED** | Per-CPU min-heap; finite deadlines only. |
+| Priority levels and ageing | **IMPLEMENTED** | `low`/`normal`/`high`; no starvation; no inheritance. |
+| Join with status and timeout | **IMPLEMENTED** | Single waiter; `already_finished`, `timeout`, and `invalid` outcomes. |
+| Task migration and balancing | **PLANNED** | M20. |
 
 ## Related documentation
 

@@ -2,13 +2,15 @@
 
 **Purpose:** document x86_64 CPU mode setup, per-CPU state, descriptor tables,
 interrupt and exception handling, the legacy PIC/PIT, ACPI/MADT discovery, the
-I/O APIC, the local APIC/IPIs, and the interrupt-facing FPU state.
+I/O APIC, the local APIC/IPIs, timekeeping, and the interrupt-facing FPU state.
 
 **Implementation status:** CPU bring-up, GDT/TSS, IDT, exception dispatch,
 PIC/PIT, ACPI/MADT parsing, IOAPIC redirection, LAPIC/x2APIC, IPI dispatch,
-per-CPU LAPIC timers, and per-CPU interrupt-time FPU save/restore are
-**IMPLEMENTED**. CPU 0 and every AP use a periodic LAPIC timer on vector 242;
-the PIT IRQ0 path remains the fallback. See
+per-CPU LAPIC timers, per-CPU interrupt-time FPU save/restore, and the monotonic
+time base are **IMPLEMENTED**. The preferred clocksource is the invariant TSC,
+calibrated against PIT channel 2 and synchronized across CPUs with IPI 243; a
+calibrated 100 Hz tick fallback preserves the public API. CPU 0 and every AP use
+a periodic LAPIC timer on vector 242; the PIT IRQ0 path remains the fallback. See
 [technical debt](../development/technical-debt.md).
 
 ## SSE and FPU enablement
@@ -101,10 +103,10 @@ of 16-byte gates. `idt.init()` installs:
 | --- | --- | --- |
 | 0-31 | `isr_stub_table` | CPU exceptions; vector 8 uses IST1 for `#DF`. |
 | 32-47 | `irq_stub_table` | PIC IRQs; only IRQ0 is unmasked. |
-| 48-53 | `sched_stub_table` | Scheduler software interrupts. |
-| 240, 241 | `ipi_stub_table[0..2]` | Reschedule and TLB-shootdown IPIs. |
+| 48-54 | `sched_stub_table` | Scheduler software interrupts and join. |
+| 240, 241, 243 | `ipi_stub_table[0..3]` | Reschedule, TLB-shootdown, and TSC-sync IPIs. |
 | 242 | `timer_stub_table[0]` | Periodic LAPIC timer on every CPU, including CPU 0. |
-| 255 | `ipi_stub_table[2]` | LAPIC spurious-interrupt gate. |
+| 255 | `ipi_stub_table[3]` | LAPIC spurious-interrupt gate. |
 
 Every gate is a present, DPL0, 64-bit interrupt gate (`type_attr = 0x8e`).
 `idt.load()` executes `lidt`; the BSP fills the table, and APs load the same
@@ -120,6 +122,7 @@ shared table.
 | 51 | `sched.block()` / mutex/condition waits | `sched.blockCurrent` |
 | 52 | `WaitQueue.wait()` | `sched.waitQueueCurrent` |
 | 53 | `WaitQueue.waitTimeout(ticks)` | `sched.waitTimeoutCurrent` |
+| 54 | `sched.join(task, timeout_ms)` | `sched.joinCurrent` |
 
 ## Interrupt entry and exit
 
@@ -184,22 +187,26 @@ this order:
    `saved_rsp` unchanged. The handler scans the lock-free per-CPU mailboxes and
    takes no kernel locks, so it can run while another CPU is waiting for
    shootdown acknowledgements.
-3. **Timer 242**: send a LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
+3. **TSC-sync IPI 243**: send LAPIC EOI, call `time.tscSyncInterrupt()`, and
+   return `saved_rsp` unchanged. The handler samples the local TSC, converts it
+   to the BSP timeline through the shared reference, and acknowledges the
+   sequence without taking a lock.
+4. **Timer 242**: send a LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
    This is the timer path on CPU 0 and every AP. An ISA IRQ routed through the
    IOAPIC uses this vector too, so it is acknowledged with a LAPIC EOI only.
-4. **Spurious vector 255**: return `saved_rsp` without an EOI.
-5. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
+5. **Spurious vector 255**: return `saved_rsp` without an EOI.
+6. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
    `sched.timerInterrupt(saved_rsp)`; all other IRQs return `saved_rsp`
    unchanged. This path is used only for legacy PIC-delivered interrupts.
-6. **Scheduler vectors 48-53**: call the matching scheduler entry and return
+7. **Scheduler vectors 48-54**: call the matching scheduler entry and return
    the saved-register base it selects.
-7. **Other exceptions**: print vector number and name, error code, RIP, CS,
+8. **Other exceptions**: print vector number and name, error code, RIP, CS,
    RFLAGS, and (for user-mode frames) RSP/SS.
-8. For vector 14 (`#PF`), read `CR2` and print it.
-9. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
-   `saved_rsp`; this is the path both the BSP smoke test and the AP exception
-   test use.
-10. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
+9. For vector 14 (`#PF`), read `CR2` and print it.
+10. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
+    `saved_rsp`; this is the path both the BSP smoke test and the AP exception
+    test use.
+11. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
     with the failure code.
 
 The dispatcher uses the global console, which has its own IRQ-safe message
@@ -229,7 +236,8 @@ before accessing APIC registers.
   during bring-up.
 
 The scheduler uses vector 240 for reschedule, 241 for TLB shootdown, and 242 for
-the per-CPU timer. The timer gate sends a LAPIC EOI, which is also the correct
+the per-CPU timer. Timekeeping uses vector 243 for cross-CPU TSC
+synchronization. The timer gate sends a LAPIC EOI, which is also the correct
 acknowledgement when vector 242 is reached through an IOAPIC redirection entry.
 See [SMP](smp.md) and [synchronization](synchronization.md) for the protocols.
 
@@ -317,10 +325,49 @@ uses 100 Hz when the PIT is the fallback timer. The PIT line remains masked unti
 the caller explicitly unmasks IRQ0.
 
 Channel 2 provides a blocking millisecond reference used to calibrate the LAPIC
-timer before the APs are released and before CPU 0 starts its timer. It runs in
-one-shot mode with the speaker output off, so it does not depend on interrupts
-or on channel 0 being active. PIT channel 2 is calibration-only and is never
-programmed as an interrupt source.
+timer and the TSC before the APs are released and before CPU 0 starts its timer.
+It runs in one-shot mode with the speaker output off, so it does not depend on
+interrupts or on channel 0 being active. PIT channel 2 is calibration-only and
+is never programmed as an interrupt source.
+
+## Timekeeping and the TSC
+
+[`src/time.zig`](../../src/time.zig) provides the monotonic nanosecond clock.
+`time.init(force_ticks)` runs after `sched.init()` and before LAPIC timer
+calibration:
+
+1. CPUID leaf 1 reports whether the TSC exists (`EDX[4]`); CPUID leaf
+   `0x80000007` reports the non-stop invariant-TSC bit (`EDX[8]`).
+2. A forced fallback (the `force_pit` image) selects ticks immediately.
+3. A missing, non-invariant, unstable, or out-of-range TSC selects the
+   calibrated-tick clocksource and records a `FallbackReason`.
+4. A usable TSC is calibrated with three 20 ms PIT-channel-2 samples. The median
+   is used as the rate; if the spread exceeds 2%, calibration is rejected as
+   unstable. Accepted rates must lie between 100 MHz and 10 GHz.
+5. `time.syncAll(online_mask)` broadcasts IPI 243 after AP bring-up. The BSP
+   publishes one reference TSC value; each target computes
+   `offset = reference - local_raw` and stores it per CPU. `nowNs()` adds that
+   offset before converting cycles to nanoseconds, so all CPUs report on the BSP
+   timeline. The handler takes no locks and acknowledges a sequence number; the
+   BSP spins up to 100,000,000 `pause` iterations for all acknowledgements.
+6. `nowNs()` applies a global atomic maximum clamp, so a backward step from a
+   clocksource or an offset update is never observed by a caller.
+7. In tick mode, CPU 0's scheduler timer increments the tick counter
+   (`time.timerTick(0)`), and nanoseconds are derived at the 100 Hz rate.
+
+The public surface also includes `time.info()`, `time.currentSource()`,
+`time.tickCount()`, `time.msToTicks()`, and `time.nsToTicks()`. The scheduler
+uses the conversion helpers for `sleepMs`/`sleepNs` and timed waits. The
+`selectSourceForTest` hook switches between the two sources while preserving
+continuity; normal kernel code only reads the selected source.
+
+Cross-CPU agreement is measured as the spread of per-CPU TSC offsets after the
+sync. The observed M15 spread was roughly 50-200 microseconds under KVM, which
+includes IPI delivery and sampling jitter rather than pure oscillator skew. The
+M15 test requires the timestamps taken around a barrier to agree within 50 ms, a
+deliberately loose bound for emulated and loaded hosts. The TSC path is only
+taken when the CPU reports invariant TSC; TCG typically does not, so it exercises
+the tick fallback.
 
 ## Implementation status
 
@@ -335,8 +382,13 @@ programmed as an interrupt source.
 | PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled; legacy fallback path. |
 | PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; fallback CPU 0 timer source. |
 | PIT channel 2 reference | **IMPLEMENTED** | Calibration-only blocking millisecond delay; never an interrupt source. |
-| LAPIC/x2APIC and IPIs | **IMPLEMENTED** | Vectors 240/241; spurious gate 255. |
+| LAPIC/x2APIC and IPIs | **IMPLEMENTED** | Vectors 240/241/243; spurious gate 255. |
 | Per-CPU LAPIC timer | **IMPLEMENTED** | Vector 242, periodic, calibrated from PIT channel 2; CPU 0 and APs. |
+| Invariant-TSC detection | **IMPLEMENTED** | CPUID leaf 1 and `0x80000007`; records the fallback reason. |
+| TSC calibration | **IMPLEMENTED** | Three 20 ms PIT-channel-2 samples, median rate, 2% stability bound. |
+| Cross-CPU TSC sync | **IMPLEMENTED** | IPI 243; per-CPU offsets; BSP reference timeline. |
+| Monotonic nanosecond clock | **IMPLEMENTED** | Global atomic maximum clamp; `nowNs()` from any CPU. |
+| Tick clocksource fallback | **IMPLEMENTED** | CPU 0's 100 Hz ticks; same `nowNs()` API. |
 | ACPI RSDP/XSDT/RSDT/MADT parsing | **IMPLEMENTED** | Signature, length, checksum, and range validation; fixed entry limits. |
 | MADT CPU/IOAPIC/ISO data | **IMPLEMENTED** | Local/x2APIC, IOAPIC address/GSI base, LAPIC override, ISOs. |
 | ISA IRQ-to-GSI resolution | **IMPLEMENTED** | ISO authoritative; identity mapping only when no ISO exists. |

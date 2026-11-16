@@ -234,6 +234,54 @@ mode times out after 20 seconds because the guest is expected to stay idle.
 
 ## Recorded validation
 
+### M15 validation
+
+M15 validation ran the full matrix:
+
+- `zig build` (default ReleaseSafe): passed;
+- default KVM `zig build test` (`SMP=4`): passed;
+- TCG `ZIG_KERNEL_NO_KVM=1 zig build test`: passed;
+- `ZIG_KERNEL_SMP=2 zig build test`: passed;
+- `ZIG_KERNEL_SMP=1 zig build test`: passed;
+- `zig build -Doptimize=Debug test`: passed.
+
+The KVM harness now selects `-cpu host,+invtsc` when the host advertises
+`nonstop_tsc`, so the TSC clocksource is exercised instead of silently falling
+back. The default run reported:
+
+```text
+time: tsc=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+time: sync cpus=4 skew=133473 ns
+m15: tsc supported=1 invariant=1 calibrated=1 hz=2501183000 source=tsc reason=none
+m15: rate_ns=198760384 expected_ns=200000000 tolerance_ns=40000000
+m15: sync cpus=4 skew=190817 ns
+m15: cross-cpu skew_ns=48841 sleep_ns=49120356 tolerance_ns=50000000
+m15: deadlines pushes=1 pops=1 sleep_ns=49930354 ticks=5
+m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9
+m15: priority order=2,1,0 count=3
+m15: fallback source=ticks monotonic=1 sleep_ns=50000000
+selftest: M15 checks passed
+selftest: exiting QEMU
+```
+
+The TCG run reported `time: tsc=1 invariant=0 calibrated=0 hz=0 source=ticks
+reason=non_invariant` and still passed every M15 check, proving the fallback
+clocksource keeps the same API and monotonicity. With `ZIG_KERNEL_SMP=1` there
+is no AP, so the cross-CPU probe logs `m15: cross-cpu skipped cpus=1`; the
+harness accepts that marker in place of the skew/sleep line. The `force_pit`
+image reported `time: tsc=1 invariant=1 calibrated=0 hz=0 source=ticks
+reason=forced` and `timer: source=pit, 100 Hz, IRQ0 unmasked`; `--test-boot`
+accepted the expected idle timeout.
+
+The M15 assertions also require the M11-M14 markers to remain present.
+`zig fmt --check build.zig src` and `git diff --check` passed before the commit.
+
+The observed sync spread (roughly 50-200 microseconds under KVM) is the IPI
+sampling spread, not a pure oscillator skew. The cross-CPU test tolerance is
+50 ms, deliberately loose for emulated and loaded hosts.
+
+### M14 validation
+
 M14 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
@@ -292,6 +340,12 @@ commit. Earlier M10-M13 validation remains in
   covers the wait-queue/IPI path.
 - The concurrent heap test does not force PMM exhaustion or page-table
   allocation failure.
+- M15 does not test a non-invariant TSC on a real host with a working TSC; the
+  fallback is exercised by TCG and by the runtime source-switch hook.
+- The TSC sync path has no test for a target that never acknowledges the IPI or
+  for a host whose TSC offsets exceed the 50 ms timestamp tolerance.
+- Join coverage is single-waiter only; there is no test for `detach` racing
+  with `join`, nor for reusing a joined slot under contention.
 - Debug builds are validated by running the same test flow with
   `-Doptimize=Debug`, but there is no separate debug-only test suite.
 
@@ -300,10 +354,10 @@ commit. Earlier M10-M13 validation remains in
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M14 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, and `int3`. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M15 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, timekeeping, join, priorities, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
 | QEMU fallback boot test | **IMPLEMENTED** | `force_pit` image reaches the PIT timer path and idle transition. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M14 test results. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M15 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
 | TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |
@@ -314,6 +368,12 @@ commit. Earlier M10-M13 validation remains in
 | AP timer preemption test | **IMPLEMENTED** | Two CPU-bound CPU 1 tasks must observe each other. |
 | ACPI/MADT/IOAPIC test | **IMPLEMENTED** | ISO-resolved IRQ0, redirection readback, end-to-end delivery, mask check. |
 | CPU 0 LAPIC timer test | **IMPLEMENTED** | Local sleeper and two preempted CPU-bound tasks. |
+| TSC detection/calibration test | **IMPLEMENTED** | Reports CPUID bits, rate, and source; checks the 200 ms rate window. |
+| Cross-CPU time test | **IMPLEMENTED** | TSC sync, per-AP monotonic samples, barrier skew, and `sleepMs` on every AP. |
+| Deadline-queue test | **IMPLEMENTED** | Push/pop counters and a timed sleep of at least five ticks. |
+| Join test | **IMPLEMENTED** | Success/failure statuses, already-finished, repeated join, and timeout/retry. |
+| Priority test | **IMPLEMENTED** | Three tasks must run high, normal, low. |
+| Fallback clocksource test | **IMPLEMENTED** | Runtime switch to ticks, monotonicity, and a bounded sleep. |
 | AP NMI test | **PLANNED** | NMI is not tested. |
 | Allocator failure-path test | **PLANNED** | No PMM-exhaustion or mapping-failure test. |
 
