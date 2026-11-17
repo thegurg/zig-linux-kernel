@@ -75,6 +75,7 @@ ISR_NOERR 51   /* scheduler block */
 ISR_NOERR 52   /* scheduler wait queue */
 ISR_NOERR 53   /* scheduler timed wait */
 ISR_NOERR 54   /* scheduler join */
+ISR_NOERR 128  /* user syscall */
 
 ISR_NOERR 240  /* IPI: reschedule */
 ISR_NOERR 241  /* IPI: TLB shootdown */
@@ -103,6 +104,16 @@ IRQ_NOERR 47   /* IRQ15 */
 .type isr_common, @function
 isr_common:
     cld
+
+    /* The interrupted frame starts with vector, error code, RIP, CS. Entering
+     * from ring 3 means GS still holds the user value, so swap in the per-CPU
+     * block before the FPU pointer at %gs:0 is dereferenced. Kernel-mode
+     * interrupts leave GS alone. */
+    testb $3, 24(%rsp)
+    jz 10f
+    swapgs
+10:
+
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -147,6 +158,12 @@ isr_common:
     jz 2f
     fxrstor64 (%rax)
 2:
+    /* The target frame's CS is at r12 + 15*8 + 2*8 + 3*8 = r12 + 144.
+     * If it returns to ring 3, leave the kernel GS block behind. */
+    testb $3, 144(%r12)
+    jz 4f
+    swapgs
+4:
     movq %r12, %rsp
     popq %r15
     popq %r14
@@ -180,6 +197,11 @@ sched_resume:
     jz 3f
     fxrstor64 (%rax)
 3:
+    /* Resume either a kernel idle frame or, in principle, a user frame. */
+    testb $3, 144(%rsp)
+    jz 5f
+    swapgs
+5:
     popq %r15
     popq %r14
     popq %r13
@@ -224,5 +246,9 @@ ipi_stub_table:
 .globl timer_stub_table
 timer_stub_table:
     .quad isr_242
+
+.globl syscall_stub_table
+syscall_stub_table:
+    .quad isr_128
 
 .section .note.GNU-stack,"",@progbits

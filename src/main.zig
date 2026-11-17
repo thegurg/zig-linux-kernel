@@ -28,8 +28,9 @@ const smp = @import("smp.zig");
 const sync = @import("sync.zig");
 const time = @import("time.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
+const user = @import("user.zig");
 
-pub const version = "0.17.0-m15";
+pub const version = "0.17.0-m16";
 
 const timer_hz: u32 = time.tick_hz;
 const timer_test_ticks: u64 = 30;
@@ -47,6 +48,11 @@ const m15_sleep_min_ns: u64 = 40_000_000;
 const m15_sleep_max_ns: u64 = 80_000_000;
 const m15_join_timeout_ms: u64 = 50;
 const m15_max_spin: u64 = 200_000_000;
+
+const m16_kernel_stack_size = 16 * 1024;
+const m16_join_timeout_ms: u64 = 2_000;
+const m16_preempt_spin: u64 = 200_000_000;
+var m16_kernel_stacks: [12][m16_kernel_stack_size]u8 align(16) = undefined;
 
 var task_a_stack: [task_stack_size]u8 align(16) = undefined;
 var task_b_stack: [task_stack_size]u8 align(16) = undefined;
@@ -607,6 +613,13 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: M15 checks passed\n");
+
+        serial.write("selftest: checking M16 ring 3 and address spaces\n");
+        if (!selftestM16()) {
+            serial.write("selftest: M16 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M16 checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
@@ -1829,6 +1842,178 @@ fn selftestM15() bool {
 
     asm volatile ("cli");
     return true;
+}
+
+fn m16Spawn(image: user.Image, stack_index: usize, mode: u64) ?*sched.Task {
+    if (stack_index >= m16_kernel_stacks.len) return null;
+    return sched.createUser(
+        "m16-user",
+        image.entry,
+        m16_kernel_stacks[stack_index][0..],
+        image.root,
+        user.stack_top,
+        mode,
+        .{ .joinable = true },
+    );
+}
+
+fn m16Join(task: *sched.Task) ?sched.JoinResult {
+    const result = sched.join(task, m16_join_timeout_ms);
+    switch (result.outcome) {
+        .joined, .already_finished => return result,
+        else => {
+            console.print("m16: join outcome={s}\n", .{@tagName(result.outcome)});
+            return null;
+        },
+    }
+}
+
+fn m16ReadQword(phys: u64, offset: u64) u64 {
+    const ptr: *const volatile u64 = @ptrFromInt(vmm.hhdmOffset() + phys + offset);
+    return ptr.*;
+}
+
+fn m16WriteQword(phys: u64, offset: u64, value: u64) void {
+    const ptr: *volatile u64 = @ptrFromInt(vmm.hhdmOffset() + phys + offset);
+    ptr.* = value;
+}
+
+/// M16: exercise ring 3, per-task address spaces, the int 0x80 gate, user
+/// pointer validation, and timer preemption.
+fn selftestM16() bool {
+    const before = vmm.addressSpaceStats();
+
+    // Basic syscall round trip: write, getpid, yield, sleepMs, exit(42).
+    var image = user.create(false) orelse {
+        console.write("m16: basic image load failed\n");
+        return false;
+    };
+    var task = m16Spawn(image, 0, 0) orelse {
+        user.destroy(image.root);
+        console.write("m16: basic task create failed\n");
+        return false;
+    };
+    var result = m16Join(task) orelse return false;
+    console.print("m16: user exit status={d}\n", .{result.status});
+    if (result.status != 42) return false;
+
+    // A NULL fault must terminate only the user task.
+    image = user.create(false) orelse return false;
+    task = m16Spawn(image, 1, 1) orelse {
+        user.destroy(image.root);
+        return false;
+    };
+    result = m16Join(task) orelse return false;
+    console.print("m16: user null fault status={d}\n", .{result.status});
+    if (result.status != -15) return false;
+
+    // Two live tasks map different physical pages at the same virtual address.
+    var image_a = user.create(false) orelse return false;
+    var image_b = user.create(false) orelse {
+        user.destroy(image_a.root);
+        return false;
+    };
+    m16WriteQword(image_a.data_phys, 0, 0xA1);
+    m16WriteQword(image_b.data_phys, 0, 0xB2);
+    const data_a = m16Spawn(image_a, 2, 2) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+    const data_b = m16Spawn(image_b, 3, 2) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+    const result_a = m16Join(data_a) orelse return false;
+    const result_b = m16Join(data_b) orelse return false;
+    console.print("m16: isolation data a={d} b={d}\n", .{ result_a.status, result_b.status });
+    if (result_a.status != 0xA1 or result_b.status != 0xB2) return false;
+
+    // The holder sleeps with an extra mapping live; the prober must fault and
+    // die without affecting the holder.
+    image_a = user.create(true) orelse return false;
+    image_b = user.create(false) orelse {
+        user.destroy(image_a.root);
+        return false;
+    };
+    m16WriteQword(image_a.extra_phys.?, 0, 0x7E);
+    const holder = m16Spawn(image_a, 4, 7) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+    const prober = m16Spawn(image_b, 5, 5) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+    const probe_result = m16Join(prober) orelse return false;
+    const holder_result = m16Join(holder) orelse return false;
+    console.print("m16: isolation extra holder={d} probe={d}\n", .{
+        holder_result.status, probe_result.status,
+    });
+    if (holder_result.status != 0x7E or probe_result.status != -15) return false;
+
+    // Two busy user tasks on one CPU must both make progress without yielding.
+    image_a = user.create(false) orelse return false;
+    image_b = user.create(false) orelse {
+        user.destroy(image_a.root);
+        return false;
+    };
+    m16WriteQword(image_a.data_phys, 0, 0);
+    m16WriteQword(image_b.data_phys, 0, 0);
+    const spin_a = m16Spawn(image_a, 6, 3) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+    const spin_b = m16Spawn(image_b, 7, 3) orelse {
+        user.destroy(image_a.root);
+        user.destroy(image_b.root);
+        return false;
+    };
+
+    const ticks_start = sched.ticksOn(0);
+    var count_a: u64 = 0;
+    var count_b: u64 = 0;
+    var spins: u64 = 0;
+    asm volatile ("sti");
+    while (spins < m16_preempt_spin) : (spins += 1) {
+        count_a = m16ReadQword(image_a.data_phys, 0);
+        count_b = m16ReadQword(image_b.data_phys, 0);
+        if (count_a > 0 and count_b > 0 and sched.ticksOn(0) != ticks_start) break;
+        asm volatile ("pause");
+    }
+    asm volatile ("cli");
+    const preempt_ticks = sched.ticksOn(0) - ticks_start;
+
+    m16WriteQword(image_a.data_phys, 8, 1);
+    m16WriteQword(image_b.data_phys, 8, 1);
+    const spin_a_result = m16Join(spin_a) orelse return false;
+    const spin_b_result = m16Join(spin_b) orelse return false;
+    console.print("m16: preemption counters={d},{d} ticks={d}\n", .{
+        count_a, count_b, preempt_ticks,
+    });
+    if (count_a == 0 or count_b == 0 or preempt_ticks == 0) return false;
+    if (spin_a_result.status != 0 or spin_b_result.status != 0) return false;
+
+    // Unmapped and non-canonical user pointers must be rejected by copyFromUser
+    // and reported as an error without faulting the kernel.
+    image = user.create(false) orelse return false;
+    task = m16Spawn(image, 8, 4) orelse {
+        user.destroy(image.root);
+        return false;
+    };
+    result = m16Join(task) orelse return false;
+    console.print("m16: user badptr status={d}\n", .{result.status});
+    if (result.status != 0) return false;
+
+    const after = vmm.addressSpaceStats();
+    const created = after.created - before.created;
+    const destroyed = after.destroyed - before.destroyed;
+    console.print("m16: aspace created={d} destroyed={d}\n", .{ created, destroyed });
+    return created == destroyed;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

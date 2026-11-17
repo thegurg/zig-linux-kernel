@@ -5,9 +5,10 @@
 //! CPU needs a TSS for its ring-0 stack pointer (RSP0) plus an IST stack for
 //! faults that must not trust the current stack (notably #DF).
 //!
-//! The GDT has one null, one code and one data descriptor, followed by a
-//! low/high TSS descriptor pair per CPU. CPU 0 is the bootstrap processor, so
-//! its TSS selector stays 0x18; CPU N uses selector `0x18 + N * 0x10`.
+//! The GDT has one null, kernel code/data and user code/data descriptors,
+//! followed by a low/high TSS descriptor pair per CPU. CPU 0 is the bootstrap
+//! processor, so its TSS selector is 0x28; CPU N uses selector
+//! `0x28 + N * 0x10`.
 
 const std = @import("std");
 
@@ -22,7 +23,9 @@ var double_fault_stacks: [max_cpus][double_fault_stack_size]u8 align(16) = undef
 
 pub const kernel_code_selector: u16 = 0x08;
 pub const kernel_data_selector: u16 = 0x10;
-pub const first_tss_selector: u16 = 0x18;
+pub const user_code_selector: u16 = 0x18;
+pub const user_data_selector: u16 = 0x20;
+pub const first_tss_selector: u16 = 0x28;
 
 /// Standard 64-bit TSS: exactly 104 bytes, with several fields at unaligned
 /// offsets (RSP0 sits at byte 4), so it is built byte-wise instead of with an
@@ -32,7 +35,7 @@ const tss_rsp0_offset = 0x04;
 const tss_ist1_offset = 0x24;
 const tss_iomap_offset = 0x66;
 
-const gdt_entry_count = 3 + 2 * max_cpus;
+const gdt_entry_count = 5 + 2 * max_cpus;
 
 var tss: [max_cpus][tss_size]u8 align(16) = @splat(@splat(0));
 
@@ -41,6 +44,8 @@ var gdt: [gdt_entry_count]u64 align(16) = blk: {
     entries[0] = 0x0000000000000000; // null
     entries[1] = 0x00af9a000000ffff; // 64-bit kernel code: present, DPL0, code, L=1
     entries[2] = 0x00cf92000000ffff; // kernel data: present, DPL0, writable, D/B=1
+    entries[3] = 0x00affa000000ffff; // 64-bit user code: present, DPL3, code, L=1
+    entries[4] = 0x00cff2000000ffff; // user data: present, DPL3, writable, D/B=1
     break :blk entries;
 };
 
@@ -66,8 +71,8 @@ pub fn init() void {
 
         const base = @intFromPtr(&tss[cpu]);
         const limit: u32 = tss_size - 1;
-        gdt[3 + 2 * cpu] = tssDescriptorLow(base, limit);
-        gdt[4 + 2 * cpu] = base >> 32;
+        gdt[5 + 2 * cpu] = tssDescriptorLow(base, limit);
+        gdt[6 + 2 * cpu] = base >> 32;
     }
 
     gdtr = @splat(0);

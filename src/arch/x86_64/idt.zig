@@ -8,6 +8,7 @@
 const std = @import("std");
 const console = @import("../../console.zig");
 const sched = @import("../../sched.zig");
+const syscall = @import("../../syscall.zig");
 const time = @import("../../time.zig");
 const gdt = @import("gdt.zig");
 const pic = @import("pic.zig");
@@ -27,6 +28,7 @@ extern const irq_stub_table: [16]u64;
 extern const sched_stub_table: [7]u64;
 extern const ipi_stub_table: [4]u64;
 extern const timer_stub_table: [1]u64;
+extern const syscall_stub_table: [1]u64;
 
 /// Stack frame as laid out by the CPU plus the two values our stubs push.
 /// In long mode the CPU pushes a full five-qword frame (RIP, CS, RFLAGS, RSP,
@@ -93,6 +95,7 @@ pub fn init() void {
     setGate(time.sync_vector, ipi_stub_table[2], 0);
     setGate(sched.timer_vector, timer_stub_table[0], 0);
     setGate(255, ipi_stub_table[3], 0); // LAPIC spurious
+    setGateDpl(syscall.vector, syscall_stub_table[0], 0, 3); // ring-3 int 0x80
 
     idtr = @splat(0);
     std.mem.writeInt(u16, idtr[0..2], @sizeOf(@TypeOf(idt)) - 1, .little);
@@ -111,13 +114,17 @@ pub fn load() void {
 }
 
 fn setGate(vector: usize, handler: u64, ist: u8) void {
+    setGateDpl(vector, handler, ist, 0);
+}
+
+fn setGateDpl(vector: usize, handler: u64, ist: u8, dpl: u8) void {
     const entry = &idt[vector];
     entry[0] = @truncate(handler);
     entry[1] = @truncate(handler >> 8);
     entry[2] = @truncate(gdt.kernel_code_selector);
     entry[3] = 0;
     entry[4] = ist & 0x7;
-    entry[5] = 0x8e; // present, DPL0, 64-bit interrupt gate
+    entry[5] = 0x8e | ((dpl & 3) << 5); // present, DPL, 64-bit interrupt gate
     entry[6] = @truncate(handler >> 16);
     entry[7] = @truncate(handler >> 24);
     entry[8] = @truncate(handler >> 32);
@@ -155,6 +162,7 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
         // LAPIC spurious interrupt: it must be ignored and needs no EOI.
         return saved_rsp;
     }
+    if (vector == syscall.vector) return syscall.dispatch(saved_rsp);
 
     if (vector >= 32 and vector < 48) {
         const irq = vector - 32;
@@ -189,6 +197,12 @@ export fn isr_dispatch(frame: *Frame, saved_rsp: u64) callconv(.c) u64 {
             : [value] "=r" (-> u64),
         );
         console.print("  cr2=0x{x}\n", .{cr2});
+    }
+
+    if (from_user) {
+        console.print("  user fault: task={d}, terminating task\n", .{sched.currentId()});
+        const status: i32 = -(@as(i32, @intCast(vector)) + 1);
+        return sched.exitUserFault(saved_rsp, status);
     }
 
     if (vector == 3) {

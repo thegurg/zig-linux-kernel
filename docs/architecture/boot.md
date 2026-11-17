@@ -128,7 +128,7 @@ The build creates four images from the same source using `build_options` in
 | Variant | Options | Behavior |
 | --- | --- | --- |
 | Normal kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = false` | Reports boot information, starts the APs into their scheduler idle loops, starts CPU 0's LAPIC timer (PIT fallback if calibration failed), and exits the boot task into the BSP idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M15 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, M14 ACPI/IOAPIC/CPU 0 timer, and M15 time/join/priority/deadline checks, triggers `int3`, and exits QEMU with success. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M16 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, M14 ACPI/IOAPIC/CPU 0 timer, M15 time/join/priority/deadline, and M16 ring-3/address-space checks, triggers `int3`, and exits QEMU with success. |
 | Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true`, `force_pit = false` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
 | Fallback kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = true` | Boots normally but forces the PIT IRQ0 timer path and the tick clocksource so `--test-boot` can assert the fallback. |
 
@@ -153,10 +153,12 @@ In the selftest variant, the normal timer setup is skipped. The tests call
 `sched.init()`, program the PIT, and manage `sti`/`cli` themselves. M14 stops the
 CPU 0 timer, exercises IOAPIC delivery, and restarts the LAPIC timer; M15 then
 synchronizes the already-online APs' TSC offsets and runs the time, deadline,
-join, priority, and fallback-clock checks. The fault-test variant starts APs
-through the normal path and then faults. The fallback variant uses the normal
-path with `force_pit` set, which forces both the PIT timer source and the tick
-clocksource.
+join, priority, and fallback-clock checks; M16 finally loads the embedded ring-3
+ELF fixture into private address spaces and exercises syscalls, user faults,
+isolation, and timer preemption before returning to the `int3` path. The
+fault-test variant starts APs through the normal path and then faults. The
+fallback variant uses the normal path with `force_pit` set, which forces both the
+PIT timer source and the tick clocksource.
 
 ## Console
 

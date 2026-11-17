@@ -19,7 +19,7 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.17.0-m15`. Milestones M0 through M15 are implemented, and M16-M20 are planned
+`0.17.0-m16`. Milestones M0 through M16 are implemented, and M17-M20 are planned
 in the [roadmap](development/roadmap.md).
 
 ## Architecture
@@ -28,9 +28,9 @@ in the [roadmap](development/roadmap.md).
 | --- | --- |
 | [Overview](architecture/overview.md) | Goals, constraints, milestone status, source layout, and how the subsystems fit together. |
 | [Boot and early bring-up](architecture/boot.md) | Limine/UEFI handoff, linker layout, `_start`, `kmain`, boot variants, and the console. |
-| [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, the kernel heap, and TLB shootdown. |
-| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI entry, PIC, PIT, ACPI/MADT, IOAPIC, the LAPIC timer, and TSC timekeeping. |
-| [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, deadlines, priorities, join, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
+| [Memory management](architecture/memory.md) | Physical page allocator, 4-level paging/HHDM, per-task address spaces, user copies, the kernel heap, and TLB shootdown. |
+| [CPU and interrupts](architecture/cpu-interrupts.md) | SSE bring-up, per-CPU state, GDT/TSS, IDT, exception/IRQ/IPI/syscall entry, `swapgs`, PIC, PIT, ACPI/MADT, IOAPIC, the LAPIC timer, and TSC timekeeping. |
+| [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, user tasks, deadlines, priorities, join, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
 | [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
 | [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs/timers, and the SMP tests. |
 

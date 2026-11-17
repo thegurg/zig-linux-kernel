@@ -22,7 +22,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M13 complete:** per-CPU tick counters, AP LAPIC timers calibrated against PIT channel 2, local deadline wakeups, and timer-driven AP preemption.
 - **M14 complete:** ACPI RSDP/XSDT/RSDT/MADT parsing, ISO-resolved ISA IRQ0, an IOAPIC redirection driver, a CPU 0 LAPIC timer, a PIT fallback boot image, and IOAPIC delivery tests.
 - **M15 complete:** invariant-TSC detection and PIT calibration, cross-CPU TSC synchronization, a monotonic nanosecond clock with a calibrated-tick fallback, a per-CPU deadline queue, `sleepMs`/`sleepNs`, join with exit status and timeout, and priority levels with an explicit anti-starvation policy.
-- **Next:** M16 (planned). See the [roadmap](docs/development/roadmap.md).
+- **M16 complete:** per-task low-half address spaces with a shared kernel high half, ring-3 entry, a DPL3 `int 0x80` gate, `swapgs`, per-task kernel stacks and TSS `RSP0`, validated `copyFromUser`/`copyToUser`, the `write`/`exit`/`yield`/`sleepMs`/`getpid` syscalls, CR3 switching, user-half teardown, and a minimal test-only ELF64 loader.
+- **Next:** M17 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -66,8 +67,14 @@ Build options:
   fall back), sample the monotonic clock on every CPU around a barrier, verify
   cross-CPU agreement and per-AP `sleepMs`, exercise the deadline heap, join
   tasks with success/already-finished/timeout/retry outcomes, assert priority
-  order, and switch to the tick clocksource for monotonicity and sleep checks; it
-  then triggers `int3` and must return from the handler (QEMU status 33);
+  order, and switch to the tick clocksource for monotonicity and sleep checks; the
+  M16 checks load and run the embedded ring-3 ELF fixture, observe its serial
+  `write` and `sleepMs`, verify an exit status of 42, kill only the offending
+  task on a user NULL fault, show that two address spaces map different physical
+  pages at the same virtual address, reject an unmapped and a non-canonical user
+  pointer without a kernel panic, prove timer preemption of two busy user tasks,
+  and confirm that every created address space is destroyed; it then triggers
+  `int3` and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35);
 - the fallback image boots with `force_pit` and must log the PIT timer path and
@@ -82,21 +89,27 @@ src/
   arch/x86_64/cpu.zig       per-CPU GS-based state and SSE/FPU enablement
   arch/x86_64/lapic.zig     xAPIC/x2APIC detection, EOI, IPIs, and the LAPIC timer
   arch/x86_64/ioapic.zig    IOAPIC redirection entries, masking, and ISA IRQ routing
-  arch/x86_64/interrupts.S  Exception/IRQ/IPI stubs, GPR and FPU save/restore
+  arch/x86_64/interrupts.S  Exception/IRQ/IPI stubs, swapgs entry/exit, GPR and FPU save/restore
   arch/x86_64/smp_entry.S   AP entry: private stack, kernel CR3, ap_main
   acpi.zig         RSDP/XSDT/RSDT/MADT parsing and ISA IRQ resolution
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M15 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M16 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
-  memory/vmm.zig   4-level page tables, kernel/HHDM mappings, CR3 switch, TLB shootdown hook
+  memory/vmm.zig   4-level page tables, per-task address spaces, user copies, TLB shootdown
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
-  sched.zig        per-CPU scheduler, priorities, deadline heaps, join, wait queues, mutex/condition, IPIs, TLB shootdown
+  sched.zig        per-CPU scheduler, priorities, deadline heaps, join, user tasks, wait queues, mutex/condition, IPIs, TLB shootdown
+  syscall.zig      int 0x80 ABI, saved-register frame, syscall dispatcher
   time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback
+  user.zig         minimal embedded ELF64 test-image loader and user layout
+  user/demo.S      ring-3 test program source
+  user/demo.ld     fixed low-half linker script for the test program
+  user/demo.elf    checked-in ELF fixture embedded with @embedFile
   smp.zig          Limine MP bring-up, AP scheduler entry and M11-M13 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
 tools/run.sh       Build ESP (vvfat) and launch QEMU
+tools/build-user.sh Regenerate src/user/demo.elf from demo.S and demo.ld
 tools/genfont.py   Regenerate src/font.zig from a system font
 third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 docs/              Architecture and development documentation

@@ -110,6 +110,17 @@ if [ "$MODE" != "run" ]; then
            grep -q "m15: join joined=joined/42 already=already_finished/7 twice=invalid timeout=timeout retry=joined/9" "$WORK/serial.log" &&
            grep -q "m15: priority order=2,1,0" "$WORK/serial.log" &&
            grep -q "m15: fallback source=ticks monotonic=1" "$WORK/serial.log" &&
+           grep -q "M16 checks passed" "$WORK/serial.log" &&
+           grep -q "m16: user write ok" "$WORK/serial.log" &&
+           grep -q "m16: user sleep ok" "$WORK/serial.log" &&
+           grep -q "m16: user exit status=42" "$WORK/serial.log" &&
+           grep -q "m16: user null fault status=-15" "$WORK/serial.log" &&
+           grep -q "m16: isolation data a=161 b=178" "$WORK/serial.log" &&
+           grep -q "m16: isolation extra holder=126 probe=-15" "$WORK/serial.log" &&
+           grep -qE "m16: preemption counters=[0-9]+,[0-9]+ ticks=[0-9]+" "$WORK/serial.log" &&
+           grep -q "m16: user badptr rejected" "$WORK/serial.log" &&
+           grep -q "m16: user badptr status=0" "$WORK/serial.log" &&
+           grep -q "m16: aspace created=9 destroyed=9" "$WORK/serial.log" &&
            grep -q "M14 checks passed" "$WORK/serial.log" &&
            grep -q "M13 checks passed" "$WORK/serial.log" &&
            grep -q "M12 checks passed" "$WORK/serial.log" &&

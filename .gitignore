@@ -2,3 +2,5 @@
 zig-out/
 *.o
 *.elf
+# The M16 smoke test embeds this fixture, so it is part of the source tree.
+!src/user/demo.elf

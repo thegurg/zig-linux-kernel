@@ -3,8 +3,8 @@
 **Purpose:** describe what zig-kernel is, the constraints it is built under,
 which milestones are implemented, and how the source tree is organized.
 
-**Implementation status:** M0-M15 are implemented and validated through the
-QEMU test flow. M16-M20 are planned. See the per-subsystem documents for the
+**Implementation status:** M0-M16 are implemented and validated through the
+QEMU test flow. M17-M20 are planned. See the per-subsystem documents for the
 exact status of individual features.
 
 ## Project facts
@@ -16,7 +16,7 @@ exact status of individual features.
 | Boot path | Limine 12.9.4, UEFI, Limine boot protocol base revision 3 | [`src/limine.zig`](../../src/limine.zig) |
 | Kernel base | `0xffffffff80000000` (higher half) | [`linker.ld`](../../linker.ld) |
 | Default build | `ReleaseSafe` with LLVM (`exe.use_llvm = true`) | [`build.zig`](../../build.zig) |
-| Current version string | `0.17.0-m15` | [`src/main.zig`](../../src/main.zig) |
+| Current version string | `0.17.0-m16` | [`src/main.zig`](../../src/main.zig) |
 | Primary test platform | QEMU with KVM when available, TCG as fallback | [`tools/run.sh`](../../tools/run.sh) |
 
 ## Design constraints
@@ -60,7 +60,7 @@ exact status of individual features.
 | M13 | Per-CPU tick counters, AP LAPIC timers calibrated against the PIT, local deadline wakeups, timer-driven AP preemption | **IMPLEMENTED** |
 | M14 | ACPI/MADT discovery, ISO-resolved ISA IRQs, IOAPIC driver, CPU 0 LAPIC timer, PIC/PIT fallback, IOAPIC delivery and fallback boot tests | **IMPLEMENTED** |
 | M15 | Invariant-TSC detection/calibration, cross-CPU sync, monotonic nanosecond clock, tick fallback, deadline queue, sleep helpers, join, priorities with ageing | **IMPLEMENTED** |
-| M16 | Ring 3, per-task address spaces, syscalls, user-memory validation, minimal test-only ELF loader | **PLANNED** |
+| M16 | Ring 3, per-task low-half address spaces with a shared kernel high half, `int 0x80` syscall gate, `swapgs`, user-memory validation, minimal test-only ELF64 loader, CR3 switching and user-half teardown | **IMPLEMENTED** |
 | M17 | General ELF64 loading, W^X/NX, argv, spawn/wait/reap, process lifecycle | **PLANNED** |
 | M18 | PCI, virtio-blk polling, optional MSI-X, block layer, VFS/FAT/initramfs | **PLANNED** |
 | M19 | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP, loopback | **PLANNED** |
@@ -93,6 +93,8 @@ normal boot: CPU 0 and AP LAPIC timers at 100 Hz -> per-CPU ticks
              (PIT IRQ0 remains the fallback timer path)
 time: invariant TSC when available -> synchronized nanosecond clock
       (CPU 0 ticks remain the fallback clocksource)
+user task: private low-half PML4 + shared high half -> iretq to ring 3
+           int 0x80 -> swapgs -> syscall dispatcher -> validated user copy
 ```
 
 Every CPU runs its own scheduler state and tick counter. CPU 0 and every AP use
@@ -109,17 +111,19 @@ shootdown after releasing the page-table lock.
 | --- | --- |
 | [`boot/limine.conf`](../../boot/limine.conf) | Limine menu and kernel path. |
 | [`linker.ld`](../../linker.ld) | Higher-half layout and page-aligned `PT_LOAD` segments. |
-| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M15 self-tests. |
+| [`src/main.zig`](../../src/main.zig) | `_start`, `kmain`, panic, boot sequence, and M1c-M16 self-tests. |
 | [`src/limine.zig`](../../src/limine.zig) | Limine protocol structures and requests, including the RSDP request. |
 | [`src/acpi.zig`](../../src/acpi.zig) | RSDP/XSDT/RSDT/MADT parsing, table validation, and ISA IRQ-to-GSI resolution. |
 | [`src/console.zig`](../../src/console.zig) | Framebuffer text console with serial mirroring. |
 | [`src/font.zig`](../../src/font.zig) | 8x16 bitmap font. |
-| [`src/sched.zig`](../../src/sched.zig) | Per-CPU scheduler, priorities, deadline heaps, join, wait queues, mutex/condition, FPU state, idle tasks, IPIs, TLB shootdown. |
+| [`src/sched.zig`](../../src/sched.zig) | Per-CPU scheduler, priorities, deadline heaps, join, user-task creation, wait queues, mutex/condition, FPU state, idle tasks, IPIs, TLB shootdown. |
+| [`src/syscall.zig`](../../src/syscall.zig) | `int 0x80` ABI, saved-register layout, and syscall dispatcher. |
+| [`src/user.zig`](../../src/user.zig) | Minimal test-only ELF64 loader, user virtual layout, and image teardown. |
 | [`src/time.zig`](../../src/time.zig) | Invariant-TSC detection and calibration, cross-CPU synchronization, monotonic nanoseconds, tick fallback. |
 | [`src/sync.zig`](../../src/sync.zig) | Spinlocks and interrupt save/restore helpers. |
 | [`src/smp.zig`](../../src/smp.zig) | Limine MP bring-up, AP contexts, AP scheduler entry, SMP tests. |
 | [`src/memory/pmm.zig`](../../src/memory/pmm.zig) | Bitmap physical page allocator. |
-| [`src/memory/vmm.zig`](../../src/memory/vmm.zig) | 4-level page tables, kernel/HHDM mappings, CR3 switch. |
+| [`src/memory/vmm.zig`](../../src/memory/vmm.zig) | 4-level page tables, kernel/HHDM mappings, per-task address spaces, user copies, CR3 switch. |
 | [`src/memory/heap.zig`](../../src/memory/heap.zig) | IRQ-safe, lazily mapped first-fit kernel heap and `std.mem.Allocator` adapter. |
 | [`src/arch/x86_64/cpu.zig`](../../src/arch/x86_64/cpu.zig) | SSE/FPU enablement and GS-based per-CPU state. |
 | [`src/arch/x86_64/lapic.zig`](../../src/arch/x86_64/lapic.zig) | xAPIC/x2APIC detection, initialization, EOI, IPIs, and the periodic LAPIC timer. |
@@ -135,6 +139,7 @@ shootdown after releasing the page-table lock.
 | [`src/arch/x86_64/qemu.zig`](../../src/arch/x86_64/qemu.zig) | `isa-debug-exit` helper. |
 | [`src/test_root.zig`](../../src/test_root.zig) | Host-side unit-test root. |
 | [`tools/run.sh`](../../tools/run.sh) | Build the ESP directory and launch QEMU. |
+| [`tools/build-user.sh`](../../tools/build-user.sh) | Regenerate the checked-in `src/user/demo.elf` fixture with host `as`/`ld`. |
 | [`tools/genfont.py`](../../tools/genfont.py) | Regenerate `src/font.zig` from a system font. |
 | [`third_party/limine/`](../../third_party/limine) | Vendored Limine UEFI binary and notices. |
 

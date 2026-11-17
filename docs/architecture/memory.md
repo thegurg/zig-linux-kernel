@@ -94,6 +94,27 @@ kernel text virtual address translates to the expected physical address and
 that the HHDM offset translates to physical 0; a bad mapping returns
 `BadKernelMapping` instead of triple-faulting on the first instruction fetch.
 
+### Per-task address spaces
+
+`createAddressSpace()` allocates and zeroes a PML4, then copies the kernel
+PML4 entries `256..512` into it. The kernel image, HHDM, heap, and every other
+kernel mapping live in that shared high half, so a user task can enter the
+kernel without switching to a second set of kernel tables. The low half stays
+private; `mapPageIn` propagates the user bit through each intermediate table so
+a user leaf cannot hide behind a supervisor-only parent.
+
+`destroyAddressSpace(root)` walks only entries `0..256`, frees every present
+4 KiB leaf and page table, and finally frees the PML4. The caller must switch
+`CR3` to the kernel root first; the address-space teardown in `sched.zig` does
+exactly that. User address spaces are pinned to one CPU, so freeing their pages
+does not require a remote TLB shootdown.
+
+`copyFromUser`/`copyToUser` validate the low-half range before touching memory:
+the address must be below `0x0000_8000_0000_0000`, the length must not wrap past
+it, and every page must be present with the user bit. Copies bounce through the
+HHDM and split at page boundaries, so an invalid pointer returns
+`InvalidUserRange` or `NotMapped` instead of faulting the kernel.
+
 ### API
 
 | Function | Behavior |
@@ -106,6 +127,14 @@ that the HHDM offset translates to physical 0; a bad mapping returns
 | `currentPml4() u64` | Reads and masks `CR3`. |
 | `hhdmOffset() u64` | Returns the cached Limine HHDM offset. |
 | `kernelPhysical(virt) ?u64` | Converts a kernel-image virtual address to its physical address; only valid inside the image range. |
+| `kernelPml4() u64` | Returns the kernel's own PML4 physical address. |
+| `createAddressSpace() ?u64` | Allocates a private low half and shares the kernel high half; returns the PML4 physical address. |
+| `destroyAddressSpace(root) void` | Frees every low-half leaf, page table, and the PML4. The caller must switch `CR3` away first. |
+| `mapPageIn(root, virt, phys, flags) bool` / `mapUserPage(...)` | Maps one page in a specific address space; user mappings set the user bit at every level and are restricted to the low half. |
+| `translateIn(root, virt) ?u64` / `translateUserIn(root, virt) ?u64` | Walks a specific PML4; the user variant also requires the user bit at every level. |
+| `copyFromUser(dst, src) !void` / `copyToUser(dst, src) !void` | Validate a low-half range, translate it, and copy through the HHDM without faulting on bad pointers. |
+| `switchAddressSpace(root)` / `switchToKernelAddressSpace()` | Load a PML4 into `CR3`, or restore the kernel root before tearing a user address space down. |
+| `addressSpaceStats()` | Reports created and destroyed address-space counters. |
 | `markUncached(phys, size) bool` | Sets `cache_disable` on the HHDM 2 MiB chunk(s) covering a physical range. Used for framebuffer and LAPIC MMIO. |
 | `setTlbShootdownHandler(fn)` | Registers the scheduler callback invoked after an unmap releases the page-table lock. |
 

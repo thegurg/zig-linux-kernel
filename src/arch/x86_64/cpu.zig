@@ -75,6 +75,9 @@ pub fn initPerCpu(index: u32, lapic_id: u32) void {
     state.index = index;
     state.lapic_id = lapic_id;
     setGsBase(@intFromPtr(state));
+    // Ring-3 entry assumes KERNEL_GS_BASE holds the user GS value (zero) while
+    // running in the kernel; `swapgs` installs the per-CPU block on entry.
+    writeMsr(kernel_gs_base_msr, 0);
 }
 
 /// Index of the CPU executing this code. Valid after `initPerCpu`.
@@ -123,3 +126,5 @@ pub fn writeMsr(msr: u32, value: u64) void {
 fn setGsBase(value: u64) void {
     writeMsr(0xc0000101, value);
 }
+
+const kernel_gs_base_msr: u32 = 0xc0000102;

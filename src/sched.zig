@@ -22,6 +22,7 @@ const cpu = @import("arch/x86_64/cpu.zig");
 const lapic = @import("arch/x86_64/lapic.zig");
 const sync = @import("sync.zig");
 const time = @import("time.zig");
+const vmm = @import("memory/vmm.zig");
 
 pub const max_tasks = 32;
 pub const max_cpus = cpu.max_cpus;
@@ -69,6 +70,12 @@ const no_waiter: u32 = ~@as(u32, 0);
 pub const Task = struct {
     name: []const u8,
     rsp: u64,
+    /// PML4 installed while this task runs. Kernel tasks share the kernel root;
+    /// user tasks own a private low half with the same high half.
+    pml4_phys: u64,
+    /// RSP0 written to this CPU's TSS before the task runs.
+    kernel_stack_top: u64,
+    is_user: bool,
     state: TaskState,
     ticks: u64,
     wake_tick: u64,
@@ -477,6 +484,9 @@ pub fn init() void {
     tasks[0] = .{
         .name = "boot",
         .rsp = 0,
+        .pml4_phys = vmm.kernelPml4(),
+        .kernel_stack_top = gdt.kernelStackTop(),
+        .is_user = false,
         .state = .running,
         .ticks = 0,
         .wake_tick = 0,
@@ -557,6 +567,7 @@ fn createLocked(
     joinable: bool,
 ) ?*Task {
     const index = findSlotLocked() orelse return null;
+    const top = stackTop(stack) orelse return null;
     const rsp = initialFrame(stack, entry) orelse return null;
     const id = next_id;
     next_id +%= 1;
@@ -564,6 +575,76 @@ fn createLocked(
     tasks[index] = .{
         .name = name,
         .rsp = rsp,
+        .pml4_phys = vmm.kernelPml4(),
+        .kernel_stack_top = top,
+        .is_user = false,
+        .state = .ready,
+        .ticks = 0,
+        .wake_tick = 0,
+        .wake_reason = .none,
+        .fpu_state = fpu_template,
+        .priority = priority,
+        .ready_tick = @atomicLoad(u64, &cpu_ticks[target_cpu], .monotonic),
+        .exit_status = 0,
+        .joinable = joinable,
+        .join_reaped = !joinable,
+        .join_waiter_id = no_waiter,
+        .id = id,
+        .index = index,
+        .cpu = target_cpu,
+        .is_idle = false,
+    };
+    if (index == task_count) task_count += 1;
+
+    if (target_cpu != cpu.currentIndex()) sendRescheduleLocked(target_cpu);
+    return &tasks[index];
+}
+
+/// Create a ring-3 task. The caller owns the address space, user pages, and the
+/// kernel stack. `entry` and `user_stack_top` are low-half user addresses; the
+/// task starts with `arg` in RDI.
+pub fn createUser(
+    name: []const u8,
+    entry: u64,
+    kernel_stack: []u8,
+    pml4_phys: u64,
+    user_stack_top: u64,
+    arg: u64,
+    options: CreateOptions,
+) ?*Task {
+    const target_cpu = options.cpu orelse cpu.currentIndex();
+    if (!initialized or target_cpu >= max_cpus) return null;
+    if (pml4_phys == 0 or entry == 0 or user_stack_top == 0) return null;
+    if (entry >= vmm.user_max_address or user_stack_top > vmm.user_max_address) return null;
+
+    const guard = task_lock.acquire();
+    defer guard.release();
+    return createUserLocked(target_cpu, name, entry, kernel_stack, pml4_phys, user_stack_top, arg, options.priority, options.joinable);
+}
+
+fn createUserLocked(
+    target_cpu: u32,
+    name: []const u8,
+    entry: u64,
+    kernel_stack: []u8,
+    pml4_phys: u64,
+    user_stack_top: u64,
+    arg: u64,
+    priority: Priority,
+    joinable: bool,
+) ?*Task {
+    const index = findSlotLocked() orelse return null;
+    const top = stackTop(kernel_stack) orelse return null;
+    const rsp = initialFrameUser(kernel_stack, entry, user_stack_top, arg) orelse return null;
+    const id = next_id;
+    next_id +%= 1;
+
+    tasks[index] = .{
+        .name = name,
+        .rsp = rsp,
+        .pml4_phys = pml4_phys,
+        .kernel_stack_top = top,
+        .is_user = true,
         .state = .ready,
         .ticks = 0,
         .wake_tick = 0,
@@ -600,6 +681,7 @@ pub fn initCpu(index: u32, lapic_id: u32) bool {
     cpu_state[index].next_scan = idle.index;
     deadlines[index] = .{};
     idle.state = .running;
+    gdt.setKernelStack(index, idle.kernel_stack_top);
     _ = @atomicRmw(u64, &online_mask, .Or, @as(u64, 1) << @intCast(index), .release);
     cpu.setFpuState(@intFromPtr(&idle.fpu_state));
     return true;
@@ -713,18 +795,57 @@ pub fn exitCurrent(saved_rsp: u64) u64 {
     defer guard.release();
 
     const current_task = cpu_state[index].current orelse return saved_rsp;
-    current_task.rsp = saved_rsp;
     if (current_task.is_idle) haltForever();
-
-    current_task.state = .finished;
-    current_task.exit_status = cpu_state[index].exit_status;
+    const status = cpu_state[index].exit_status;
     cpu_state[index].exit_status = 0;
+    return finishTaskLocked(index, current_task, saved_rsp, status);
+}
+
+/// Exit the current ring-3 task with an explicit status. The user half is torn
+/// down before the next task is resumed.
+pub fn exitUser(saved_rsp: u64, status: i32) u64 {
+    if (!initialized) return saved_rsp;
+
+    const index = cpu.currentIndex();
+    const guard = task_lock.acquire();
+    defer guard.release();
+
+    const current_task = cpu_state[index].current orelse return saved_rsp;
+    if (current_task.is_idle) haltForever();
+    return finishTaskLocked(index, current_task, saved_rsp, status);
+}
+
+/// Terminate a user task after a CPU exception. Kernel faults still halt.
+pub fn exitUserFault(saved_rsp: u64, status: i32) u64 {
+    return exitUser(saved_rsp, status);
+}
+
+fn finishTaskLocked(index: u32, task: *Task, saved_rsp: u64, status: i32) u64 {
+    task.rsp = saved_rsp;
+    task.state = .finished;
+    task.exit_status = status;
+
+    if (task.is_user) releaseUserAddressSpaceLocked(task);
+
     _ = @atomicRmw(u64, &finished_counter, .Add, 1, .monotonic);
-    wakeJoinWaiterLocked(current_task);
+    wakeJoinWaiterLocked(task);
 
     if (pickNextLocked(index)) |next| return switchTaskLocked(index, next);
     const idle = cpu_state[index].idle orelse haltForever();
     return switchTaskLocked(index, idle);
+}
+
+/// Free a finished user task's low half. CR3 must stop pointing at the root
+/// before its PML4 and page tables are returned to the PMM. User address spaces
+/// are private and pinned to one CPU, so no remote TLB shootdown is needed.
+fn releaseUserAddressSpaceLocked(task: *Task) void {
+    const root = task.pml4_phys;
+    if (root != 0 and root != vmm.kernelPml4()) {
+        vmm.switchToKernelAddressSpace();
+        vmm.destroyAddressSpace(root);
+    }
+    task.pml4_phys = vmm.kernelPml4();
+    task.is_user = false;
 }
 
 pub fn sleep(duration: u64) void {
@@ -763,6 +884,16 @@ pub fn sleepMs(ms: u64) void {
 /// Sleep for at least `ns` nanoseconds, rounded up to the next scheduler tick.
 pub fn sleepNs(ns: u64) void {
     sleep(time.nsToTicks(ns));
+}
+
+/// Syscall helper: block the current task for `ms` milliseconds, returning the
+/// saved-register base to resume.
+pub fn sleepMsCurrent(saved_rsp: u64, ms: u64) u64 {
+    if (!initialized) return saved_rsp;
+    const duration = time.msToTicks(ms);
+    if (duration == 0) return saved_rsp;
+    cpu_state[cpu.currentIndex()].sleep_request = duration;
+    return sleepCurrent(saved_rsp);
 }
 
 pub fn block() void {
@@ -1122,6 +1253,12 @@ pub fn tlbInterrupt() void {
     }
 }
 
+/// Task ID of the calling CPU's current task, or zero when none is installed.
+pub fn currentId() u32 {
+    const task = cpu_state[cpu.currentIndex()].current orelse return 0;
+    return task.id;
+}
+
 fn currentTask() ?*Task {
     return cpu_state[cpu.currentIndex()].current;
 }
@@ -1186,6 +1323,8 @@ fn pickNextLocked(index: u32) ?*Task {
 fn switchTaskLocked(index: u32, next: *Task) u64 {
     next.state = .running;
     cpu_state[index].current = next;
+    if (next.pml4_phys != 0) vmm.switchAddressSpace(next.pml4_phys);
+    gdt.setKernelStack(index, next.kernel_stack_top);
     cpu.setFpuState(@intFromPtr(&next.fpu_state));
     return next.rsp;
 }
@@ -1194,6 +1333,7 @@ fn ensureIdleLocked(index: u32) ?*Task {
     if (cpu_state[index].idle) |idle| return idle;
 
     const slot = findSlotLocked() orelse return null;
+    const top = stackTop(idle_stacks[index][0..]) orelse return null;
     const rsp = initialFrame(idle_stacks[index][0..], idleEntry) orelse return null;
     const id = next_id;
     next_id +%= 1;
@@ -1201,6 +1341,9 @@ fn ensureIdleLocked(index: u32) ?*Task {
     tasks[slot] = .{
         .name = "idle",
         .rsp = rsp,
+        .pml4_phys = vmm.kernelPml4(),
+        .kernel_stack_top = top,
+        .is_user = false,
         .state = .idle,
         .ticks = 0,
         .wake_tick = 0,
@@ -1368,12 +1511,17 @@ fn restoreFpu(state: *FpuState) void {
         });
 }
 
-fn initialFrame(stack: []u8, entry: Entry) ?u64 {
+fn stackTop(stack: []u8) ?u64 {
     if (stack.len < 512) return null;
 
     const start = @intFromPtr(stack.ptr);
     const top = (start + stack.len) & ~@as(usize, 15);
     if (top < start + 256) return null;
+    return top;
+}
+
+fn initialFrame(stack: []u8, entry: Entry) ?u64 {
+    const top = stackTop(stack) orelse return null;
 
     const entry_rsp = top - 8;
     const base = entry_rsp - initial_frame_qwords * @sizeOf(u64);
@@ -1388,5 +1536,26 @@ fn initialFrame(stack: []u8, entry: Entry) ?u64 {
     frame[saved_registers + 4] = 0x202;
     frame[saved_registers + 5] = entry_rsp;
     frame[saved_registers + 6] = @as(u64, gdt.kernel_data_selector);
+    return base;
+}
+
+/// Build a 22-qword frame whose `iretq` lands in ring 3 at `entry` with
+/// `user_rsp` and the initial argument in RDI. The frame itself lives on the
+/// task's kernel stack, which is shared through every address space's high half.
+fn initialFrameUser(stack: []u8, entry: u64, user_rsp: u64, arg: u64) ?u64 {
+    const top = stackTop(stack) orelse return null;
+
+    const entry_rsp = top - 8;
+    const base = entry_rsp - initial_frame_qwords * @sizeOf(u64);
+    const frame: [*]u64 = @ptrFromInt(base);
+    @memset(frame[0..initial_frame_qwords], 0);
+
+    // r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, ...
+    frame[9] = arg;
+    frame[saved_registers + 2] = entry;
+    frame[saved_registers + 3] = @as(u64, gdt.user_code_selector) | 3;
+    frame[saved_registers + 4] = 0x202;
+    frame[saved_registers + 5] = user_rsp;
+    frame[saved_registers + 6] = @as(u64, gdt.user_data_selector) | 3;
     return base;
 }
