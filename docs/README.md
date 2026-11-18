@@ -41,7 +41,7 @@ in the [roadmap](development/roadmap.md).
 | [Building](development/building.md) | Toolchain requirements, build options, kernel variants, and the QEMU harness. |
 | [Testing](development/testing.md) | Host tests, QEMU smoke, fault, and fallback-boot tests, assertions, exit codes, and recorded results. |
 | [Technical debt and known issues](development/technical-debt.md) | Correctness hazards, unsafe assumptions, and current limitations. |
-| [Roadmap](development/roadmap.md) | M14 results and the deferred work planned beyond it. |
+| [Roadmap](development/roadmap.md) | M16 results and the deferred work planned beyond it. |
 
 ## Suggested reading paths
 

@@ -419,12 +419,54 @@ m15: fallback source=ticks monotonic=1 sleep_ns=50000000
 selftest: M15 checks passed
 ```
 
+### M16 ring-3 and address-space checks
+
+`selftestM16()` runs after M15 on the BSP. It creates ring-3 tasks pinned to
+CPU 0, each with its own private low half and a 16 KiB kernel stack from
+`main.zig`:
+
+1. loads the embedded fixture, runs mode 0, and requires the serial
+   `m16: user write ok`, `m16: user sleep ok`, and exit status 42;
+2. runs mode 1, which dereferences NULL, and requires status `-15` while the BSP
+   continues;
+3. starts two tasks that read their private data page at `0x500000` and requires
+   the distinct values `0xA1` and `0xB2`;
+4. starts a holder that keeps a `0x600000` mapping alive through `sleepMs(100)`
+   and a prober without that mapping; the prober faults with `-15`, the holder
+   returns `0x7E`;
+5. starts two CPU-bound user tasks and requires both private counters to advance
+   under at least one timer tick with no syscalls;
+6. runs mode 4, which passes an unmapped pointer and a non-canonical pointer to
+   `write`; both must return `-EFAULT` and the task must exit 0;
+7. compares `vmm.addressSpaceStats()` and requires every created address space to
+   be destroyed. The expected marker is `m16: aspace created=9 destroyed=9`.
+
+The selftest log is:
+
+```text
+m16: user write ok
+m16: user sleep ok
+m16: user exit status=42
+m16: user null fault status=-15
+m16: isolation data a=161 b=178
+m16: isolation extra holder=126 probe=-15
+m16: preemption counters=36074295,43085469 ticks=3
+m16: user badptr rejected
+m16: user badptr status=0
+m16: aspace created=9 destroyed=9
+selftest: M16 checks passed
+```
+
+The M16 checks are pinned to CPU 0 so they run on every `ZIG_KERNEL_SMP`
+configuration, including the no-AP path. The APs remain in their idle loops
+while the user tasks run.
+
 ## Boot-mode behavior
 
 | Mode | AP behavior |
 | --- | --- |
 | Normal kernel | `kmain` parses ACPI, initializes the IOAPICs, calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. The BSP then synchronizes TSC offsets. CPU 0 starts its own LAPIC timer. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, M14, and M15 tests. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, M14, M15, and M16 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
 | Fallback kernel | `kmain` follows the normal path but `force_pit` makes CPU 0 select PIT IRQ0 instead of its LAPIC timer, and the tick clocksource instead of the TSC. |
 
@@ -438,7 +480,7 @@ timer: source=lapic
 
 ## Recorded validation
 
-M15 validation ran the full matrix:
+M16 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -446,16 +488,19 @@ M15 validation ran the full matrix:
 - `ZIG_KERNEL_SMP=2 zig build test`: passed;
 - `ZIG_KERNEL_SMP=1 zig build test`: passed;
 - `zig build -Doptimize=Debug test`: passed;
-- the default smoke result included `acpi: madt revision=3 ...`,
-  `ioapic: id=0 version=17 entries=24 gsi_base=0`, `m14: irq0 gsi=2 ...`,
-  `m14: ioapic ticks=5`, `timer: source=lapic`, `m14: cpu0 sleep ticks=5`,
-  `m14: cpu0 preempted=1`, and the M15 time/join/priority markers;
-- the TCG run selected `source=ticks reason=non_invariant` and still passed;
+- every run included the M15 time/join/priority markers and the M16 markers
+  `m16: user write ok`, `m16: user sleep ok`, `m16: user exit status=42`,
+  `m16: user null fault status=-15`, `m16: isolation data a=161 b=178`,
+  `m16: isolation extra holder=126 probe=-15`,
+  `m16: user badptr rejected`, `m16: user badptr status=0`, and
+  `m16: aspace created=9 destroyed=9`;
+- the TCG run selected the tick clocksource and still passed every M15 and M16
+  check;
 - the `force_pit` image booted through `timer: source=pit, 100 Hz, IRQ0
   unmasked` and the `--test-boot` harness accepted it;
 - `zig fmt --check src build.zig` and `git diff --check`: passed.
 
-The earlier M11-M14 validation and the M15 roadmap record are in the
+The earlier M11-M15 validation and roadmap records are in the
 [roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
@@ -475,10 +520,11 @@ The earlier M11-M14 validation and the M15 roadmap record are in the
 | Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
 | Per-CPU tick counters | **IMPLEMENTED** | LAPIC timers on CPU 0 and APs; PIT fallback for CPU 0. |
 | Per-CPU LAPIC timer | **IMPLEMENTED** | Vector 242; calibrated against PIT channel 2. |
-| Timer-driven preemption | **IMPLEMENTED** | CPU 1 AP test plus the M14 CPU 0 preemption test. |
+| Timer-driven preemption | **IMPLEMENTED** | CPU 1 AP test plus the M14 CPU 0 preemption test and the M16 user-task preemption test. |
+| Ring-3 tasks on an SMP kernel | **IMPLEMENTED** | User tasks are pinned to one CPU; their low halves are private and torn down locally. |
 | ACPI/MADT discovery | **IMPLEMENTED** | RSDP/XSDT/RSDT/MADT validation; BSP-only. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection entries, mask/unmask, ISA IRQ0 delivery test. |
-| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M15; deferred to M18. |
+| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M16; deferred to M18. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |
 
 ## Related documentation

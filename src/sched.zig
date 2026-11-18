@@ -792,27 +792,48 @@ pub fn exitCurrent(saved_rsp: u64) u64 {
 
     const index = cpu.currentIndex();
     const guard = task_lock.acquire();
-    defer guard.release();
 
-    const current_task = cpu_state[index].current orelse return saved_rsp;
-    if (current_task.is_idle) haltForever();
+    const current_task = cpu_state[index].current orelse {
+        guard.release();
+        return saved_rsp;
+    };
+    if (current_task.is_idle) {
+        guard.release();
+        haltForever();
+    }
     const status = cpu_state[index].exit_status;
     cpu_state[index].exit_status = 0;
-    return finishTaskLocked(index, current_task, saved_rsp, status);
+
+    var released_root: u64 = 0;
+    const next_rsp = finishTaskLocked(index, current_task, saved_rsp, status, &released_root);
+    guard.release();
+    destroyReleasedAddressSpace(released_root);
+    return next_rsp;
 }
 
-/// Exit the current ring-3 task with an explicit status. The user half is torn
-/// down before the next task is resumed.
+/// Exit the current ring-3 task with an explicit status. The user half is
+/// detached under `task_lock`, then destroyed after the lock is released so the
+/// teardown never acquires `pmm.lock` while holding `task_lock`.
 pub fn exitUser(saved_rsp: u64, status: i32) u64 {
     if (!initialized) return saved_rsp;
 
     const index = cpu.currentIndex();
     const guard = task_lock.acquire();
-    defer guard.release();
 
-    const current_task = cpu_state[index].current orelse return saved_rsp;
-    if (current_task.is_idle) haltForever();
-    return finishTaskLocked(index, current_task, saved_rsp, status);
+    const current_task = cpu_state[index].current orelse {
+        guard.release();
+        return saved_rsp;
+    };
+    if (current_task.is_idle) {
+        guard.release();
+        haltForever();
+    }
+
+    var released_root: u64 = 0;
+    const next_rsp = finishTaskLocked(index, current_task, saved_rsp, status, &released_root);
+    guard.release();
+    destroyReleasedAddressSpace(released_root);
+    return next_rsp;
 }
 
 /// Terminate a user task after a CPU exception. Kernel faults still halt.
@@ -820,12 +841,18 @@ pub fn exitUserFault(saved_rsp: u64, status: i32) u64 {
     return exitUser(saved_rsp, status);
 }
 
-fn finishTaskLocked(index: u32, task: *Task, saved_rsp: u64, status: i32) u64 {
+fn finishTaskLocked(
+    index: u32,
+    task: *Task,
+    saved_rsp: u64,
+    status: i32,
+    released_root: *u64,
+) u64 {
     task.rsp = saved_rsp;
     task.state = .finished;
     task.exit_status = status;
 
-    if (task.is_user) releaseUserAddressSpaceLocked(task);
+    released_root.* = detachUserAddressSpaceLocked(task);
 
     _ = @atomicRmw(u64, &finished_counter, .Add, 1, .monotonic);
     wakeJoinWaiterLocked(task);
@@ -835,17 +862,24 @@ fn finishTaskLocked(index: u32, task: *Task, saved_rsp: u64, status: i32) u64 {
     return switchTaskLocked(index, idle);
 }
 
-/// Free a finished user task's low half. CR3 must stop pointing at the root
-/// before its PML4 and page tables are returned to the PMM. User address spaces
-/// are private and pinned to one CPU, so no remote TLB shootdown is needed.
-fn releaseUserAddressSpaceLocked(task: *Task) void {
+/// Switch to the kernel root and return the private root to free later. The
+/// caller must not free it while holding `task_lock`: `destroyAddressSpace`
+/// takes `pmm.lock`, and the documented lock order places the PMM before the
+/// scheduler.
+fn detachUserAddressSpaceLocked(task: *Task) u64 {
     const root = task.pml4_phys;
-    if (root != 0 and root != vmm.kernelPml4()) {
-        vmm.switchToKernelAddressSpace();
-        vmm.destroyAddressSpace(root);
-    }
     task.pml4_phys = vmm.kernelPml4();
     task.is_user = false;
+
+    if (root == 0 or root == vmm.kernelPml4()) return 0;
+    vmm.switchToKernelAddressSpace();
+    return root;
+}
+
+/// Free a detached low half. The private address space is pinned to this CPU
+/// and is no longer installed in CR3, so no remote TLB shootdown is needed.
+fn destroyReleasedAddressSpace(root: u64) void {
+    if (root != 0) vmm.destroyAddressSpace(root);
 }
 
 pub fn sleep(duration: u64) void {

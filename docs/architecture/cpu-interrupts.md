@@ -60,9 +60,15 @@ layout now reorders fields, and the assembly depends on these exact offsets.
 - `%gs:0` initially points at `boot_fpu_state`, a scratch FXSAVE area.
   `sched.init` and `sched.initCpu` replace it with the current task's FPU area.
 - `cpu.currentIndex()` and `cpu.lapicId()` are `movl %gs:8` / `movl %gs:12`.
+- `cpu.initPerCpu` also clears `IA32_KERNEL_GS_BASE` (`0xc0000102`) to zero.
+  The kernel invariant is `GS_BASE = per-CPU block` and `KERNEL_GS_BASE = 0`
+  while executing in the kernel; ring-3 code may use `GS` freely. Entry from
+  ring 3 executes `swapgs` before dereferencing `%gs:0`, and the resume path
+  executes `swapgs` again before returning to a user frame.
 
-The GS base is not changed by `iretq` or by task switches; only the pointer at
-`%gs:0` changes per task.
+The GS base is not changed by `iretq` or by kernel task switches; only the
+pointer at `%gs:0` changes per task. A user task's GS value is preserved by the
+`swapgs` pair rather than by saving an MSR on every switch.
 
 ## GDT and TSS
 
@@ -74,11 +80,13 @@ long-mode GDT:
 | 0 | `0x00` | Null descriptor. |
 | 1 | `0x08` | 64-bit kernel code, present, DPL0, `L=1`. |
 | 2 | `0x10` | Kernel data, present, DPL0, writable, `D/B=1`. |
-| 3.. | `0x18 + cpu * 0x10` | Low/high TSS descriptor pair for each CPU. |
+| 3 | `0x18` | 64-bit user code, present, DPL3, `L=1`. |
+| 4 | `0x20` | User data, present, DPL3, writable, `D/B=1`. |
+| 5.. | `0x28 + cpu * 0x10` | Low/high TSS descriptor pair for each CPU. |
 
-- `max_cpus = 8`, so the GDT has `3 + 2 * 8 = 19` qwords.
-- CPU 0 is the BSP; its TSS selector is `0x18`. CPU N uses
-  `0x18 + N * 0x10`.
+- `max_cpus = 8`, so the GDT has `5 + 2 * 8 = 21` qwords.
+- CPU 0 is the BSP; its TSS selector is `0x28`. CPU N uses
+  `0x28 + N * 0x10`.
 - Each TSS is 104 bytes and is built byte-wise because fields are unaligned.
   `RSP0` is at offset `0x04`, `IST1` at `0x24`, and the I/O map base at `0x66`
   (`0xffff`, meaning no I/O permission bitmap).
@@ -92,7 +100,9 @@ long-mode GDT:
 `ltr` with that CPU's TSS selector. Because loading a data-segment selector
 changes the GS base state in long mode, callers must install the per-CPU block
 with `cpu.initPerCpu` **after** `gdt.load`. `gdt.setKernelStack(cpu, top)`
-updates the TSS `RSP0` field; APs use it to install their private stack.
+updates the TSS `RSP0` field; APs use it to install their private stack, and the
+scheduler rewrites it on every task switch so a ring-3 interrupt lands on the
+current task's kernel stack.
 
 ## IDT and gate layout
 
@@ -106,11 +116,12 @@ of 16-byte gates. `idt.init()` installs:
 | 48-54 | `sched_stub_table` | Scheduler software interrupts and join. |
 | 240, 241, 243 | `ipi_stub_table[0..3]` | Reschedule, TLB-shootdown, and TSC-sync IPIs. |
 | 242 | `timer_stub_table[0]` | Periodic LAPIC timer on every CPU, including CPU 0. |
+| 128 | `syscall_stub_table[0]` | DPL3 `int 0x80` syscall gate. |
 | 255 | `ipi_stub_table[3]` | LAPIC spurious-interrupt gate. |
 
-Every gate is a present, DPL0, 64-bit interrupt gate (`type_attr = 0x8e`).
-`idt.load()` executes `lidt`; the BSP fills the table, and APs load the same
-shared table.
+Every gate is a present, 64-bit interrupt gate (`type_attr = 0x8e`), except the
+syscall gate, which sets DPL3 (`0xee`). `idt.load()` executes `lidt`; the BSP
+fills the table, and APs load the same shared table.
 
 ### Scheduler software interrupts
 
@@ -123,6 +134,7 @@ shared table.
 | 52 | `WaitQueue.wait()` | `sched.waitQueueCurrent` |
 | 53 | `WaitQueue.waitTimeout(ticks)` | `sched.waitTimeoutCurrent` |
 | 54 | `sched.join(task, timeout_ms)` | `sched.joinCurrent` |
+| 128 | `int 0x80` from ring 3 | `syscall.dispatch` |
 
 ## Interrupt entry and exit
 
@@ -142,13 +154,16 @@ Each stub normalizes the stack to:
 `isr_common` then:
 
 1. executes `cld`;
-2. pushes all 15 general-purpose registers;
-3. reads `%gs:0`; if non-zero, executes `fxsave64` into that 512-byte area;
-4. aligns `RSP` to 16 bytes, passes the frame pointer and saved-register base to
+2. tests the interrupted `CS` at `[rsp + 24]`; if it is a ring-3 selector, it
+   executes `swapgs` so `%gs:0` names the per-CPU block again;
+3. pushes all 15 general-purpose registers;
+4. reads `%gs:0`; if non-zero, executes `fxsave64` into that 512-byte area;
+5. aligns `RSP` to 16 bytes, passes the frame pointer and saved-register base to
    `isr_dispatch`, and calls it;
-5. takes the returned saved-register base, re-reads `%gs:0`, restores that FPU
+6. takes the returned saved-register base, re-reads `%gs:0`, restores that FPU
    area with `fxrstor64`, pops the 15 registers, drops the vector and error
-   code, and executes `iretq`.
+   code, and, when returning to a ring-3 frame, executes `swapgs` immediately
+   before `iretq`.
 
 The FPU save happens before the dispatcher can use SIMD registers. The restore
 happens immediately before `iretq`, after the dispatcher has finished. Because
@@ -194,19 +209,27 @@ this order:
 4. **Timer 242**: send a LAPIC EOI and return `sched.timerInterrupt(saved_rsp)`.
    This is the timer path on CPU 0 and every AP. An ISA IRQ routed through the
    IOAPIC uses this vector too, so it is acknowledged with a LAPIC EOI only.
-5. **Spurious vector 255**: return `saved_rsp` without an EOI.
-6. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
+5. **Syscall 128**: call `syscall.dispatch(saved_rsp)`. The dispatcher reads the
+   number and arguments from the saved frame, validates any user buffer with the
+   VMM, and either rewrites `RAX` and returns the same frame or calls a scheduler
+   exit/sleep/yield entry that selects a different frame.
+6. **Spurious vector 255**: return `saved_rsp` without an EOI.
+7. **IRQ 32-47**: send a PIC EOI and a LAPIC EOI. IRQ0 returns
    `sched.timerInterrupt(saved_rsp)`; all other IRQs return `saved_rsp`
    unchanged. This path is used only for legacy PIC-delivered interrupts.
-7. **Scheduler vectors 48-54**: call the matching scheduler entry and return
+8. **Scheduler vectors 48-54**: call the matching scheduler entry and return
    the saved-register base it selects.
-8. **Other exceptions**: print vector number and name, error code, RIP, CS,
+9. **Other exceptions**: print vector number and name, error code, RIP, CS,
    RFLAGS, and (for user-mode frames) RSP/SS.
-9. For vector 14 (`#PF`), read `CR2` and print it.
-10. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
+10. For vector 14 (`#PF`), read `CR2` and print it.
+11. If the frame came from ring 3, terminate only the current task: print
+    `user fault: task=<id>, terminating task`, convert the vector to
+    `-(vector + 1)` (a user `#PF` is `-15`), and return
+    `sched.exitUserFault(saved_rsp, status)`. Kernel faults still halt.
+12. For vector 3 (`int3`), print `breakpoint handled, resuming` and return
     `saved_rsp`; this is the path both the BSP smoke test and the AP exception
     test use.
-11. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
+13. Any other exception is fatal: print `fatal exception, halting` and exit QEMU
     with the failure code.
 
 The dispatcher uses the global console, which has its own IRQ-safe message
@@ -374,10 +397,13 @@ the tick fallback.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | SSE/FPU enablement | **IMPLEMENTED** | BSP in `kmain`; APs in the assembly stub before Zig code. |
-| Per-CPU GS-based state | **IMPLEMENTED** | Extern layout with `%gs:0/8/12` offsets checked at compile time. |
-| GDT/TSS with per-CPU #DF IST | **IMPLEMENTED** | `max_cpus = 8`; 8 KiB #DF stacks. |
+| Per-CPU GS-based state | **IMPLEMENTED** | Extern layout with `%gs:0/8/12` offsets checked at compile time; `KERNEL_GS_BASE` cleared. |
+| GDT/TSS with per-CPU #DF IST | **IMPLEMENTED** | `max_cpus = 8`; 8 KiB #DF stacks; DPL3 user code/data selectors. |
 | IDT and exception dispatch | **IMPLEMENTED** | Vectors 0-31, CR2 reporting for #PF. |
 | IRQ stubs and full GPR save | **IMPLEMENTED** | 15 GPRs; scheduler resumption via returned base. |
+| Ring-3 `int 0x80` gate | **IMPLEMENTED** | DPL3 gate 128; `swapgs` on entry and before `iretq`. |
+| Per-task TSS `RSP0` | **IMPLEMENTED** | Scheduler writes the current task's 16 KiB kernel-stack top on every switch. |
+| User-fault termination | **IMPLEMENTED** | Ring-3 exceptions exit only the task with `-(vector + 1)`; kernel faults halt. |
 | Interrupt-time FPU save/restore | **IMPLEMENTED** | Per-CPU `%gs:0`; AP `int3` test. |
 | PIC remap/mask/EOI | **IMPLEMENTED** | Only IRQ0 enabled; legacy fallback path. |
 | PIT at 100 Hz | **IMPLEMENTED** | Channel 0, mode 3; fallback CPU 0 timer source. |
@@ -395,7 +421,6 @@ the tick fallback.
 | IOAPIC driver and routing | **IMPLEMENTED** | Uncached HHDM mapping, mask-all init, redirection read/write, readback. |
 | IOAPIC EOI rule | **IMPLEMENTED** | Fixed IOAPIC-delivered vectors use a LAPIC EOI only. |
 | MSI/MSI-X and general PCI routing | **PLANNED** | Not implemented; belongs to M18. |
-| User-mode interrupt frames | **PLANNED** | `from_user` reporting exists, but user mode is not implemented. |
 
 ## Related documentation
 

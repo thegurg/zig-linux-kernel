@@ -47,6 +47,9 @@ documented in [CPU and interrupts](cpu-interrupts.md#timekeeping-and-the-tsc).
 | --- | --- | --- |
 | `name` | `[]const u8` | Diagnostic name. |
 | `rsp` | `u64` | Saved stack pointer / saved-register frame base. |
+| `pml4_phys` | `u64` | Address space installed while this task runs; the kernel root for kernel tasks. |
+| `kernel_stack_top` | `u64` | TSS `RSP0` value installed before the task runs. |
+| `is_user` | `bool` | True for a ring-3 task; its low half is private. |
 | `state` | `TaskState` | `idle`, `ready`, `running`, `blocked`, or `finished`. |
 | `ticks` | `u64` | Number of timer ticks this task has run. |
 | `wake_tick` | `u64` | Deadline for sleep/timed wait; `~0` for indefinite block. |
@@ -86,6 +89,10 @@ is already running on the kernel stack.
 User tasks use caller-owned stacks; the selftests use static 16 KiB stacks in
 [`src/main.zig`](../../src/main.zig) and
 [`src/smp.zig`](../../src/smp.zig).
+
+A ring-3 task has two stacks: a 16 KiB kernel stack used by `int 0x80`,
+interrupts, and the initial `iretq` frame, and a four-page user stack mapped in
+the private low half. Kernel tasks use their caller-owned stack for both roles.
 
 ## Per-CPU state
 
@@ -175,6 +182,26 @@ exits cleanly instead of `ret`-ing into uninitialized stack memory. The
 trampoline starts with `RSP % 16 == 0` rather than the usual callee alignment,
 so it is assembly-only and does not call Zig code before entering the
 scheduler.
+
+### Creating a user task
+
+`sched.createUser(name, entry, kernel_stack, pml4_phys, user_stack_top, arg,
+options)` creates a ring-3 task pinned to the selected CPU (CPU 0 by default).
+It validates that the address space and both entry points are in the low half,
+then builds `initialFrameUser`, a 22-qword frame whose `iretq` target is
+`CS = 0x1b`, `SS = 0x23`, `RIP = entry`, `RSP = user_stack_top`, and
+`RDI = arg` (the test mode). The frame itself lives on the supplied kernel
+stack, which is shared through the high half of every address space.
+
+The caller owns the address space, the mapped user pages, and the kernel stack.
+`sched` does not copy or validate the ELF image; that is `src/user.zig`'s
+test-only job. Finished user tasks are torn down by the scheduler, not by the
+caller.
+
+`switchTaskLocked` installs `next.pml4_phys` in `CR3`, writes
+`next.kernel_stack_top` to the TSS `RSP0`, and then restores FPU state. Kernel
+tasks store the kernel PML4, so switching to and from them is a no-op at the
+page-table level.
 
 ### Slot reuse
 
@@ -273,6 +300,16 @@ runnable task. If none exists, it switches to this CPU's idle task. If an idle
 task itself exits, the CPU halts forever. `sched.exit()` is declared `noreturn`
 and halts if the software interrupt ever returns; `sched.exitWith(status)` sets
 the status that `join` reports.
+
+Ring-3 exits go through `sched.exitUser(saved_rsp, status)` or
+`sched.exitUserFault(saved_rsp, status)`. `finishTaskLocked` detaches the
+private PML4, switches `CR3` to the kernel root, and marks the task finished
+while `task_lock` is held. The detached low half is destroyed by
+`destroyReleasedAddressSpace` only after the lock is released, so teardown never
+takes `pmm.lock` under `task_lock`. Because user address spaces are pinned to one
+CPU, this teardown needs no remote TLB shootdown. A user exception is converted
+to status `-(vector + 1)`; a user `#PF` therefore exits with `-15`. Kernel faults
+still take the fatal path.
 
 A non-joinable finished slot is immediately reusable. A joinable slot stays
 allocated with its status until `join` consumes it or `detach` releases it, so a
@@ -446,6 +483,12 @@ The scheduler is exercised by the selftest image described in
 | M15 join | A worker exits with status 42 and is joined; an already-finished task returns status 7; a repeated join is `invalid`; a blocked task times out at 50 ms and is then woken and joined with status 9. |
 | M15 priorities | Three tasks at `low`/`normal`/`high` run in the order high, normal, low. |
 | M15 sleep helpers | `sleepMs(50)` is used on the BSP, every AP, and through the tick fallback; the elapsed nanosecond delta is bounded. |
+| M16 user syscalls | The embedded ring-3 fixture writes to the serial console, sleeps, calls `getpid`/`yield`, and exits with status 42. |
+| M16 user fault | Dereferencing NULL in ring 3 terminates only that task with `-15`; the BSP continues. |
+| M16 isolation | Two address spaces map different physical pages at `0x500000`; a third task probes an extra page that exists only in another task and faults with `-15`. |
+| M16 preemption | Two busy user tasks on CPU 0 both advance their private counters under the LAPIC timer with no syscalls. |
+| M16 user pointers | An unmapped address and a non-canonical address are rejected by `copyFromUser` with `-EFAULT`; the task survives and exits 0. |
+| M16 teardown | The nine address spaces created by the test are all destroyed before the check succeeds. |
 
 ## Limitations
 
@@ -463,8 +506,16 @@ The scheduler is exercised by the selftest image described in
 - **Fixed task limit:** 32 slots total, including the boot task and one idle task
   per CPU. Unreaped joinable tasks hold their slots.
 - **Static stacks:** tasks use caller-owned stacks; there is no guard page or
-  automatic stack allocation.
-- **No address-space switching**; all tasks share the kernel page tables.
+  automatic stack allocation. User tasks additionally own a fixed four-page
+  user stack in the low half, also without a guard page.
+- **User tasks are test-shaped:** `createUser` accepts an already-built address
+  space and a raw user `RSP`; there is no `exec`, `argv`, general process
+  creation, or reaping. The only image loader is the M16 ELF fixture.
+- **Address spaces are pinned:** a user address space cannot migrate to another
+  CPU, so its teardown avoids a remote TLB shootdown but migration remains
+  impossible.
+- **No NX/W^X:** the loader maps the test text read-only and data writable, but
+  the NX bit is not enabled, so writable pages are executable.
 - **Idle cannot block**; blocking calls return immediately for idle tasks.
 - **Fallback timer:** CPU 0 uses the PIT if LAPIC calibration fails or the
   `force_pit` image is built. Normal operation uses the same LAPIC mechanism as
@@ -493,6 +544,10 @@ The scheduler is exercised by the selftest image described in
 | Deadline queue | **IMPLEMENTED** | Per-CPU min-heap; finite deadlines only. |
 | Priority levels and ageing | **IMPLEMENTED** | `low`/`normal`/`high`; no starvation; no inheritance. |
 | Join with status and timeout | **IMPLEMENTED** | Single waiter; `already_finished`, `timeout`, and `invalid` outcomes. |
+| Ring-3 user tasks | **IMPLEMENTED** | Per-task low-half PML4, 16 KiB kernel stack, `iretq` to DPL3. |
+| CR3 and TSS switching | **IMPLEMENTED** | `switchTaskLocked` loads the task PML4 and rewrites TSS `RSP0`. |
+| User exit/fault teardown | **IMPLEMENTED** | Kernel-root switch, low-half free, PML4 free; fault status `-(vector + 1)`. |
+| General process creation/reaping | **PLANNED** | M17. |
 | Task migration and balancing | **PLANNED** | M20. |
 
 ## Related documentation

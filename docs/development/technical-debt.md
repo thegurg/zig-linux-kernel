@@ -2,14 +2,14 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M15; **RESOLVED** entries are kept so the audit trail and the remaining
+after M16; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
 > **PARTIAL** means a feature exists but has a documented limitation.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
-> issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, M14, or M15.
+> issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, M14, M15, or M16.
 
 ## Critical
 
@@ -139,7 +139,9 @@ CPU. Tests still poll `finishedCount()` for tasks that are not joinable.
 ### 9. Static, caller-owned task stacks
 
 **Status: PARTIAL.** Tasks use stacks supplied to `sched.create`. There is no
-guard page, automatic stack allocation, or stack-overflow detection.
+guard page, automatic stack allocation, or stack-overflow detection. User tasks
+add a fixed four-page user stack in the low half, also without a guard page, and
+a 16 KiB caller-owned kernel stack for syscalls and interrupts.
 
 ### 10. Allocator concurrency is only lightly stressed
 
@@ -155,7 +157,7 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11, M12, M13, M14, and M15:
+Covered in M11, M12, M13, M14, M15, and M16:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
@@ -168,9 +170,12 @@ Covered in M11, M12, M13, M14, and M15:
 - invariant-TSC detection, PIT-based calibration, cross-CPU sync, monotonic
   samples on every AP, deadline heap push/pop, `sleepMs`, join outcomes,
   priority order, and the tick fallback;
+- ring-3 syscalls, user faults, two address spaces at the same virtual address,
+  user-pointer rejection, timer preemption of user tasks, and address-space
+  teardown;
 - the `force_pit` fallback boot path;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11-M15 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11-M16 result markers.
 
 Still open:
 
@@ -218,12 +223,30 @@ allocate-copy-free. There is no shrinking or in-place growth.
 bits, but not the NX bit. Kernel mappings are separated into read-only and
 read-write segments, not executable and non-executable ones.
 
-### 15. No user mode or address-space isolation
+### 15. User mode exists but protection and process support are narrow
 
-**Status: DEFERRED.** All tasks share the kernel page tables. There are no user
-page tables, privilege transitions, or per-process address spaces. The IDT
-dispatcher has a `from_user` branch for reporting, but user mode is not
-implemented.
+**Status: PARTIAL.** **Sources:**
+[`src/memory/vmm.zig`](../../src/memory/vmm.zig),
+[`src/sched.zig`](../../src/sched.zig),
+[`src/user.zig`](../../src/user.zig),
+[`src/syscall.zig`](../../src/syscall.zig).
+
+M16 provides ring 3, a private low-half PML4 per user task, and validated user
+copies, but the model is deliberately test-shaped:
+
+- the only executable image is the embedded fixture loaded by `src/user.zig`;
+- the fixed layout has no `argv`, no PIE, no dynamic linking, and no general
+  ELF validation;
+- NX is not enabled, so writable data pages are executable, and there are no
+  guard pages around the user stack or data;
+- user tasks are created with `sched.createUser` from an already-built address
+  space; there is no spawn/reap/process table;
+- user tasks are pinned to one CPU, so teardown is local but migration is
+  impossible;
+- the syscall ABI is project-local and intended for M16 tests; M17 may replace
+  it.
+
+General ELF loading, W^X/NX, `argv`, and the process lifecycle are M17 scope.
 
 ### 16. Partial heap growth leaks reserved virtual address space
 
@@ -283,6 +306,59 @@ exhaust the 32-slot table. There is no `join`-all, no process reaping, and no
 test for a `detach`/`join` race. Priority ageing prevents starvation but is not
 strict priority scheduling and has no priority inheritance.
 
+## User-mode limitations (M16)
+
+### 20. The user image loader is a test fixture loader
+
+**Status: PARTIAL.** **Sources:**
+[`src/user.zig`](../../src/user.zig),
+[`src/user/demo.elf`](../../src/user/demo.elf),
+[`tools/build-user.sh`](../../tools/build-user.sh).
+
+`loadSegments` checks the ELF magic, class, endianness, `ET_EXEC`, `EM_X86_64`,
+and basic header bounds, then maps only `PT_LOAD` segments that fit in the fixed
+range below `0x500000`. It does not reject overlapping segments, does not honour
+`p_vaddr`/`p_offset` congruence in general, does not support PIE or dynamic
+linking, and does not validate a second executable. The fixture is built from
+`src/user/demo.S` and checked in so the kernel can use `@embedFile`; it must be
+regenerated with `tools/build-user.sh` after either source file changes.
+
+### 21. User mappings have no NX or guard pages
+
+**Status: PARTIAL.** **Source:**
+[`src/memory/vmm.zig`](../../src/memory/vmm.zig).
+
+The VMM can set present/writable/user but never the NX bit. The test loader maps
+its text read-only and its data/stack writable, so ring-3 code cannot modify its
+text, but every writable user page is still executable. User stacks and data
+pages are separated from neighbouring mappings only by the fixed layout, not by
+guard pages. A user stack overflow can therefore write into an adjacent mapped
+page instead of faulting.
+
+### 22. User address spaces are pinned and torn down locally
+
+**Status: PARTIAL.** **Sources:**
+[`src/sched.zig`](../../src/sched.zig), [`src/memory/vmm.zig`](../../src/memory/vmm.zig).
+
+A user task cannot migrate because its address space is private to one CPU and
+the scheduler has no migration path. This is why teardown needs no remote TLB
+shootdown: `finishTaskLocked` detaches the root and switches to the kernel root
+under `task_lock`, then frees the low half after releasing the lock. Any future
+migration must add an address-space ownership rule and a remote shootdown before
+the old root is freed.
+
+### 23. The syscall ABI is test-only and the process lifecycle is absent
+
+**Status: PARTIAL.** **Sources:**
+[`src/syscall.zig`](../../src/syscall.zig), [`src/sched.zig`](../../src/sched.zig).
+
+The ABI uses `RAX` for the number, `RDI/RSI/RDX/R10` for arguments, and `RAX`
+for the result. `write` accepts only fds 1 and 2 and copies through a 256-byte
+bounce buffer; `exit` takes only the low 32 bits as a status; `getpid` returns the
+scheduler task ID, not a process ID. There is no `spawn`, `wait`, `reap`, file
+descriptor table, or `argv`. The numbers and errors are project-local and should
+be treated as an M16 test interface rather than a stable system call ABI.
+
 ## Implementation status summary
 
 | Area | Status | Notes |
@@ -300,11 +376,15 @@ strict priority scheduling and has no priority inheritance.
 | Cross-CPU TSC sync | **PARTIAL** | One IPI pass and per-CPU offsets; measured skew, no drift correction. |
 | Deadline queue | **IMPLEMENTED** | Per-CPU min-heap; finite deadlines only. |
 | Join and priorities | **PARTIAL** | Single waiter; tick-granular timeout; priority ageing. |
+| Ring 3 and address-space isolation | **IMPLEMENTED** | Private low half, shared high half, `int 0x80`, validated copies, teardown. |
+| User image loading | **PARTIAL** | One embedded `ET_EXEC` fixture; no general ELF validation or `argv`. |
+| User protection policy | **PARTIAL** | No NX/W^X and no guard pages. |
+| Process lifecycle | **DEFERRED** | M17 spawn/wait/reap and a process table. |
 | Task migration | **DEFERRED** | Planned for M20. |
 | ACPI/MADT discovery | **IMPLEMENTED** | Validated RSDP/XSDT/RSDT/MADT; BSP-only; narrow table coverage. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection read/write, mask/unmask, IRQ0 delivery test. |
-| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M15. |
-| Test coverage | **PARTIAL** | M11-M15 tests added; gaps listed above. |
+| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M16. |
+| Test coverage | **PARTIAL** | M11-M16 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 8 CPUs. |
 
 ## Related documentation

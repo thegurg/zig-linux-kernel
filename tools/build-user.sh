@@ -15,6 +15,7 @@ LD="$ROOT/src/user/demo.ld"
 as --64 -o "$OBJ" "$SRC"
 trap 'rm -f "$OBJ"' EXIT
 ld -m elf_x86_64 -nostdlib --build-id=none -T "$LD" -o "$ELF" "$OBJ"
+chmod 644 "$ELF"
 
 readelf -h "$ELF" >/dev/null
 readelf -l "$ELF"

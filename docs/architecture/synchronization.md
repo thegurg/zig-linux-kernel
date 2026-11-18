@@ -239,6 +239,13 @@ mailboxes and each target acknowledges into its own column, so every cell has a
 single writer. The IPI handler takes no locks, which lets a CPU that is waiting
 for acknowledgements still service a request from another CPU.
 
+CR3 switching under `task_lock` does not take `vmm.table_lock`. User-task
+teardown is split: the exiting path detaches the private PML4 and switches to the
+kernel root under `task_lock`, then releases the lock before
+`destroyAddressSpace` frees pages through `pmm.lock`. This preserves the
+documented heap -> VMM -> PMM -> scheduler order; no path acquires `task_lock`
+while holding `pmm.lock`.
+
 `unmapPage` invokes the shootdown callback after releasing `vmm.table_lock`.
 Callers must have interrupts enabled when other CPUs are online: the waiting CPU
 must be able to take their shootdown IPIs. The heap grow path follows this rule
@@ -261,6 +268,7 @@ unmapped tail of its reserved range instead.
 | Console/serial locking | **IMPLEMENTED** | IRQ-safe message locks. |
 | Heap locking | **IMPLEMENTED** | IRQ-safe free-list lock; concurrent allocation test. |
 | Lock-free TLB mailboxes | **IMPLEMENTED** | Per-shooter slots; handlers take no locks. |
+| User address-space teardown | **IMPLEMENTED** | Detach and kernel-root switch under `task_lock`; free after release. |
 
 ## Related documentation
 

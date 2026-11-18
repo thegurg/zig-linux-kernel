@@ -4,8 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M15 are complete and validated through the QEMU test
-flow. M16 is the next milestone. M16-M20 are planned and are recorded below with
+**Current status:** M0-M16 are complete and validated through the QEMU test
+flow. M17 is the next milestone. M17-M20 are planned and are recorded below with
 their scope and verification criteria.
 
 ## Pre-M11 bugfix pass (complete)
@@ -409,7 +409,7 @@ source=ticks reason=forced` and `timer: source=pit, 100 Hz, IRQ0 unmasked`.
 - TSC-deadline mode, per-CPU clocksource selection, or NTP-style rate
   correction.
 
-## M16: ring 3, address spaces, and syscalls (planned)
+## M16: ring 3, address spaces, and syscalls (complete)
 
 ### Goal
 
@@ -443,6 +443,52 @@ and a minimal syscall path.
 
 - General ELF validation, PIE, dynamic linking, `exec`, and `argv`.
 - General process creation and reaping; these belong to M17.
+
+### Results
+
+All scope items are implemented:
+
+- `vmm.zig` creates a private low-half PML4 that shares kernel entries
+  `256..512`, maps user pages with the user bit at every level, translates and
+  copies user ranges with canonical and per-page validation, switches `CR3`, and
+  destroys the private half. Created/destroyed counters are exposed for tests.
+- `gdt.zig` adds DPL3 user code (`0x18`) and data (`0x20`) selectors. The TSS
+  descriptors move to `0x28 + cpu * 0x10`.
+- `interrupts.S` executes `swapgs` on entry from ring 3 and before returning to
+  a user frame; `idt.zig` installs a DPL3 gate for vector 128.
+- `sched.zig` gives every task a PML4 and a kernel-stack top, creates ring-3
+  tasks with an `iretq` frame, switches `CR3` and TSS `RSP0` on every task
+  switch, and tears down the private low half without holding `task_lock` across
+  `pmm.lock`.
+- `syscall.zig` implements `write` (1), `exit` (2), `yield` (3), `sleepMs` (4),
+  and `getpid` (5) over the saved-register frame. Errors are `-EBADF`, `-EFAULT`,
+  and `-ENOSYS`.
+- `user.zig` loads the single embedded ELF64 fixture through `PT_LOAD`, maps its
+  segments at `0x400000`, and adds private data (`0x500000`), optional extra
+  (`0x600000`), and four-page stack (`0x700000`..`0x704000`) pages.
+  `src/user/demo.S` builds the fixture; `tools/build-user.sh` regenerates the
+  checked-in `demo.elf`.
+
+Validation ran the full matrix: default KVM, TCG, `SMP=2`, `SMP=1`, and Debug
+all passed, and the default run logged:
+
+```text
+m16: user write ok
+m16: user sleep ok
+m16: user exit status=42
+m16: user null fault status=-15
+m16: isolation data a=161 b=178
+m16: isolation extra holder=126 probe=-15
+m16: preemption counters=36074295,43085469 ticks=3
+m16: user badptr rejected
+m16: user badptr status=0
+m16: aspace created=9 destroyed=9
+selftest: M16 checks passed
+```
+
+Limitations carried into M17: no NX/W^X, no guard page, no general ELF
+validation, no `argv`, and no process creation/reaping. The loader is a test
+fixture loader by design.
 
 ## M17: ELF64 loading and process lifecycle (planned)
 
@@ -598,7 +644,7 @@ dependency, not by priority.
 | M13 | **IMPLEMENTED** | Per-CPU tick counters, AP LAPIC timers, local deadline wakeups, timer-driven AP preemption, calibration and tests. |
 | M14 | **IMPLEMENTED** | ACPI/MADT discovery, ISO-based ISA IRQ resolution, IOAPIC driver, CPU 0 LAPIC timer, PIC/PIT fallback, IOAPIC delivery and fallback boot tests. |
 | M15 | **IMPLEMENTED** | Invariant-TSC detection and calibration, cross-CPU sync, monotonic nanosecond clock, tick fallback, deadline queue, sleep helpers, join, priorities with ageing. |
-| M16 | **PLANNED** | Ring 3, per-task address spaces, syscall gate, user memory validation, minimal test-only ELF loader. |
+| M16 | **IMPLEMENTED** | Ring 3, per-task low-half address spaces with shared kernel high half, `int 0x80` gate, `swapgs`, per-task kernel stacks/TSS `RSP0`, validated user copies, syscalls, CR3 switching, user-half teardown, minimal test-only ELF loader. |
 | M17 | **PLANNED** | General ELF64 validation, W^X/NX, argv, spawn/wait/reap, process table, address-space teardown. |
 | M18 | **PLANNED** | PCI enumeration, virtio-blk polling, optional MSI-X extension, block layer, VFS, FAT, initramfs. |
 | M19 | **PLANNED** | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP, loopback, minimal socket API. |

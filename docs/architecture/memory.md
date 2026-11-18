@@ -145,6 +145,11 @@ HHDM and split at page boundaries, so an invalid pointer returns
 | `0xffffffff80000000` and up | Kernel image, page-by-page 4 KiB mappings with per-section permissions. |
 | Limine HHDM offset | First 4 GiB of physical memory, 2 MiB pages, read-write; framebuffer pages uncached. |
 | `0xffffffff90000000` .. `0xffffffff94000000` | Reserved virtual range for the kernel heap, mapped lazily by `heap.zig`. |
+| `0x0000000000400000` | Test ELF `.text`; one 4 KiB user RX page in each private address space. |
+| `0x0000000000401000` | Test ELF `.rodata`; one 4 KiB user RO page. |
+| `0x0000000000500000` | Private writable data page, one per user task. |
+| `0x0000000000600000` | Optional private writable "extra" page used by the isolation test. |
+| `0x0000000000700000` .. `0x0000000000704000` | Four-page user stack; `RSP` starts at `0x704000`. |
 | Test-only range | `0xffffffffb0000000` is mapped and unmapped by the VMM selftest. |
 
 The HHDM mapping requires the Limine offset to be 1 GiB aligned. Each 1 GiB
@@ -158,12 +163,15 @@ managed limit.
   it enables interrupts. Callers must not invoke `unmapPage` with interrupts
   disabled when other CPUs are online. See
   [technical debt](../development/technical-debt.md).
-- There is no user-space mapping support, no copy-on-write, and no demand
-  paging. The VMM maps and unmaps explicit pages only.
-- The NX bit is not used; executable permissions are not separated beyond the
-  read-only/read-write distinction.
+- There is no copy-on-write and no demand paging. The VMM maps and unmaps
+  explicit pages only.
+- User mappings are limited to the test loader's fixed layout. The NX bit is not
+  used, so user code and writable data are separated only by the read-only bit,
+  not by execute permission. There is no guard page between the user stack and
+  neighbouring mappings.
 - Page-table mutation is serialized by one IRQ-safe spinlock; there is no
-  per-address-space or per-range locking.
+  per-address-space or per-range locking. A user address space is pinned to one
+  CPU, so its teardown skips a remote TLB shootdown.
 - The HHDM covers only the first 4 GiB because the PMM manages only that range.
 
 ## Kernel heap
@@ -231,8 +239,12 @@ allocate/write/verify/free pattern concurrently on every CPU.
 | TLB shootdown | **IMPLEMENTED** | Lock-free per-CPU mailboxes; IPI 241 after `unmapPage`; waits for every ack. |
 | PMM/VMM locking | **IMPLEMENTED** | IRQ-safe allocator and page-table locks. |
 | Heap locking | **IMPLEMENTED** | One IRQ-safe lock; concurrent M12 allocation test. |
+| Per-task address spaces | **IMPLEMENTED** | Private low half, shared kernel high half; CR3 switch on task switch. |
+| User mapping and copies | **IMPLEMENTED** | User bit through every level; range/canonical checks plus per-page translation. |
+| Address-space teardown | **IMPLEMENTED** | Switch to the kernel root, free the low half, destroy the PML4. |
 | Physical memory above 4 GiB | **PLANNED** | Not managed. |
-| User-space mappings / demand paging | **PLANNED** | Not implemented. |
+| Copy-on-write / demand paging | **PLANNED** | Not implemented. |
+| NX / W^X user policy | **PLANNED** | M17; NX is not enabled. |
 
 ## Related documentation
 
