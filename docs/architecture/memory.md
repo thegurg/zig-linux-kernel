@@ -85,6 +85,9 @@ M1c replaces Limine's page tables with a 4-level PML4 built by the kernel:
 - The framebuffer's HHDM range is marked uncached (`cache_disable`) on the
   covering 2 MiB page-directory entries.
 - `CR0.WP` is enabled so read-only mappings are enforced even in ring 0.
+- `EFER.NXE` is enabled on the BSP before any page table is built and on every
+  AP before it can run a user task; `vmm.init` fails with `NoNoExecute` if the
+  CPU does not advertise NX.
 - `CR3` is loaded with the new PML4, and the global TLB is flushed by clearing
   and restoring `CR4.PGE` once.
 
@@ -115,6 +118,26 @@ it, and every page must be present with the user bit. Copies bounce through the
 HHDM and split at page boundaries, so an invalid pointer returns
 `InvalidUserRange` or `NotMapped` instead of faulting the kernel.
 
+### User page permissions and the stack guard
+
+The general loader applies an explicit W^X policy to every user leaf:
+
+| Segment kind | Flags | Meaning |
+| --- | --- | --- |
+| Code | `user_rx` (present, user) | Readable and executable, never writable. |
+| Read-only data | `user_ro_nx` (present, user, NX) | Readable, never writable or executable. |
+| Writable data | `user_rw_nx` (present, writable, user, NX) | Writable, never executable. |
+| Stack and stack strings | `user_rw_nx` | Writable, never executable. |
+
+`mapUserPageFlags(root, virt, phys, flags)` adds the user bit and installs the
+leaf with the exact NX/writable policy the loader requested. The loader rejects
+any `PT_LOAD` that is both writable and executable, and requires the ELF entry
+point to lie inside an executable segment.
+
+The process stack is four pages ending at `0x0000_0000_7fff_f000`. The page
+below the mapped stack at `0x0000_0000_7fff_a000` is never mapped; a stack
+overflow therefore takes a user `#PF` and terminates only that process.
+
 ### API
 
 | Function | Behavior |
@@ -131,6 +154,8 @@ HHDM and split at page boundaries, so an invalid pointer returns
 | `createAddressSpace() ?u64` | Allocates a private low half and shares the kernel high half; returns the PML4 physical address. |
 | `destroyAddressSpace(root) void` | Frees every low-half leaf, page table, and the PML4. The caller must switch `CR3` away first. |
 | `mapPageIn(root, virt, phys, flags) bool` / `mapUserPage(...)` | Maps one page in a specific address space; user mappings set the user bit at every level and are restricted to the low half. |
+| `mapUserPageFlags(root, virt, phys, flags) bool` | Maps one user leaf with an explicit RX, RO+NX, or RW+NX policy; adds the user bit. |
+| `execute_disable`, `user_rx`, `user_ro_nx`, `user_rw_nx` | Exported PTE flag constants for the W^X user policy. |
 | `translateIn(root, virt) ?u64` / `translateUserIn(root, virt) ?u64` | Walks a specific PML4; the user variant also requires the user bit at every level. |
 | `copyFromUser(dst, src) !void` / `copyToUser(dst, src) !void` | Validate a low-half range, translate it, and copy through the HHDM without faulting on bad pointers. |
 | `switchAddressSpace(root)` / `switchToKernelAddressSpace()` | Load a PML4 into `CR3`, or restore the kernel root before tearing a user address space down. |
@@ -145,11 +170,13 @@ HHDM and split at page boundaries, so an invalid pointer returns
 | `0xffffffff80000000` and up | Kernel image, page-by-page 4 KiB mappings with per-section permissions. |
 | Limine HHDM offset | First 4 GiB of physical memory, 2 MiB pages, read-write; framebuffer pages uncached. |
 | `0xffffffff90000000` .. `0xffffffff94000000` | Reserved virtual range for the kernel heap, mapped lazily by `heap.zig`. |
-| `0x0000000000400000` | Test ELF `.text`; one 4 KiB user RX page in each private address space. |
-| `0x0000000000401000` | Test ELF `.rodata`; one 4 KiB user RO page. |
-| `0x0000000000500000` | Private writable data page, one per user task. |
-| `0x0000000000600000` | Optional private writable "extra" page used by the isolation test. |
-| `0x0000000000700000` .. `0x0000000000704000` | Four-page user stack; `RSP` starts at `0x704000`. |
+| `0x0000000000400000` | Test ELF `.text`; user RX pages in each private address space. |
+| `0x0000000000401000` | Test ELF `.rodata`; user RO+NX pages. |
+| `0x0000000000500000` | M16 private writable data page, one per user task. |
+| `0x0000000000600000` | Optional M16 private writable "extra" page used by the isolation test. |
+| `0x0000000000700000` .. `0x0000000000704000` | M16 four-page user stack; `RSP` starts at `0x704000`. |
+| `0x0000_0000_7fff_b000` .. `0x0000_0000_7fff_f000` | M17 process stack, four RW+NX pages; `RSP` starts at `0x0000_0000_7fff_f000`. |
+| `0x0000_0000_7fff_a000` | M17 stack guard page; deliberately unmapped. |
 | Test-only range | `0xffffffffb0000000` is mapped and unmapped by the VMM selftest. |
 
 The HHDM mapping requires the Limine offset to be 1 GiB aligned. Each 1 GiB
@@ -165,10 +192,10 @@ managed limit.
   [technical debt](../development/technical-debt.md).
 - There is no copy-on-write and no demand paging. The VMM maps and unmaps
   explicit pages only.
-- User mappings are limited to the test loader's fixed layout. The NX bit is not
-  used, so user code and writable data are separated only by the read-only bit,
-  not by execute permission. There is no guard page between the user stack and
-  neighbouring mappings.
+- The loader supports only `ET_EXEC`. There is no PIE, dynamic linking, `exec`,
+  or relocation that would change the policy of an already-mapped segment.
+- The process stack is fixed at four pages with one guard page. There is no
+  automatic stack growth on a guard-page fault; the process is terminated.
 - Page-table mutation is serialized by one IRQ-safe spinlock; there is no
   per-address-space or per-range locking. A user address space is pinned to one
   CPU, so its teardown skips a remote TLB shootdown.
@@ -242,9 +269,12 @@ allocate/write/verify/free pattern concurrently on every CPU.
 | Per-task address spaces | **IMPLEMENTED** | Private low half, shared kernel high half; CR3 switch on task switch. |
 | User mapping and copies | **IMPLEMENTED** | User bit through every level; range/canonical checks plus per-page translation. |
 | Address-space teardown | **IMPLEMENTED** | Switch to the kernel root, free the low half, destroy the PML4. |
+| NX and user W^X policy | **IMPLEMENTED** | `EFER.NXE` on every CPU; RX code, RO+NX data, RW+NX data/stack; W+X segments rejected. |
+| User stack guard page | **IMPLEMENTED** | Four mapped process pages; the page below is unmapped and faults on overflow. |
+| General `ET_EXEC` loading | **IMPLEMENTED** | Header, bounds, alignment, overlap, W^X, and entry-point validation. |
+| PIE, dynamic linking, demand paging | **PLANNED** | Not implemented. |
 | Physical memory above 4 GiB | **PLANNED** | Not managed. |
-| Copy-on-write / demand paging | **PLANNED** | Not implemented. |
-| NX / W^X user policy | **PLANNED** | M17; NX is not enabled. |
+| Copy-on-write | **PLANNED** | Not implemented. |
 
 ## Related documentation
 

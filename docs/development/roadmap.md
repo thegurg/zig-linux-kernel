@@ -4,8 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M16 are complete and validated through the QEMU test
-flow. M17 is the next milestone. M17-M20 are planned and are recorded below with
+**Current status:** M0-M17 are complete and validated through the QEMU test
+flow. M18 is the next milestone. M18-M20 are planned and are recorded below with
 their scope and verification criteria.
 
 ## Pre-M11 bugfix pass (complete)
@@ -490,7 +490,7 @@ Limitations carried into M17: no NX/W^X, no guard page, no general ELF
 validation, no `argv`, and no process creation/reaping. The loader is a test
 fixture loader by design.
 
-## M17: ELF64 loading and process lifecycle (planned)
+## M17: ELF64 loading and process lifecycle (complete)
 
 ### Goal
 
@@ -515,6 +515,58 @@ Turn the M16 test-only loader into a general process model.
 - An NX violation kills only the offending process.
 - Failed loads are rejected without leaking pages or address spaces.
 - Address spaces are reclaimed and reusable after reaping.
+
+### Results
+
+All scope items are implemented:
+
+- `cpu.zig` detects NX through CPUID leaf `0x8000_0001` and sets `EFER.NXE`.
+  `vmm.init` refuses to start without NX, and every AP enables NXE in `ap_main`
+  before it can run a user task.
+- `vmm.zig` adds `execute_disable` and the `user_rx` (readable/executable),
+  `user_ro_nx`, and `user_rw_nx` leaf flags, plus `mapUserPageFlags` for an
+  explicit user-leaf policy.
+- `user.zig` validates ELF64 `ET_EXEC` `EM_X86_64` images before mapping:
+  class, encoding, version, header size, program-header table bounds, segment
+  bounds, page congruence, alignment, W+X rejection, segment overlap, stack
+  overlap, and an entry point inside an executable segment. It maps RX code,
+  RO+NX read-only data, and RW+NX writable data, then builds a SysV initial
+  stack with `argc`, `argv`, a terminating NULL, `envp`, a terminating NULL,
+  pushed strings, and 16-byte alignment. Every failure path destroys the partial
+  address space.
+- The user stack occupies four pages ending at `0x0000_0000_7fff_f000`; the page
+  below it at `0x0000_0000_7fff_a000` is never mapped, so overflow faults.
+- `process.zig` adds a 16-slot process table. `spawn` reserves a slot, allocates
+  a 16 KiB kernel stack, loads the image, creates a joinable ring-3 task, and
+  publishes a generation-tagged `Handle`. `wait` polls `sched.taskStatus` at
+  tick granularity and stores the status until `reap`, which detaches the
+  scheduler task and frees the kernel stack. A stale generation is `invalid`.
+- `sched.taskStatus(id)` snapshots a task's state and exit status without
+  consuming the scheduler's single join slot.
+- `src/user/proc.S` and `src/user/proc.ld` build a three-segment `proc.elf`
+  fixture; `tools/build-user.sh` regenerates it alongside `demo.elf`.
+
+Validation ran the full matrix: default KVM, TCG, `SMP=2`, `SMP=1`, and Debug
+all passed, and the default run logged:
+
+```text
+m17: proc argv=m17proc,basic env=M17=1
+m17: argv status=42 pid=1 gen=2
+m17: concurrent statuses=42,43
+m17: wait timeout=timeout retry=exited/43
+m17: generation advanced=1 stale=invalid
+m17: nx fault status=-15 sibling=44
+m17: guard fault status=-15 sibling=44
+m17: bad loads rejected=4
+m17: reclaim aspaces created=10 destroyed=10 free_pages_match=1
+m17: process table slots=0 live=0 spawned=10 reaped=10
+selftest: M17 checks passed
+```
+
+The loader is still `ET_EXEC`-only: no PIE, dynamic linking, `exec`, or
+demand paging. The process API is kernel-side; the ring-3 syscall ABI is
+unchanged. These limitations are recorded in
+[technical debt](../development/technical-debt.md).
 
 ## M18: PCI, virtio-blk, and VFS/initramfs (planned)
 
@@ -645,7 +697,7 @@ dependency, not by priority.
 | M14 | **IMPLEMENTED** | ACPI/MADT discovery, ISO-based ISA IRQ resolution, IOAPIC driver, CPU 0 LAPIC timer, PIC/PIT fallback, IOAPIC delivery and fallback boot tests. |
 | M15 | **IMPLEMENTED** | Invariant-TSC detection and calibration, cross-CPU sync, monotonic nanosecond clock, tick fallback, deadline queue, sleep helpers, join, priorities with ageing. |
 | M16 | **IMPLEMENTED** | Ring 3, per-task low-half address spaces with shared kernel high half, `int 0x80` gate, `swapgs`, per-task kernel stacks/TSS `RSP0`, validated user copies, syscalls, CR3 switching, user-half teardown, minimal test-only ELF loader. |
-| M17 | **PLANNED** | General ELF64 validation, W^X/NX, argv, spawn/wait/reap, process table, address-space teardown. |
+| M17 | **IMPLEMENTED** | General `ET_EXEC` ELF64 validation, W^X/NX, `argc`/`argv`/`envp`, stack guard page, `spawn`/`wait`/`reap`, process table, generation handles, leak-free teardown. |
 | M18 | **PLANNED** | PCI enumeration, virtio-blk polling, optional MSI-X extension, block layer, VFS, FAT, initramfs. |
 | M19 | **PLANNED** | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP, loopback, minimal socket API. |
 | M20 | **PLANNED** | Shell, panic unwinding, cross-CPU NMI watchdog, migration, failure injection, stress. |

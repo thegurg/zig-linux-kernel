@@ -23,7 +23,8 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M14 complete:** ACPI RSDP/XSDT/RSDT/MADT parsing, ISO-resolved ISA IRQ0, an IOAPIC redirection driver, a CPU 0 LAPIC timer, a PIT fallback boot image, and IOAPIC delivery tests.
 - **M15 complete:** invariant-TSC detection and PIT calibration, cross-CPU TSC synchronization, a monotonic nanosecond clock with a calibrated-tick fallback, a per-CPU deadline queue, `sleepMs`/`sleepNs`, join with exit status and timeout, and priority levels with an explicit anti-starvation policy.
 - **M16 complete:** per-task low-half address spaces with a shared kernel high half, ring-3 entry, a DPL3 `int 0x80` gate, `swapgs`, per-task kernel stacks and TSS `RSP0`, validated `copyFromUser`/`copyToUser`, the `write`/`exit`/`yield`/`sleepMs`/`getpid` syscalls, CR3 switching, user-half teardown, and a minimal test-only ELF64 loader.
-- **Next:** M17 (planned). See the [roadmap](docs/development/roadmap.md).
+- **M17 complete:** a validated general `ET_EXEC` ELF64 loader, W^X mappings (RX code, RO+NX data, RW+NX stacks), EFER.NXE on every CPU, a SysV `argc`/`argv`/`envp` initial stack, an unmapped user stack guard page, and a process table with `spawn`/`wait`/`reap`, exit-status storage, and generation-tagged handles.
+- **Next:** M18 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
@@ -73,8 +74,12 @@ Build options:
   task on a user NULL fault, show that two address spaces map different physical
   pages at the same virtual address, reject an unmapped and a non-canonical user
   pointer without a kernel panic, prove timer preemption of two busy user tasks,
-  and confirm that every created address space is destroyed; it then triggers
-  `int3` and must return from the handler (QEMU status 33);
+  and confirm that every created address space is destroyed; the M17 checks then
+  validate the general ELF loader, `argc`/`argv`/`envp`, concurrent spawn/wait,
+  wait timeouts and retries, generation-tagged handle reuse, NX and guard-page
+  faults that kill only the faulting process, rejection of malformed or
+  unsupported images, and leak-free address-space and process-table reclamation;
+  it then triggers `int3` and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35);
 - the fallback image boots with `force_pit` and must log the PIT timer path and
@@ -95,21 +100,25 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M16 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M17 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, per-task address spaces, user copies, TLB shootdown
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
+  process.zig      process table, spawn/wait/reap, exit status, generation handles
   sched.zig        per-CPU scheduler, priorities, deadline heaps, join, user tasks, wait queues, mutex/condition, IPIs, TLB shootdown
   syscall.zig      int 0x80 ABI, saved-register frame, syscall dispatcher
   time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback
-  user.zig         minimal embedded ELF64 test-image loader and user layout
-  user/demo.S      ring-3 test program source
-  user/demo.ld     fixed low-half linker script for the test program
-  user/demo.elf    checked-in ELF fixture embedded with @embedFile
+  user.zig         general ET_EXEC ELF64 loader, argv/envp stack, user layout
+  user/demo.S      ring-3 M16 test program source
+  user/demo.ld     fixed low-half linker script for the M16 test program
+  user/demo.elf    checked-in M16 ELF fixture embedded with @embedFile
+  user/proc.S      M17 process test program with separate RX/RO/RW segments
+  user/proc.ld     multi-segment ELF layout for the M17 test program
+  user/proc.elf    checked-in M17 process fixture embedded with @embedFile
   smp.zig          Limine MP bring-up, AP scheduler entry and M11-M13 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
 tools/run.sh       Build ESP (vvfat) and launch QEMU
-tools/build-user.sh Regenerate src/user/demo.elf from demo.S and demo.ld
+tools/build-user.sh Regenerate src/user/demo.elf and src/user/proc.elf
 tools/genfont.py   Regenerate src/font.zig from a system font
 third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 docs/              Architecture and development documentation

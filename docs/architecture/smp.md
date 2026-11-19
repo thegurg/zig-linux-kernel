@@ -419,7 +419,7 @@ m15: fallback source=ticks monotonic=1 sleep_ns=50000000
 selftest: M15 checks passed
 ```
 
-### M16 ring-3 and address-space checks
+### M16-M17 ring-3, address-space, and process checks
 
 `selftestM16()` runs after M15 on the BSP. It creates ring-3 tasks pinned to
 CPU 0, each with its own private low half and a 16 KiB kernel stack from
@@ -461,12 +461,19 @@ The M16 checks are pinned to CPU 0 so they run on every `ZIG_KERNEL_SMP`
 configuration, including the no-AP path. The APs remain in their idle loops
 while the user tasks run.
 
+`selftestM17()` then loads the general multi-segment fixture through the process
+table and covers `argv`/`envp`, two concurrent processes, a wait timeout and
+retry, generation-tagged handle reuse, NX and guard-page faults with a live
+sibling, four rejected images, and leak-free address-space and process-table
+reclamation. It is also pinned to CPU 0. Multi-CPU runs additionally verify that
+every AP enabled `EFER.NXE` during bring-up, but no M17 process runs on an AP.
+
 ## Boot-mode behavior
 
 | Mode | AP behavior |
 | --- | --- |
 | Normal kernel | `kmain` parses ACPI, initializes the IOAPICs, calibrates the LAPIC timer before release, then calls `smp.start()` and `smp.waitOnline()` after scheduler/LAPIC init. APs install per-CPU state, start their timers, and enter the scheduler idle loop. The BSP then synchronizes TSC offsets. CPU 0 starts its own LAPIC timer. The log is `smp: 3 APs online, scheduler idle`. |
-| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, M14, M15, and M16 tests. |
+| Selftest kernel | `kmain` skips the early release because `exit_after_boot` is true. `selftestSmp()` calibrates the timer if needed, calls `smp.start()` after the BSP-only tests, waits online, re-enables scheduling and BSP interrupts, and runs the M11, M12, M13, M14, M15, M16, and M17 tests. |
 | Fault-test kernel | `kmain` follows the normal release path, so APs are already in the scheduler idle loop before the deliberate NULL dereference. |
 | Fallback kernel | `kmain` follows the normal path but `force_pit` makes CPU 0 select PIT IRQ0 instead of its LAPIC timer, and the tick clocksource instead of the TSC. |
 
@@ -480,7 +487,7 @@ timer: source=lapic
 
 ## Recorded validation
 
-M16 validation ran the full matrix:
+M17 validation ran the full matrix:
 
 - `zig build` (default ReleaseSafe): passed;
 - default KVM `zig build test` (`SMP=4`): passed;
@@ -488,20 +495,31 @@ M16 validation ran the full matrix:
 - `ZIG_KERNEL_SMP=2 zig build test`: passed;
 - `ZIG_KERNEL_SMP=1 zig build test`: passed;
 - `zig build -Doptimize=Debug test`: passed;
-- every run included the M15 time/join/priority markers and the M16 markers
+- every run included the M15 time/join/priority markers, the M16 markers
   `m16: user write ok`, `m16: user sleep ok`, `m16: user exit status=42`,
   `m16: user null fault status=-15`, `m16: isolation data a=161 b=178`,
   `m16: isolation extra holder=126 probe=-15`,
   `m16: user badptr rejected`, `m16: user badptr status=0`, and
-  `m16: aspace created=9 destroyed=9`;
-- the TCG run selected the tick clocksource and still passed every M15 and M16
-  check;
+  `m16: aspace created=9 destroyed=9`, and the M17 markers
+  `m17: proc argv=m17proc,basic env=M17=1`,
+  `m17: concurrent statuses=42,43`,
+  `m17: wait timeout=timeout retry=exited/43`,
+  `m17: generation advanced=1 stale=invalid`,
+  `m17: nx fault status=-15 sibling=44`,
+  `m17: guard fault status=-15 sibling=44`,
+  `m17: bad loads rejected=4`,
+  `m17: reclaim aspaces created=10 destroyed=10 free_pages_match=1`, and
+  `m17: process table slots=0 live=0 spawned=10 reaped=10`;
+- the TCG run selected the tick clocksource and still passed every M15, M16,
+  and M17 check;
 - the `force_pit` image booted through `timer: source=pit, 100 Hz, IRQ0
   unmasked` and the `--test-boot` harness accepted it;
 - `zig fmt --check src build.zig` and `git diff --check`: passed.
 
-The earlier M11-M15 validation and roadmap records are in the
-[roadmap](../development/roadmap.md).
+The M17 process tests are pinned to CPU 0, so `SMP=1` exercises the same process
+path without APs. Multi-CPU runs still exercise the AP-side `EFER.NXE`
+enablement during bring-up. The earlier M11-M16 validation and roadmap records
+are in the [roadmap](../development/roadmap.md).
 
 ## Limitations and deferred work
 
@@ -522,9 +540,10 @@ The earlier M11-M15 validation and roadmap records are in the
 | Per-CPU LAPIC timer | **IMPLEMENTED** | Vector 242; calibrated against PIT channel 2. |
 | Timer-driven preemption | **IMPLEMENTED** | CPU 1 AP test plus the M14 CPU 0 preemption test and the M16 user-task preemption test. |
 | Ring-3 tasks on an SMP kernel | **IMPLEMENTED** | User tasks are pinned to one CPU; their low halves are private and torn down locally. |
+| AP NX enablement | **IMPLEMENTED** | Every AP sets `EFER.NXE` in `ap_main` before scheduler entry; the BSP requires NX in `vmm.init`. |
 | ACPI/MADT discovery | **IMPLEMENTED** | RSDP/XSDT/RSDT/MADT validation; BSP-only. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection entries, mask/unmask, ISA IRQ0 delivery test. |
-| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M16; deferred to M18. |
+| MSI/MSI-X and general PCI routing | **PLANNED** | Not part of M17; deferred to M18. |
 | More than 8 CPUs | **PLANNED** | `max_cpus = 8`; larger responses are rejected. |
 
 ## Related documentation

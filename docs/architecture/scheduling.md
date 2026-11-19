@@ -190,12 +190,15 @@ options)` creates a ring-3 task pinned to the selected CPU (CPU 0 by default).
 It validates that the address space and both entry points are in the low half,
 then builds `initialFrameUser`, a 22-qword frame whose `iretq` target is
 `CS = 0x1b`, `SS = 0x23`, `RIP = entry`, `RSP = user_stack_top`, and
-`RDI = arg` (the test mode). The frame itself lives on the supplied kernel
-stack, which is shared through the high half of every address space.
+`RDI = arg`. The frame itself lives on the supplied kernel stack, which is
+shared through the high half of every address space.
 
 The caller owns the address space, the mapped user pages, and the kernel stack.
-`sched` does not copy or validate the ELF image; that is `src/user.zig`'s
-test-only job. Finished user tasks are torn down by the scheduler, not by the
+`sched` does not copy or validate the ELF image. The M17 process layer
+([`src/process.zig`](../../src/process.zig)) supplies those resources from the
+general loader and a heap-allocated kernel stack, then keeps the finished task
+slot and exit status until `reap`. The M16 fixture path still calls `createUser`
+directly. Finished user tasks are torn down by the scheduler, not by `sched`'s
 caller.
 
 `switchTaskLocked` installs `next.pml4_phys` in `CR3`, writes
@@ -453,6 +456,41 @@ The M9 selftest creates two tasks that load distinct XMM0 patterns, yield to eac
 other inside one inline-assembly block, and store XMM0 afterwards. The M11 AP
 test does the same with XMM5 and an `int3` on CPU 1.
 
+## Process lifecycle (M17)
+
+The kernel-side process layer in [`src/process.zig`](../../src/process.zig)
+wraps scheduler tasks. A process owns:
+
+- one user address space, loaded and validated by `user.zig`;
+- one 16 KiB kernel stack from the kernel heap;
+- one joinable ring-3 scheduler task;
+- a stored exit status and a generation-tagged handle.
+
+`spawn` reserves a table slot, allocates the kernel stack, loads the image,
+creates the task, and only then publishes the process as `running`. Every
+failure before publish releases the slot, stack, and address space. A published
+`Handle` consists of a one-based `pid` and a `generation`; the generation
+increments when the slot is reused, so a stale handle cannot name a later
+process.
+
+`wait` does not consume the scheduler's single `join` slot. It snapshots
+`sched.taskStatus(id)` and polls at tick granularity, sleeping for one tick
+between checks. A finite timeout is measured in ticks and returns `timeout`
+without discarding the process. When the task is `finished`, `wait` copies the
+exit status into the process record and returns `exited`; later `wait` calls
+keep returning the stored status.
+
+`reap` requires a process that has exited. It marks the slot `reaping`,
+detaches the finished scheduler task, frees the kernel stack, clears the
+record, and makes the slot reusable. Because the scheduler destroyed the user
+address space when the ring-3 task exited, `reap` performs no user-page
+teardown. `process.stats()` reports slots, live processes, exited processes,
+and cumulative spawn/reap counts for the selftest.
+
+A ring-3 `#PF` (for example on the guard page or an NX leaf) takes the existing
+scheduler fault path, which gives the task the status `-(vector + 1)` and
+destroys only its address space.
+
 ## Self-test coverage
 
 The scheduler is exercised by the selftest image described in
@@ -489,6 +527,14 @@ The scheduler is exercised by the selftest image described in
 | M16 preemption | Two busy user tasks on CPU 0 both advance their private counters under the LAPIC timer with no syscalls. |
 | M16 user pointers | An unmapped address and a non-canonical address are rejected by `copyFromUser` with `-EFAULT`; the task survives and exits 0. |
 | M16 teardown | The nine address spaces created by the test are all destroyed before the check succeeds. |
+| M17 argv/envp | The general loader reports `argv`/`envp` through the fixture, and the process exits 42. |
+| M17 concurrency | Two processes are live at once; a fast one exits 42 and a sleeping one exits 43. |
+| M17 wait timeout | A short finite wait times out while the process sleeps and a longer retry returns the stored status. |
+| M17 generations | Reusing a reaped slot advances the generation and an old handle returns `invalid`. |
+| M17 NX | Fetching from a RW+NX data page faults only that process with `-15`; a sibling exits 44. |
+| M17 guard page | Writing to the unmapped stack guard faults only that process with `-15`; a sibling exits 44. |
+| M17 rejected loads | A bad header, wrong machine, overlapping segments, and an oversized stack argument are rejected. |
+| M17 reclaim | Created/destroyed address spaces and free pages match after the process run; the table ends empty. |
 
 ## Limitations
 
@@ -505,17 +551,22 @@ The scheduler is exercised by the selftest image described in
   smallest effective sleep and a wakeup can be up to one tick late.
 - **Fixed task limit:** 32 slots total, including the boot task and one idle task
   per CPU. Unreaped joinable tasks hold their slots.
-- **Static stacks:** tasks use caller-owned stacks; there is no guard page or
-  automatic stack allocation. User tasks additionally own a fixed four-page
-  user stack in the low half, also without a guard page.
-- **User tasks are test-shaped:** `createUser` accepts an already-built address
-  space and a raw user `RSP`; there is no `exec`, `argv`, general process
-  creation, or reaping. The only image loader is the M16 ELF fixture.
+- **Static stacks:** tasks use caller-owned stacks for kernel tasks; user
+  processes get a 16 KiB heap-allocated kernel stack from the process layer.
+  Kernel tasks have no guard page. User processes have a fixed four-page user
+  stack and one unmapped guard page, but no automatic stack growth.
+- **Process API is kernel-side:** `spawn`/`wait`/`reap` are not exposed to ring
+  3. There is no `exec`, no file-descriptor table, and the syscall ABI is
+  unchanged.
+- **Single-threaded processes:** a process owns exactly one scheduler task; there
+  are no threads, `clone`, or shared address spaces.
+- **Fixed process limit:** 16 process slots in addition to the 32 scheduler task
+  slots. An unreaped process holds both.
 - **Address spaces are pinned:** a user address space cannot migrate to another
   CPU, so its teardown avoids a remote TLB shootdown but migration remains
   impossible.
-- **No NX/W^X:** the loader maps the test text read-only and data writable, but
-  the NX bit is not enabled, so writable pages are executable.
+- **Tick-granular waits:** `process.wait` polls once per tick, so a finite
+  timeout can be up to one tick late.
 - **Idle cannot block**; blocking calls return immediately for idle tasks.
 - **Fallback timer:** CPU 0 uses the PIT if LAPIC calibration fails or the
   `force_pit` image is built. Normal operation uses the same LAPIC mechanism as
@@ -547,7 +598,8 @@ The scheduler is exercised by the selftest image described in
 | Ring-3 user tasks | **IMPLEMENTED** | Per-task low-half PML4, 16 KiB kernel stack, `iretq` to DPL3. |
 | CR3 and TSS switching | **IMPLEMENTED** | `switchTaskLocked` loads the task PML4 and rewrites TSS `RSP0`. |
 | User exit/fault teardown | **IMPLEMENTED** | Kernel-root switch, low-half free, PML4 free; fault status `-(vector + 1)`. |
-| General process creation/reaping | **PLANNED** | M17. |
+| General process creation/reaping | **IMPLEMENTED** | Process table, `spawn`/`wait`/`reap`, stored status, generation handles. |
+| Process wait/timeout | **IMPLEMENTED** | Tick-granular polling; timeout is retryable; status survives until reaping. |
 | Task migration and balancing | **PLANNED** | M20. |
 
 ## Related documentation
