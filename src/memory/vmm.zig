@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const limine = @import("../limine.zig");
+const cpu = @import("../arch/x86_64/cpu.zig");
 const pmm = @import("pmm.zig");
 const sync = @import("../sync.zig");
 
@@ -28,6 +29,8 @@ pub const accessed: u64 = 1 << 5;
 pub const dirty: u64 = 1 << 6;
 pub const huge: u64 = 1 << 7;
 pub const global: u64 = 1 << 8;
+/// No-execute leaf bit. EFER.NXE must be enabled before this bit is used.
+pub const execute_disable: u64 = 1 << 63;
 
 /// Physical-address bits in a 4-level paging entry (bits 12..51).
 pub const address_mask: u64 = 0x000f_ffff_ffff_f000;
@@ -40,6 +43,12 @@ pub const kernel_ro: u64 = present;
 pub const user_max_address: u64 = 0x0000_8000_0000_0000;
 pub const user_rw: u64 = present | writable | user;
 pub const user_ro: u64 = present | user;
+/// User code: readable and executable, never writable.
+pub const user_rx: u64 = present | user;
+/// User read-only data: readable but not writable or executable.
+pub const user_ro_nx: u64 = present | user | execute_disable;
+/// User writable data and stacks: never executable.
+pub const user_rw_nx: u64 = present | writable | user | execute_disable;
 
 const PageTable = [512]u64;
 
@@ -52,6 +61,7 @@ pub const InitError = error{
     FiveLevelPaging,
     BadKernelRange,
     BadKernelMapping,
+    NoNoExecute,
     OutOfMemory,
 };
 
@@ -99,6 +109,10 @@ pub fn setTlbShootdownHandler(handler: TlbShootdownFn) void {
 
 pub fn init() InitError!void {
     if (initialized) return;
+
+    // NX is a hard requirement for the user W^X policy. Enable it before any
+    // page table is built so no NX leaf can be installed with NXE clear.
+    if (!cpu.enableNx()) return error.NoNoExecute;
 
     hhdm_offset = limine.hhdmOffset() orelse return error.NoHhdm;
     const executable = limine.executableAddress() orelse return error.NoExecutableAddress;
@@ -306,7 +320,13 @@ fn mapPageInLocked(root: u64, virt: u64, phys: u64, flags: u64) bool {
 }
 
 pub fn mapUserPage(root: u64, virt: u64, phys: u64, writable_page: bool) bool {
-    return mapPageIn(root, virt, phys, if (writable_page) user_rw else user_ro);
+    return mapUserPageFlags(root, virt, phys, if (writable_page) user_rw_nx else user_ro_nx);
+}
+
+/// Map one user leaf with explicit flags. `flags` must include `user`; NX is
+/// preserved verbatim, so callers choose RX, RO+NX, or RW+NX.
+pub fn mapUserPageFlags(root: u64, virt: u64, phys: u64, flags: u64) bool {
+    return mapPageIn(root, virt, phys, flags | user);
 }
 
 pub fn mapPage(virt: u64, phys: u64, flags: u64) bool {

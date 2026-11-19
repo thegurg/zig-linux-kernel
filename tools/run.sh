@@ -121,6 +121,17 @@ if [ "$MODE" != "run" ]; then
            grep -q "m16: user badptr rejected" "$WORK/serial.log" &&
            grep -q "m16: user badptr status=0" "$WORK/serial.log" &&
            grep -q "m16: aspace created=9 destroyed=9" "$WORK/serial.log" &&
+           grep -q "M17 checks passed" "$WORK/serial.log" &&
+           grep -q "m17: proc argv=m17proc,basic env=M17=1" "$WORK/serial.log" &&
+           grep -qE "m17: argv status=42 pid=[0-9]+ gen=[0-9]+" "$WORK/serial.log" &&
+           grep -q "m17: concurrent statuses=42,43" "$WORK/serial.log" &&
+           grep -q "m17: wait timeout=timeout retry=exited/43" "$WORK/serial.log" &&
+           grep -q "m17: generation advanced=1 stale=invalid" "$WORK/serial.log" &&
+           grep -q "m17: nx fault status=-15 sibling=44" "$WORK/serial.log" &&
+           grep -q "m17: guard fault status=-15 sibling=44" "$WORK/serial.log" &&
+           grep -q "m17: bad loads rejected=4" "$WORK/serial.log" &&
+           grep -qE "m17: reclaim aspaces created=[0-9]+ destroyed=[0-9]+ free_pages_match=1" "$WORK/serial.log" &&
+           grep -qE "m17: process table slots=0 live=0 spawned=[0-9]+ reaped=[0-9]+" "$WORK/serial.log" &&
            grep -q "M14 checks passed" "$WORK/serial.log" &&
            grep -q "M13 checks passed" "$WORK/serial.log" &&
            grep -q "M12 checks passed" "$WORK/serial.log" &&

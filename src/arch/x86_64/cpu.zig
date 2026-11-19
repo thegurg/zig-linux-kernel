@@ -4,6 +4,47 @@ const gdt = @import("gdt.zig");
 
 pub const max_cpus = gdt.max_cpus;
 
+const efer_msr: u32 = 0xc0000080;
+const efer_nx: u64 = 1 << 11;
+
+const CpuidResult = struct {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+};
+
+fn cpuid(leaf: u32, subleaf: u32) CpuidResult {
+    var eax: u32 = leaf;
+    var ebx: u32 = undefined;
+    var ecx: u32 = subleaf;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "+{eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "+{ecx}" (ecx),
+          [edx] "={edx}" (edx),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+/// Return true when CPUID advertises the no-execute page-table bit.
+pub fn nxSupported() bool {
+    const max_extended = cpuid(0x8000_0000, 0).eax;
+    if (max_extended < 0x8000_0001) return false;
+    return (cpuid(0x8000_0001, 0).edx & (1 << 20)) != 0;
+}
+
+/// Enable EFER.NXE on the current CPU. Must run before any page-table entry
+/// sets the NX bit; otherwise the CPU treats the leaf as a reserved-bit fault.
+pub fn enableNx() bool {
+    if (!nxSupported()) return false;
+
+    const efer = readMsr(efer_msr);
+    if ((efer & efer_nx) == 0) writeMsr(efer_msr, efer | efer_nx);
+    return (readMsr(efer_msr) & efer_nx) != 0;
+}
+
 /// Per-CPU data reachable through the GS base MSR.
 ///
 /// The first field is deliberately `fpu_state`: the interrupt entry stub in

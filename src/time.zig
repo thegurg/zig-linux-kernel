@@ -202,8 +202,8 @@ pub fn tickCount() u64 {
 pub fn msToTicks(ms: u64) u64 {
     if (ms == 0) return 0;
     const max = ~@as(u64, 0);
-    if (ms > (max - (tick_hz - 1)) / tick_hz) return max;
-    return (ms * tick_hz + (tick_hz - 1)) / 1000;
+    if (ms > (max - 999) / tick_hz) return max;
+    return (ms * tick_hz + 999) / 1000;
 }
 
 /// Convert a nanosecond duration to scheduler ticks, rounding up.

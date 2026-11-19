@@ -24,13 +24,14 @@ const idt = @import("arch/x86_64/idt.zig");
 const pic = @import("arch/x86_64/pic.zig");
 const pit = @import("arch/x86_64/pit.zig");
 const sched = @import("sched.zig");
+const process = @import("process.zig");
 const smp = @import("smp.zig");
 const sync = @import("sync.zig");
 const time = @import("time.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 const user = @import("user.zig");
 
-pub const version = "0.17.0-m16";
+pub const version = "0.17.0-m17";
 
 const timer_hz: u32 = time.tick_hz;
 const timer_test_ticks: u64 = 30;
@@ -53,6 +54,18 @@ const m16_kernel_stack_size = 16 * 1024;
 const m16_join_timeout_ms: u64 = 2_000;
 const m16_preempt_spin: u64 = 200_000_000;
 var m16_kernel_stacks: [12][m16_kernel_stack_size]u8 align(16) = undefined;
+
+const m17_wait_timeout_ms: u64 = 2_000;
+const m17_short_timeout_ms: u64 = 1;
+const m17_basic_argv = [_][]const u8{ "m17proc", "basic" };
+const m17_sleep_argv = [_][]const u8{ "m17proc", "sleep" };
+const m17_instant_argv = [_][]const u8{ "m17proc", "instant" };
+const m17_nx_argv = [_][]const u8{ "m17proc", "nx" };
+const m17_guard_argv = [_][]const u8{ "m17proc", "guard" };
+const m17_basic_env = [_][]const u8{"M17=1"};
+var m17_elf_copy: [16 * 1024]u8 = undefined;
+var m17_bad_elf: [64]u8 = @splat(0);
+var m17_big_arg: [20_000]u8 = @splat('x');
 
 var task_a_stack: [task_stack_size]u8 align(16) = undefined;
 var task_b_stack: [task_stack_size]u8 align(16) = undefined;
@@ -419,6 +432,7 @@ export fn kmain() callconv(.c) noreturn {
     const bsp_lapic_id = if (lapic_ready) lapic.id() else smp.getStats().bsp_lapic_id;
     cpu.initPerCpu(0, bsp_lapic_id);
     sched.init();
+    process.init();
     vmm.setTlbShootdownHandler(&sched.shootdownTlb);
 
     // Establish the time base before any AP is released. The TSC calibration
@@ -620,6 +634,13 @@ export fn kmain() callconv(.c) noreturn {
             qemu.exit(qemu.EXIT_FAILURE);
         }
         serial.write("selftest: M16 checks passed\n");
+
+        serial.write("selftest: checking M17 ELF loading and process lifecycle\n");
+        if (!selftestM17()) {
+            serial.write("selftest: M17 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M17 checks passed\n");
 
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
@@ -2014,6 +2035,211 @@ fn selftestM16() bool {
     const destroyed = after.destroyed - before.destroyed;
     console.print("m16: aspace created={d} destroyed={d}\n", .{ created, destroyed });
     return created == destroyed;
+}
+
+/// M17: general ELF loading, SysV argv/envp stack, W^X/NX, waits, reaping, and
+/// generation-tagged process handles.
+fn selftestM17() bool {
+    // Warm the heap so the kernel-stack block is already in the free list when
+    // the leak-free reclaim comparison below takes its snapshot.
+    const warm = process.spawn(user.proc_elf, .{
+        .name = "m17-warm",
+        .argv = &m17_instant_argv,
+    }) catch |err| {
+        console.print("m17: warm spawn failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    var result = process.wait(warm, m17_wait_timeout_ms);
+    if (result.outcome != .exited or result.status != 44) return false;
+    var reaped = process.reap(warm);
+    if (reaped.outcome != .reaped or reaped.status != 44) return false;
+
+    const aspace_before = vmm.addressSpaceStats();
+    const free_before = pmm.stats().free_pages;
+
+    // argc/argv/envp construction: the program prints the strings it received.
+    var handle = process.spawn(user.proc_elf, .{
+        .name = "m17-argv",
+        .argv = &m17_basic_argv,
+        .envp = &m17_basic_env,
+    }) catch |err| {
+        console.print("m17: argv spawn failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    result = process.wait(handle, m17_wait_timeout_ms);
+    if (result.outcome != .exited or result.status != 42) {
+        console.print("m17: argv wait outcome={s} status={d}\n", .{
+            @tagName(result.outcome), result.status,
+        });
+        return false;
+    }
+    console.print("m17: argv status={d} pid={d} gen={d}\n", .{
+        result.status, handle.pid, handle.generation,
+    });
+    reaped = process.reap(handle);
+    if (reaped.outcome != .reaped or reaped.status != 42) return false;
+
+    // Two live processes: one exits immediately, one sleeps for 50 ms.
+    const fast = process.spawn(user.proc_elf, .{
+        .name = "m17-fast",
+        .argv = &m17_basic_argv,
+        .envp = &m17_basic_env,
+    }) catch return false;
+    const slow = process.spawn(user.proc_elf, .{
+        .name = "m17-slow",
+        .argv = &m17_sleep_argv,
+    }) catch {
+        _ = process.reap(fast);
+        return false;
+    };
+
+    const fast_result = process.wait(fast, m17_wait_timeout_ms);
+    const slow_result = process.wait(slow, m17_wait_timeout_ms);
+    console.print("m17: concurrent statuses={d},{d}\n", .{
+        fast_result.status, slow_result.status,
+    });
+    if (fast_result.outcome != .exited or fast_result.status != 42) return false;
+    if (slow_result.outcome != .exited or slow_result.status != 43) return false;
+    if (process.reap(fast).outcome != .reaped) return false;
+    if (process.reap(slow).outcome != .reaped) return false;
+
+    // A finite wait must time out while the process is still sleeping, then a
+    // longer wait must observe the stored exit status.
+    handle = process.spawn(user.proc_elf, .{
+        .name = "m17-timeout",
+        .argv = &m17_sleep_argv,
+    }) catch return false;
+    const timed = process.wait(handle, m17_short_timeout_ms);
+    if (timed.outcome != .timeout) return false;
+    const retried = process.wait(handle, m17_wait_timeout_ms);
+    if (retried.outcome != .exited or retried.status != 43) return false;
+    console.print("m17: wait timeout=timeout retry=exited/{d}\n", .{retried.status});
+    reaped = process.reap(handle);
+    console.print("m17: reap outcome={s} status={d}\n", .{
+        @tagName(reaped.outcome), reaped.status,
+    });
+    if (reaped.outcome != .reaped or reaped.status != 43) return false;
+
+    // A stale generation must not name the slot's next process, and the slot
+    // must be reusable after reaping.
+    const old_handle = handle;
+    handle = process.spawn(user.proc_elf, .{
+        .name = "m17-reuse",
+        .argv = &m17_instant_argv,
+    }) catch return false;
+    const stale = process.wait(old_handle, 0);
+    const generation_advanced = handle.generation != old_handle.generation;
+    console.print("m17: generation advanced={d} stale={s}\n", .{
+        @intFromBool(generation_advanced), @tagName(stale.outcome),
+    });
+    if (!generation_advanced or stale.outcome != .invalid) return false;
+    const reuse_result = process.wait(handle, m17_wait_timeout_ms);
+    if (reuse_result.outcome != .exited or reuse_result.status != 44) return false;
+    reaped = process.reap(handle);
+    if (reaped.outcome != .reaped or reaped.status != 44) return false;
+
+    // NX enforcement: fetching from the RW+NX data page kills only the faulting
+    // process; a sibling process still exits normally.
+    const nx = process.spawn(user.proc_elf, .{
+        .name = "m17-nx",
+        .argv = &m17_nx_argv,
+    }) catch return false;
+    const nx_sibling = process.spawn(user.proc_elf, .{
+        .name = "m17-nx-sibling",
+        .argv = &m17_instant_argv,
+    }) catch {
+        _ = process.reap(nx);
+        return false;
+    };
+    const nx_result = process.wait(nx, m17_wait_timeout_ms);
+    const nx_sibling_result = process.wait(nx_sibling, m17_wait_timeout_ms);
+    console.print("m17: nx fault status={d} sibling={d}\n", .{
+        nx_result.status, nx_sibling_result.status,
+    });
+    if (nx_result.outcome != .exited or nx_result.status != -15) return false;
+    if (nx_sibling_result.outcome != .exited or nx_sibling_result.status != 44) return false;
+    if (process.reap(nx).outcome != .reaped) return false;
+    if (process.reap(nx_sibling).outcome != .reaped) return false;
+
+    // The page immediately below the stack is an unmapped guard page.
+    const guard = process.spawn(user.proc_elf, .{
+        .name = "m17-guard",
+        .argv = &m17_guard_argv,
+    }) catch return false;
+    const guard_sibling = process.spawn(user.proc_elf, .{
+        .name = "m17-guard-sibling",
+        .argv = &m17_instant_argv,
+    }) catch {
+        _ = process.reap(guard);
+        return false;
+    };
+    const guard_result = process.wait(guard, m17_wait_timeout_ms);
+    const guard_sibling_result = process.wait(guard_sibling, m17_wait_timeout_ms);
+    console.print("m17: guard fault status={d} sibling={d}\n", .{
+        guard_result.status, guard_sibling_result.status,
+    });
+    if (guard_result.outcome != .exited or guard_result.status != -15) return false;
+    if (guard_sibling_result.outcome != .exited or guard_sibling_result.status != 44) return false;
+    if (process.reap(guard).outcome != .reaped) return false;
+    if (process.reap(guard_sibling).outcome != .reaped) return false;
+
+    // Malformed and unsupported images must be rejected without leaking pages,
+    // address spaces, kernel stacks, or process slots.
+    var rejected: usize = 0;
+    if (process.spawn(m17_bad_elf[0..], .{ .name = "m17-bad" })) |_| {
+        return false;
+    } else |_| {
+        rejected += 1;
+    }
+
+    if (user.proc_elf.len > m17_elf_copy.len) return false;
+    @memcpy(m17_elf_copy[0..user.proc_elf.len], user.proc_elf);
+    m17_elf_copy[18] = 3; // EM_386
+    m17_elf_copy[19] = 0;
+    if (process.spawn(m17_elf_copy[0..user.proc_elf.len], .{ .name = "m17-mach" })) |_| {
+        return false;
+    } else |_| {
+        rejected += 1;
+    }
+
+    @memcpy(m17_elf_copy[0..user.proc_elf.len], user.proc_elf);
+    const phoff = std.mem.readInt(u64, m17_elf_copy[32..40], .little);
+    const second_vaddr: usize = @intCast(phoff + 56 + 16);
+    std.mem.writeInt(u64, m17_elf_copy[second_vaddr..][0..8], 0x0040_0000, .little);
+    if (process.spawn(m17_elf_copy[0..user.proc_elf.len], .{ .name = "m17-overlap" })) |_| {
+        return false;
+    } else |_| {
+        rejected += 1;
+    }
+
+    var big_argv: [2][]const u8 = .{ "m17proc", m17_big_arg[0..] };
+    if (process.spawn(user.proc_elf, .{
+        .name = "m17-overflow",
+        .argv = &big_argv,
+    })) |_| {
+        return false;
+    } else |_| {
+        rejected += 1;
+    }
+
+    console.print("m17: bad loads rejected={d}\n", .{rejected});
+    if (rejected != 4) return false;
+
+    const aspace_after = vmm.addressSpaceStats();
+    const created = aspace_after.created - aspace_before.created;
+    const destroyed = aspace_after.destroyed - aspace_before.destroyed;
+    const free_after = pmm.stats().free_pages;
+    const free_match = free_after == free_before;
+    console.print("m17: reclaim aspaces created={d} destroyed={d} free_pages_match={d}\n", .{
+        created, destroyed, @intFromBool(free_match),
+    });
+    if (created != destroyed or !free_match) return false;
+
+    const stats = process.stats();
+    console.print("m17: process table slots={d} live={d} spawned={d} reaped={d}\n", .{
+        stats.slots, stats.live, stats.spawned, stats.reaped,
+    });
+    return stats.slots == 0 and stats.live == 0 and stats.spawned == stats.reaped;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

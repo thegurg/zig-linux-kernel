@@ -1293,6 +1293,20 @@ pub fn currentId() u32 {
     return task.id;
 }
 
+pub const TaskStatus = struct {
+    state: TaskState,
+    exit_status: i32,
+};
+
+/// Snapshot a task's state by ID. The ID stays stable while a joinable task has
+/// not been detached, which is the process table's lifetime rule.
+pub fn taskStatus(id: u32) ?TaskStatus {
+    const guard = task_lock.acquire();
+    defer guard.release();
+    const task = findTaskById(id) orelse return null;
+    return .{ .state = task.state, .exit_status = task.exit_status };
+}
+
 fn currentTask() ?*Task {
     return cpu_state[cpu.currentIndex()].current;
 }

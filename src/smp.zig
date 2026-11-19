@@ -671,6 +671,9 @@ export fn ap_main(ctx: *ApContext, info: *limine.MpInfo) callconv(.c) noreturn {
     gdt.setKernelStack(ctx.gdt_cpu, ctx.stack_top);
     gdt.load(ctx.gdt_cpu);
     idt.load();
+    // EFER is per-logical-CPU; the BSP enabled NXE in `vmm.init`, but each AP
+    // must enable it before it can run user tasks with NX leaves.
+    if (!cpu.enableNx()) park();
     // Install GS/`%gs:0` before anything that can fault, including LAPIC
     // programming. `cpu.initPerCpu` replaces the scratch FPU area with the
     // boot area, and `sched.initCpu` later points it at the idle task.
