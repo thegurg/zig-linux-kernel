@@ -92,6 +92,81 @@ pub fn allocPage() ?u64 {
     return allocPageLocked();
 }
 
+/// Allocate `count` physically contiguous pages. Used by DMA-capable devices
+/// whose legacy virtqueue layout must live in one contiguous physical region.
+pub fn allocContiguous(count: usize) ?u64 {
+    if (!initialized or count == 0 or count > page_count) return null;
+
+    const guard = lock.acquire();
+    defer guard.release();
+
+    var run: usize = 0;
+    var start: usize = 0;
+    var page: usize = 0;
+    while (page < page_count) : (page += 1) {
+        if (bitSet(&used_bitmap, page)) {
+            run = 0;
+            continue;
+        }
+        if (run == 0) start = page;
+        run += 1;
+        if (run < count) continue;
+
+        var mark = start;
+        while (mark < start + count) : (mark += 1) {
+            setBit(&used_bitmap, mark);
+            setBit(&allocated_bitmap, mark);
+        }
+        free_pages -= count;
+        next_hint_word = start / 64;
+        return @as(u64, @intCast(start)) * page_size;
+    }
+
+    return null;
+}
+
+/// Free a block returned by `allocContiguous`. Every page must have been
+/// allocated, otherwise nothing is changed.
+pub fn freeContiguous(address: u64, count: usize) bool {
+    if (!initialized or count == 0 or address % page_size != 0) return false;
+
+    const start: usize = @intCast(address / page_size);
+    if (start + count > page_count) return false;
+
+    const guard = lock.acquire();
+    defer guard.release();
+
+    var page = start;
+    while (page < start + count) : (page += 1) {
+        if (!bitSet(&allocated_bitmap, page) or !bitSet(&used_bitmap, page)) return false;
+    }
+
+    page = start;
+    while (page < start + count) : (page += 1) {
+        clearBit(&allocated_bitmap, page);
+        clearBit(&used_bitmap, page);
+    }
+    free_pages += count;
+    if (start / 64 < next_hint_word) next_hint_word = start / 64;
+    return true;
+}
+
+fn bitSet(bitmap: *const [bitmap_words]u64, page: usize) bool {
+    const word = page / 64;
+    const mask = @as(u64, 1) << @intCast(page % 64);
+    return (bitmap[word] & mask) != 0;
+}
+
+fn setBit(bitmap: *[bitmap_words]u64, page: usize) void {
+    const word = page / 64;
+    bitmap[word] |= @as(u64, 1) << @intCast(page % 64);
+}
+
+fn clearBit(bitmap: *[bitmap_words]u64, page: usize) void {
+    const word = page / 64;
+    bitmap[word] &= ~(@as(u64, 1) << @intCast(page % 64));
+}
+
 fn allocPageLocked() ?u64 {
     var scanned: usize = 0;
     while (scanned < bitmap_words) : (scanned += 1) {

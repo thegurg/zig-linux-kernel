@@ -76,6 +76,33 @@ pub const RsdpResponse = extern struct {
 /// x86-64 entry from Limine's MP (multiprocessor) protocol. `reserved` and
 /// `goto_address` are managed by the bootloader until we publish an entry;
 /// `extra_argument` is free for the kernel.
+/// One file passed to the kernel through the Limine module mechanism. The
+/// loader maps module contents somewhere in the HHDM; `address` is that virtual
+/// address. `path` is the on-disk path and `string` is the configured
+/// `MODULE_STRING` (both NUL-terminated).
+pub const File = extern struct {
+    revision: u64,
+    address: u64,
+    size: u64,
+    path: [*:0]const u8,
+    string: [*:0]const u8,
+    media_type: u32,
+    unused: u32,
+    tftp_ip: u32,
+    tftp_port: u32,
+    partition_index: u32,
+    mbr_disk_id: u32,
+    gpt_disk_uuid: [16]u8,
+    gpt_part_uuid: [16]u8,
+    part_uuid: [16]u8,
+};
+
+pub const ModuleResponse = extern struct {
+    revision: u64,
+    module_count: u64,
+    modules: [*]?*File,
+};
+
 pub const MpInfo = extern struct {
     processor_id: u32,
     lapic_id: u32,
@@ -158,6 +185,12 @@ const MemmapRequest = extern struct {
     response: ?*MemmapResponse,
 };
 
+const ModuleRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*ModuleResponse,
+};
+
 const MpRequest = extern struct {
     id: [4]u64,
     revision: u64,
@@ -199,6 +232,14 @@ export var memmap_request: MemmapRequest linksection(".limine_requests") = .{
 
 export var executable_address_request: ExecutableAddressRequest linksection(".limine_requests") = .{
     .id = .{ common_magic_0, common_magic_1, 0x71ba76863cc55f63, 0xb2644a48c516a487 },
+    .revision = 0,
+    .response = null,
+};
+
+/// Request module (initramfs) metadata. Limine maps each module and reports its
+/// virtual address and length.
+export var module_request: ModuleRequest linksection(".limine_requests") = .{
+    .id = .{ common_magic_0, common_magic_1, 0x3e7e279702be32af, 0xca1c4f3bd1280cee },
     .revision = 0,
     .response = null,
 };
@@ -262,6 +303,32 @@ pub fn rsdp() ?*RsdpResponse {
 
 pub fn mp() ?*MpResponse {
     return mp_request.response;
+}
+
+pub fn modules() ?*ModuleResponse {
+    return module_request.response;
+}
+
+pub fn moduleCount() usize {
+    const response = modules() orelse return 0;
+    return @intCast(response.module_count);
+}
+
+pub fn moduleAt(index: usize) ?*File {
+    const response = modules() orelse return null;
+    if (index >= response.module_count) return null;
+    return response.modules[index];
+}
+
+/// Return the first module whose `MODULE_STRING` or path contains `needle`.
+pub fn findModule(needle: []const u8) ?*File {
+    var index: usize = 0;
+    while (index < moduleCount()) : (index += 1) {
+        const file = moduleAt(index) orelse continue;
+        if (std.mem.indexOf(u8, std.mem.span(file.string), needle) != null) return file;
+        if (std.mem.indexOf(u8, std.mem.span(file.path), needle) != null) return file;
+    }
+    return null;
 }
 
 test "base revision marker layout" {

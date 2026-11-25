@@ -2,7 +2,7 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M17; **RESOLVED** entries are kept so the audit trail and the remaining
+after M18; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
@@ -10,7 +10,7 @@ work stay separate.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
 > issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, M14, M15, M16, or
-> M17.
+> M18.
 
 ## Critical
 
@@ -129,6 +129,8 @@ would still see the normal exception path rather than an NMI-safe path.
 - AP boot/task stacks are 16 KiB; the BSP kernel stack is 64 KiB; each #DF IST
   stack is 8 KiB.
 - Wait queues hold at most `max_tasks` waiters.
+- The VFS has eight mount slots and a 32-byte mount prefix; the virtio-blk
+  driver allows one outstanding request and a 512-entry queue ceiling.
 
 ### 8. No task migration or load balancing
 
@@ -158,7 +160,7 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11, M12, M13, M14, M15, M16, and M17:
+Covered in M11, M12, M13, M14, M15, M16, M17, and M18:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
@@ -177,9 +179,13 @@ Covered in M11, M12, M13, M14, M15, M16, and M17:
 - general ELF loading, rejected malformed images, `argv`/`envp`, concurrent
   spawn/wait, wait timeout and retry, generation reuse, NX and guard-page
   faults, and leak-free process/address-space reclamation;
+- legacy PCI enumeration, virtio-blk identification, FAT boot-sector reads,
+  sector write/readback, FAT16 mounting, single-cluster/subdirectory/
+  multi-cluster VFS reads, the Limine-module tar, and loading/running
+  `INIT.ELF` from FAT;
 - the `force_pit` fallback boot path;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11-M17 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11-M18 result markers.
 
 Still open:
 
@@ -190,7 +196,12 @@ Still open:
 - no cross-CPU mutex/condition stress test;
 - no allocator test under PMM exhaustion or mapping failure;
 - no TSC-sync timeout or out-of-tolerance-offset test;
-- no concurrent-joiner, `detach`-race, or joined-slot-reuse stress test.
+- no concurrent-joiner, `detach`-race, or joined-slot-reuse stress test;
+- no FAT32-on-device, fragmented-file, corrupt-chain, long-LFN, FAT-write,
+  unusual-BPB, or concurrent-VFS test;
+- no virtio-blk timeout/reset/queue-exhaustion test and no MSI-X/modern-virtio
+  test;
+- no PCI bridge/secondary-bus, ECAM, or high-64-bit-BAR test.
 
 ### 12. ACPI/IOAPIC platform assumptions are narrow
 
@@ -373,6 +384,29 @@ or `argv` receiving path other than the initial stack. The numbers and errors
 should be treated as a project-local test interface rather than a stable system
 call ABI.
 
+### 24. The storage stack is polling-only, read-only, and single-request
+
+**Status: PARTIAL.** **Sources:**
+[`src/drivers/virtio_blk.zig`](../../src/drivers/virtio_blk.zig),
+[`src/fs/fat.zig`](../../src/fs/fat.zig),
+[`src/fs/vfs.zig`](../../src/fs/vfs.zig).
+
+The virtio-blk driver implements the legacy interface and polls the used ring;
+it never enables or handles interrupts. MSI-X and the modern virtio capability
+walk are not implemented, and a modern-only device produces `ModernOnly`
+instead of a fallback. One request is outstanding at a time, each sector is
+copied through a single bounce buffer, and there is no request queue or retry
+policy beyond a bounded spin.
+
+FAT is read-only. There is no create, delete, rename, truncate, or metadata
+update; FAT12 is rejected; only 512-byte logical sectors are accepted; `..` is
+rejected; and reads restart the cluster walk instead of caching the chain. The
+VFS has no permissions, directory streams, or concurrent mount support, and the
+mount table is not locked because mounts currently happen once during boot.
+
+The ring-3 ABI still has no `open`/`read`/`close`; `INIT.ELF` is loaded by the
+kernel from FAT and run, but a user program cannot open files itself.
+
 ## Implementation status summary
 
 | Area | Status | Notes |
@@ -399,8 +433,15 @@ call ABI.
 | Task migration | **DEFERRED** | Planned for M20. |
 | ACPI/MADT discovery | **IMPLEMENTED** | Validated RSDP/XSDT/RSDT/MADT; BSP-only; narrow table coverage. |
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection read/write, mask/unmask, IRQ0 delivery test. |
-| MSI/MSI-X and PCI routing | **DEFERRED** | Planned for M18; not part of M17. |
-| Test coverage | **PARTIAL** | M11-M17 tests added; gaps listed above. |
+| PCI enumeration | **IMPLEMENTED** | Legacy `0xCF8`/`0xCFC`, BAR decode, capability walk; ECAM is deferred. |
+| virtio-blk polling | **IMPLEMENTED** | Legacy split queue, three-descriptor chain, sector read/write, bounded polling. |
+| MSI/MSI-X and modern virtio | **DEFERRED** | Polling and the legacy interface are the M18 path. |
+| Block layer | **IMPLEMENTED** | Sector reads/writes with capacity checks. |
+| FAT16/FAT32 | **IMPLEMENTED** | Read-only, short and VFAT long names, cluster chains; FAT12 deferred. |
+| VFS | **PARTIAL** | Fixed mount table, longest-prefix matching, stateless reads; no permissions or writes. |
+| Initramfs | **IMPLEMENTED** | Limine module plus ustar reader. |
+| Filesystem writes | **DEFERRED** | No FAT mutation or user file syscalls. |
+| Test coverage | **PARTIAL** | M11-M18 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 16 processes, 8 CPUs. |
 
 ## Related documentation

@@ -4,8 +4,8 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M17 are complete and validated through the QEMU test
-flow. M18 is the next milestone. M18-M20 are planned and are recorded below with
+**Current status:** M0-M18 are complete and validated through the QEMU test
+flow. M19 is the next milestone. M19-M20 are planned and are recorded below with
 their scope and verification criteria.
 
 ## Pre-M11 bugfix pass (complete)
@@ -568,7 +568,7 @@ demand paging. The process API is kernel-side; the ring-3 syscall ABI is
 unchanged. These limitations are recorded in
 [technical debt](../development/technical-debt.md).
 
-## M18: PCI, virtio-blk, and VFS/initramfs (planned)
+## M18: PCI, virtio-blk, and VFS/initramfs (complete)
 
 ### Goal
 
@@ -603,6 +603,74 @@ model.
 - If MSI-X is implemented, verify its capability setup and interrupt
   completion separately; the polling tests must keep passing.
 - Read a known file from the Limine-module initramfs.
+
+### Results
+
+The polling path, block layer, FAT16/FAT32 driver, VFS, and initramfs landed.
+MSI-X was intentionally not implemented, so the required polling path stays the
+only completion mechanism and the interrupt extension remains planned.
+
+- [`src/drivers/pci.zig`](../../src/drivers/pci.zig) implements legacy
+  `0xCF8`/`0xCFC` enumeration for buses 0-255, all slots, and every function of
+  a multi-function device. It decodes I/O, 32-bit MMIO, and 64-bit MMIO BARs,
+  walks the capability list, and enables the command bits a driver requests.
+  Firmware-assigned BARs are used as-is; ECAM/MCFG is not implemented.
+- [`src/drivers/virtio_blk.zig`](../../src/drivers/virtio_blk.zig) implements
+  the legacy virtio 0.9.5 interface over BAR0: reset, feature negotiation with
+  no optional bits, one split virtqueue, a three-descriptor request chain
+  (header/data/status), a page-aligned bounce buffer, and used-ring polling with
+  a bounded timeout. Reads and writes share the chain and differ only in the
+  request type and the device-write flag. The queue lives in one physically
+  contiguous allocation and the driver verifies its HHDM mapping before handing
+  physical addresses to the device.
+- [`src/fs/block.zig`](../../src/fs/block.zig) adds the sector interface with
+  range validation and an optional write function.
+- [`src/fs/fat.zig`](../../src/fs/fat.zig) mounts 512-byte-sector FAT16 and
+  FAT32 volumes, resolves ASCII paths case-insensitively, decodes short and
+  VFAT long names, follows cluster chains, and reads files at arbitrary offsets.
+  FAT12 is rejected; the driver never writes and owns no mutable global state.
+- [`src/fs/vfs.zig`](../../src/fs/vfs.zig) is a fixed eight-entry mount table
+  with longest-prefix matching and stateless file reads. `/` is backed by FAT
+  and `/initramfs` by the tar archive.
+- [`src/limine.zig`](../../src/limine.zig) adds the Limine module request and
+  file layout; [`src/initramfs.zig`](../../src/initramfs.zig) exposes the
+  module; [`src/fs/tar.zig`](../../src/fs/tar.zig) reads ustar archives with
+  checksum validation and prefix support.
+- [`tools/mkdisk.py`](../../tools/mkdisk.py) generates a 4 MiB FAT16 image with
+  `HELLO.TXT`, a multi-cluster `BIG.BIN`, `SUB/NESTED.TXT`, and a copy of
+  `proc.elf` as `INIT.ELF`; [`tools/mkinitramfs.py`](../../tools/mkinitramfs.py)
+  generates the module tar. Neither needs root or external filesystem tools.
+- [`src/storage.zig`](../../src/storage.zig) is the shared bring-up path:
+  enumerate PCI, initialize virtio-blk, mount FAT at `/`, and mount the Limine
+  module at `/initramfs`. Normal boot calls it and logs a non-fatal summary;
+  the selftest calls the same function and then exercises the direct FAT API,
+  the VFS, the tar reader, and `process.spawn`/`wait`/`reap` with `INIT.ELF`.
+
+Validation ran the full matrix: default KVM, TCG, `SMP=2`, `SMP=1`, and Debug
+all passed. The default run logged:
+
+```text
+m18: pci devices=7
+m18: pci virtio-blk bus=0 slot=3 fn=0 io=0x6000 irq=11
+m18: virtio-blk sectors=8192 queue=256 io=0x6000 ring_pages=3
+m18: sector read lba=0 signature=ok oem=ZIGKERNL
+m18: sector write/read lba=8191 bytes=512 ok
+m18: fat type=fat16 clusters=8123 root_cluster=0 cluster_bytes=512
+m18: vfs fat read file=/HELLO.TXT bytes=15
+m18: vfs nested read file=/SUB/NESTED.TXT bytes=20
+m18: vfs cluster chain bytes=1300 ok
+m18: initramfs bytes=10240 file_bytes=21
+m17: proc argv=init,basic env=M18=1
+m18: init from fat status=42 reap=reaped pid=1
+selftest: M18 checks passed
+```
+
+Limitations carried forward: polling only, no MSI-X, legacy virtio only, no
+modern virtio capability walk, read-only FAT with no create/delete/rename,
+FAT12 unsupported, no directory streams or permissions in the VFS, no
+`open`/`read` syscalls, and one outstanding block request at a time. These are
+recorded in [technical debt](../development/technical-debt.md) and in the
+[storage architecture page](../architecture/storage.md).
 
 ## M19: virtio-net and network stack (planned)
 

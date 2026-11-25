@@ -8,6 +8,10 @@ const std = @import("std");
 // markers, so it does not depend on kernel or architecture state.
 test {
     _ = @import("limine.zig");
+    _ = @import("fs/block.zig");
+    _ = @import("fs/fat.zig");
+    _ = @import("fs/tar.zig");
+    _ = @import("fs/vfs.zig");
 }
 
 test "host test harness works" {

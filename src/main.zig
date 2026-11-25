@@ -30,8 +30,14 @@ const sync = @import("sync.zig");
 const time = @import("time.zig");
 const qemu = @import("arch/x86_64/qemu.zig");
 const user = @import("user.zig");
+const pci = @import("drivers/pci.zig");
+const virtio_blk = @import("drivers/virtio_blk.zig");
+const fat = @import("fs/fat.zig");
+const tar = @import("fs/tar.zig");
+const vfs = @import("fs/vfs.zig");
+const storage = @import("storage.zig");
 
-pub const version = "0.17.0-m17";
+pub const version = "0.18.0-m18";
 
 const timer_hz: u32 = time.tick_hz;
 const timer_test_ticks: u64 = 30;
@@ -63,6 +69,10 @@ const m17_instant_argv = [_][]const u8{ "m17proc", "instant" };
 const m17_nx_argv = [_][]const u8{ "m17proc", "nx" };
 const m17_guard_argv = [_][]const u8{ "m17proc", "guard" };
 const m17_basic_env = [_][]const u8{"M17=1"};
+
+const m18_wait_timeout_ms: u64 = 2_000;
+const m18_init_argv = [_][]const u8{ "init", "basic" };
+const m18_init_env = [_][]const u8{"M18=1"};
 var m17_elf_copy: [16 * 1024]u8 = undefined;
 var m17_bad_elf: [64]u8 = @splat(0);
 var m17_big_arg: [20_000]u8 = @splat('x');
@@ -642,12 +652,27 @@ export fn kmain() callconv(.c) noreturn {
         }
         serial.write("selftest: M17 checks passed\n");
 
+        serial.write("selftest: checking M18 PCI, virtio-blk and VFS\n");
+        if (!selftestM18()) {
+            serial.write("selftest: M18 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M18 checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
         serial.write("selftest: exiting QEMU\n");
         qemu.exit(qemu.EXIT_SUCCESS);
     }
+
+    const storage_status = storage.init();
+    console.print("storage: pci={d} virtio={d} fat={d} initramfs={d}\n", .{
+        storage_status.pci_devices,
+        @intFromBool(storage_status.virtio),
+        @intFromBool(storage_status.fat),
+        @intFromBool(storage_status.initramfs),
+    });
 
     console.print("\nboot: {s} initialized (memory, per-CPU scheduler, SMP)\n", .{version});
 
@@ -2240,6 +2265,150 @@ fn selftestM17() bool {
         stats.slots, stats.live, stats.spawned, stats.reaped,
     });
     return stats.slots == 0 and stats.live == 0 and stats.spawned == stats.reaped;
+}
+
+/// M18: enumerate PCI, read and write the legacy virtio-blk disk, mount its
+/// FAT16 filesystem through the VFS, read the Limine-module initramfs, and load
+/// `INIT.ELF` from the filesystem into the M17 process model.
+fn selftestM18() bool {
+    const status = storage.init();
+    console.print("m18: pci devices={d}\n", .{status.pci_devices});
+    if (status.pci_devices == 0) return false;
+
+    const device = pci.find(pci.virtio_vendor_id, pci.virtio_legacy_blk_device_id) orelse {
+        console.write("m18: legacy virtio-blk not found\n");
+        return false;
+    };
+    const bar = device.bar(0) orelse return false;
+    console.print("m18: pci virtio-blk bus={d} slot={d} fn={d} io=0x{x} irq={d}\n", .{
+        device.bus, device.device, device.function, bar.base, device.irq_line,
+    });
+
+    if (!status.virtio) {
+        console.print("m18: virtio-blk init failed: {s}\n", .{
+            @errorName(status.virtio_error orelse error.NotInitialized),
+        });
+        return false;
+    }
+    const info = status.blk orelse return false;
+    console.print("m18: virtio-blk sectors={d} queue={d} io=0x{x} ring_pages={d}\n", .{
+        info.capacity_sectors, info.queue_size, info.io_base, info.ring_pages,
+    });
+    if (info.capacity_sectors < 64 or info.queue_size == 0 or info.ring_pages == 0) return false;
+
+    // Raw sector read: the generated image carries a FAT boot signature and a
+    // known OEM name.
+    var sector: [512]u8 = undefined;
+    if (!virtio_blk.readSectors(0, &sector)) {
+        console.write("m18: sector 0 read failed\n");
+        return false;
+    }
+    if (sector[510] != 0x55 or sector[511] != 0xaa) return false;
+    if (!std.mem.eql(u8, sector[3..11], "ZIGKERNL")) return false;
+    console.print("m18: sector read lba=0 signature=ok oem={s}\n", .{sector[3..11]});
+
+    // Raw sector write/read: use the final sector, which the image builder
+    // leaves outside every allocated cluster.
+    const last_sector = info.capacity_sectors - 1;
+    var pattern: [512]u8 = undefined;
+    for (&pattern, 0..) |*byte, index| byte.* = @truncate(index * 7 + 3);
+    if (!virtio_blk.writeSectors(last_sector, &pattern)) {
+        console.write("m18: sector write failed\n");
+        return false;
+    }
+    var readback: [512]u8 = @splat(0);
+    if (!virtio_blk.readSectors(last_sector, &readback)) return false;
+    if (!std.mem.eql(u8, &pattern, &readback)) return false;
+    console.print("m18: sector write/read lba={d} bytes=512 ok\n", .{last_sector});
+
+    // FAT mount and direct reads. `storage.init` mounted the same volume at
+    // `/`; the selftest exercises both the direct API and the VFS path.
+    if (!status.fat) {
+        console.print("m18: fat mount failed: {s}\n", .{
+            @errorName(status.fat_error orelse error.NotFat),
+        });
+        return false;
+    }
+    const volume = storage.fatVolume() orelse return false;
+    console.print("m18: fat type={s} clusters={d} root_cluster={d} cluster_bytes={d}\n", .{
+        @tagName(volume.fat_type),
+        volume.cluster_count,
+        volume.root_cluster,
+        fat.clusterBytes(volume),
+    });
+
+    var file = vfs.open("/HELLO.TXT") orelse {
+        console.write("m18: vfs open HELLO.TXT failed\n");
+        return false;
+    };
+    var hello: [64]u8 = undefined;
+    const hello_len = file.readAll(&hello) orelse return false;
+    if (!std.mem.eql(u8, hello[0..hello_len], "hello from fat\n")) return false;
+    console.print("m18: vfs fat read file={s} bytes={d}\n", .{ "/HELLO.TXT", hello_len });
+
+    file = vfs.open("/SUB/NESTED.TXT") orelse return false;
+    var nested: [64]u8 = undefined;
+    const nested_len = file.readAll(&nested) orelse return false;
+    if (!std.mem.eql(u8, nested[0..nested_len], "nested file contents")) return false;
+    console.print("m18: vfs nested read file={s} bytes={d}\n", .{ "/SUB/NESTED.TXT", nested_len });
+
+    // A multi-cluster file through the VFS exercises cluster-chain following.
+    file = vfs.open("/BIG.BIN") orelse return false;
+    var big: [1300]u8 = undefined;
+    const big_len = file.readAll(&big) orelse return false;
+    if (big_len != 1300 or big[0] != 0 or big[1299] != @as(u8, @intCast(1299 % 251))) return false;
+    console.print("m18: vfs cluster chain bytes={d} ok\n", .{big_len});
+
+    // Limine-module initramfs, independent of the block device.
+    if (!status.initramfs) {
+        console.write("m18: initramfs module missing\n");
+        return false;
+    }
+    const archive_data = storage.archive() orelse return false;
+    const tar_entry = (tar.find(archive_data, "HELLO.TXT") catch null) orelse {
+        console.write("m18: initramfs HELLO.TXT missing\n");
+        return false;
+    };
+    var tar_buffer: [64]u8 = undefined;
+    const tar_len = tar.readAll(archive_data, tar_entry, &tar_buffer) orelse return false;
+    if (!std.mem.eql(u8, tar_buffer[0..tar_len], "hello from initramfs\n")) return false;
+    var tar_file = vfs.open("/initramfs/HELLO.TXT") orelse return false;
+    var tar_vfs_buffer: [64]u8 = undefined;
+    const tar_vfs_len = tar_file.readAll(&tar_vfs_buffer) orelse return false;
+    if (!std.mem.eql(u8, tar_vfs_buffer[0..tar_vfs_len], "hello from initramfs\n")) return false;
+    console.print("m18: initramfs bytes={d} file_bytes={d}\n", .{
+        archive_data.len, tar_vfs_len,
+    });
+
+    // Load and run the on-disk `INIT.ELF` through the M17 process model.
+    const init_entry = (fat.find(volume, "INIT.ELF") catch null) orelse {
+        console.write("m18: INIT.ELF missing\n");
+        return false;
+    };
+    const init_size: usize = @intCast(init_entry.size);
+    if (init_size == 0) return false;
+    const init_bytes = heap.alloc(init_size, 16) orelse return false;
+    defer heap.free(init_bytes, init_size);
+    if (fat.readAll(volume, init_entry, init_bytes[0..init_size]) == null) return false;
+
+    const handle = process.spawn(init_bytes[0..init_size], .{
+        .name = "m18-init",
+        .argv = &m18_init_argv,
+        .envp = &m18_init_env,
+    }) catch |err| {
+        console.print("m18: init spawn failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    const result = process.wait(handle, m18_wait_timeout_ms);
+    const reaped = process.reap(handle);
+    console.print("m18: init from fat status={d} reap={s} pid={d}\n", .{
+        result.status, @tagName(reaped.outcome), handle.pid,
+    });
+    if (result.outcome != .exited or result.status != 42) return false;
+    if (reaped.outcome != .reaped or reaped.status != 42) return false;
+
+    const stats = process.stats();
+    return stats.slots == 0 and stats.live == 0;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

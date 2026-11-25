@@ -19,7 +19,7 @@ source wins and the document should be corrected.
 | **PLANNED** | Not implemented yet. Planned work is kept separate from implemented behavior. |
 
 The current release string in [`src/main.zig`](../src/main.zig) is
-`0.17.0-m17`. Milestones M0 through M17 are implemented, and M18-M20 are planned
+`0.18.0-m18`. Milestones M0 through M18 are implemented, and M19-M20 are planned
 in the [roadmap](development/roadmap.md).
 
 ## Architecture
@@ -33,6 +33,7 @@ in the [roadmap](development/roadmap.md).
 | [Scheduling](architecture/scheduling.md) | Task model, per-CPU scheduler, user tasks, process lifecycle, deadlines, priorities, join, task lifecycle, idle tasks, blocking primitives, and FPU context switching. |
 | [Synchronization](architecture/synchronization.md) | Spinlocks, IRQ masking, wait queues, mutexes, condition variables, cross-CPU wakeups, and lock ordering. |
 | [SMP bring-up](architecture/smp.md) | Limine MP protocol, AP entry, per-CPU stacks/TSS, LAPIC/IPIs/timers, and the SMP tests. |
+| [Storage, filesystems, and initramfs](architecture/storage.md) | PCI enumeration, legacy virtio-blk polling, block layer, read-only FAT16/FAT32, the VFS, and the tar initramfs. |
 
 ## Development
 
@@ -41,7 +42,7 @@ in the [roadmap](development/roadmap.md).
 | [Building](development/building.md) | Toolchain requirements, build options, kernel variants, and the QEMU harness. |
 | [Testing](development/testing.md) | Host tests, QEMU smoke, fault, and fallback-boot tests, assertions, exit codes, and recorded results. |
 | [Technical debt and known issues](development/technical-debt.md) | Correctness hazards, unsafe assumptions, and current limitations. |
-| [Roadmap](development/roadmap.md) | M17 results and the deferred work planned beyond it. |
+| [Roadmap](development/roadmap.md) | M18 results and the deferred work planned beyond it. |
 
 ## Suggested reading paths
 
@@ -52,6 +53,9 @@ in the [roadmap](development/roadmap.md).
   -> [Synchronization](architecture/synchronization.md) ->
   [Technical debt](development/technical-debt.md) ->
   [Roadmap](development/roadmap.md).
+- Working on storage or filesystems: [Storage](architecture/storage.md) ->
+  [Technical debt](development/technical-debt.md) ->
+  [Testing](development/testing.md).
 - Running or extending tests: [Building](development/building.md) ->
   [Testing](development/testing.md).
 

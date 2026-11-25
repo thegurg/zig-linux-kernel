@@ -24,11 +24,13 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M15 complete:** invariant-TSC detection and PIT calibration, cross-CPU TSC synchronization, a monotonic nanosecond clock with a calibrated-tick fallback, a per-CPU deadline queue, `sleepMs`/`sleepNs`, join with exit status and timeout, and priority levels with an explicit anti-starvation policy.
 - **M16 complete:** per-task low-half address spaces with a shared kernel high half, ring-3 entry, a DPL3 `int 0x80` gate, `swapgs`, per-task kernel stacks and TSS `RSP0`, validated `copyFromUser`/`copyToUser`, the `write`/`exit`/`yield`/`sleepMs`/`getpid` syscalls, CR3 switching, user-half teardown, and a minimal test-only ELF64 loader.
 - **M17 complete:** a validated general `ET_EXEC` ELF64 loader, W^X mappings (RX code, RO+NX data, RW+NX stacks), EFER.NXE on every CPU, a SysV `argc`/`argv`/`envp` initial stack, an unmapped user stack guard page, and a process table with `spawn`/`wait`/`reap`, exit-status storage, and generation-tagged handles.
-- **Next:** M18 (planned). See the [roadmap](docs/development/roadmap.md).
+- **M18 complete:** legacy PCI enumeration, a legacy virtio-blk split-queue polling driver with sector reads and writes, a validated block interface, read-only FAT16/FAT32 with VFAT long names, a longest-prefix VFS, a Limine-module ustar initramfs, and generated FAT/tar test fixtures. `INIT.ELF` is loaded from FAT and run through the process model. MSI-X and modern virtio remain planned.
+- **Next:** M19 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
 - QEMU (`qemu-system-x86_64`), OVMF (`/usr/share/edk2/x64/OVMF_CODE.4m.fd`)
+- Python 3 (generates the M18 FAT disk and initramfs tar; standard library only)
 - Linux host (x86_64). No root/sudo required for development.
 
 ## Quick start
@@ -79,7 +81,12 @@ Build options:
   wait timeouts and retries, generation-tagged handle reuse, NX and guard-page
   faults that kill only the faulting process, rejection of malformed or
   unsupported images, and leak-free address-space and process-table reclamation;
-  it then triggers `int3` and must return from the handler (QEMU status 33);
+  the M18 checks then enumerate PCI, identify the legacy virtio-blk device, read
+  the FAT boot sector, write and read back the final sector, mount the generated
+  FAT16 image, read single-cluster, nested, and multi-cluster files through the
+  VFS, read the Limine-module tar initramfs through a second mount, and load and
+  run `INIT.ELF` from the filesystem with exit status 42; it then triggers `int3`
+  and must return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35);
 - the fallback image boots with `force_pit` and must log the PIT timer path and
@@ -100,11 +107,18 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M17 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M18 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, per-task address spaces, user copies, TLB shootdown
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
   process.zig      process table, spawn/wait/reap, exit status, generation handles
+  drivers/pci.zig  legacy PCI config space, enumeration, BAR decode, capabilities
+  drivers/virtio_blk.zig  legacy virtio-blk split queue, polling, sector transfer
+  fs/block.zig     sector block-device interface
+  fs/fat.zig       read-only FAT16/FAT32 with short and VFAT long names
+  fs/vfs.zig       fixed mount table with longest-prefix matching
+  fs/tar.zig       read-only ustar reader for the initramfs
+  initramfs.zig    Limine-module discovery and archive slice
   sched.zig        per-CPU scheduler, priorities, deadline heaps, join, user tasks, wait queues, mutex/condition, IPIs, TLB shootdown
   syscall.zig      int 0x80 ABI, saved-register frame, syscall dispatcher
   time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback
@@ -117,8 +131,10 @@ src/
   user/proc.elf    checked-in M17 process fixture embedded with @embedFile
   smp.zig          Limine MP bring-up, AP scheduler entry and M11-M13 SMP tests
   sync.zig         IRQ-safe and SMP-safe spinlocks, interrupt save/restore
-tools/run.sh       Build ESP (vvfat) and launch QEMU
+tools/run.sh       Build ESP (vvfat), generate M18 fixtures, and launch QEMU
 tools/build-user.sh Regenerate src/user/demo.elf and src/user/proc.elf
+tools/mkdisk.py    Generate the M18 FAT16 test disk (standard library only)
+tools/mkinitramfs.py  Generate the M18 ustar initramfs module
 tools/genfont.py   Regenerate src/font.zig from a system font
 third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 docs/              Architecture and development documentation
@@ -135,6 +151,7 @@ and workflow:
 - [Scheduling](docs/architecture/scheduling.md)
 - [Synchronization](docs/architecture/synchronization.md)
 - [SMP bring-up](docs/architecture/smp.md)
+- [Storage, filesystems, and initramfs](docs/architecture/storage.md)
 - [Building](docs/development/building.md)
 - [Testing](docs/development/testing.md)
 - [Technical debt and known issues](docs/development/technical-debt.md)

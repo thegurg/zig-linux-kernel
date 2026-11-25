@@ -22,9 +22,10 @@ pub fn build(b: *std.Build) void {
     // preemptive/cooperative scheduler, task lifecycle, blocking sleep,
     // explicit block/wake, wait queues, timed waits, mutexes, condition
     // variables, FPU/SIMD context switching, SMP bring-up/spinlocks and
-    // exception path, ACPI/IOAPIC discovery and the CPU 0 LAPIC timer, then
-    // reports success to QEMU's isa-debug-exit so CI (and `zig build test`) can
-    // assert the exit code.
+    // exception path, ACPI/IOAPIC discovery, the CPU 0 LAPIC timer, ring 3,
+    // ELF/process lifecycle, and the M18 PCI/virtio-blk/FAT/VFS/initramfs path,
+    // then reports success to QEMU's isa-debug-exit so CI (and
+    // `zig build test`) can assert the exit code.
     const selftest_kernel = makeKernel(b, target, optimize, "zig-kernel-selftest", true, false, false);
     const smoke = b.addSystemCommand(&.{ "bash", "tools/run.sh" });
     smoke.addArtifactArg(selftest_kernel);

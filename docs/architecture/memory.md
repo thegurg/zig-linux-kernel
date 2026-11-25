@@ -46,6 +46,8 @@ The PMM is a bitmap allocator sized for a 4 GiB physical address space:
 | `init() InitError!void` | Reads Limine's memory map, marks usable pages free, reserves the zero page, and rejects a missing map or no usable memory. |
 | `allocPage() ?u64` | Scans from `next_hint_word` for a zero bit, marks it used and allocated, decrements `free_pages`, and returns the physical address. |
 | `freePage(address: u64) bool` | Validates alignment and range, requires the page to be in `allocated_bitmap`, clears both bits, increments `free_pages`, and lowers the hint. |
+| `allocContiguous(count: usize) ?u64` | Finds a run of free pages, marks every page used/allocated, and returns the first physical address. Used by the legacy virtio-blk ring, whose descriptor/available/used regions must share one DMA-contiguous allocation. |
+| `freeContiguous(address: u64, count: usize) bool` | Frees a run only when every page was allocated through the PMM. |
 | `stats() Stats` | Returns `total_pages`, `free_pages`, and `used_pages`. |
 | `totalBytes() u64` / `freeBytes() u64` | Convert the page counters to bytes. |
 
@@ -259,6 +261,7 @@ allocate/write/verify/free pattern concurrently on every CPU.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Physical page allocation/free | **IMPLEMENTED** | 4 GiB cap, double-free protection, zero page reserved. |
+| Contiguous page allocation | **IMPLEMENTED** | Bitmap run scan for DMA rings; no alignment beyond page size. |
 | 4-level paging and HHDM | **IMPLEMENTED** | Kernel image + first 4 GiB direct map. |
 | Kernel text/rodata read-only | **IMPLEMENTED** | `CR0.WP` enabled. |
 | Lazy kernel heap with allocator adapter | **IMPLEMENTED** | First-fit, coalescing, alignment. |

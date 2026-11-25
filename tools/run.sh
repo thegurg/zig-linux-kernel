@@ -8,7 +8,9 @@
 #   tools/run.sh <kernel.elf> --test-boot    headless boot test, checks the fallback timer
 #
 # The ESP is exposed to QEMU as a synthesized FAT (vvfat) drive backed by a
-# directory, so no root, loop devices, mtools or ISO tooling are required.
+# directory, so no root, loop devices, mtools or ISO tooling are required. M18
+# adds a generated FAT16 disk on a second (legacy) virtio-blk device and a
+# Limine-module initramfs tar; both are built with Python's standard library.
 
 set -euo pipefail
 
@@ -39,7 +41,7 @@ has_m15_cross_cpu() {
 }
 
 missing=0
-for f in "$KERNEL" "$LIMINE_BIN/BOOTX64.EFI" "$OVMF_CODE" "$OVMF_VARS_SRC"; do
+for f in "$KERNEL" "$LIMINE_BIN/BOOTX64.EFI" "$OVMF_CODE" "$OVMF_VARS_SRC" "$ROOT/src/user/proc.elf"; do
   if [ ! -e "$f" ]; then echo "run.sh: missing $f" >&2; missing=1; fi
 done
 [ $missing -eq 0 ] || exit 1
@@ -54,6 +56,13 @@ cp "$LIMINE_BIN/BOOTX64.EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 cp "$ROOT/boot/limine.conf" "$ESP/EFI/BOOT/limine.conf"
 cp "$ROOT/boot/limine.conf" "$ESP/limine.conf"
 cp "$KERNEL" "$ESP/zig-kernel"
+
+# M18 fixtures: a FAT16 disk served by legacy virtio-blk and a Limine-module
+# initramfs. Both are generated per run so no binary images live in the tree.
+python3 "$ROOT/tools/mkdisk.py" "$WORK/disk.img" --init-elf "$ROOT/src/user/proc.elf"
+python3 "$ROOT/tools/mkinitramfs.py" "$WORK/initramfs.tar"
+cp "$WORK/initramfs.tar" "$ESP/initramfs.tar"
+
 cp "$OVMF_VARS_SRC" "$WORK/OVMF_VARS.fd"
 chmod u+w "$WORK/OVMF_VARS.fd"
 
@@ -78,7 +87,9 @@ QEMU=(
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd"
   -drive "format=raw,file=fat:rw:$ESP,if=none,id=esp"
-  -device virtio-blk-pci,drive=esp
+  -device virtio-blk-pci,drive=esp,disable-legacy=on
+  -drive "format=raw,file=$WORK/disk.img,if=none,id=blk0"
+  -device virtio-blk-pci,drive=blk0,disable-modern=on
   -boot order=c
   -device isa-debug-exit,iobase=0xf4,iosize=0x04
   -no-reboot
@@ -122,6 +133,19 @@ if [ "$MODE" != "run" ]; then
            grep -q "m16: user badptr status=0" "$WORK/serial.log" &&
            grep -q "m16: aspace created=9 destroyed=9" "$WORK/serial.log" &&
            grep -q "M17 checks passed" "$WORK/serial.log" &&
+           grep -q "M18 checks passed" "$WORK/serial.log" &&
+           grep -q "m18: pci devices=" "$WORK/serial.log" &&
+           grep -q "m18: pci virtio-blk bus=.* io=0x.* irq=" "$WORK/serial.log" &&
+           grep -qE "m18: virtio-blk sectors=[0-9]+ queue=[0-9]+ io=0x[0-9a-f]+ ring_pages=[0-9]+" "$WORK/serial.log" &&
+           grep -q "m18: sector read lba=0 signature=ok oem=ZIGKERNL" "$WORK/serial.log" &&
+           grep -q "m18: sector write/read lba=.* bytes=512 ok" "$WORK/serial.log" &&
+           grep -q "m18: fat type=fat16 clusters=.* root_cluster=0 cluster_bytes=512" "$WORK/serial.log" &&
+           grep -q "m18: vfs fat read file=/HELLO.TXT bytes=15" "$WORK/serial.log" &&
+           grep -q "m18: vfs nested read file=/SUB/NESTED.TXT bytes=20" "$WORK/serial.log" &&
+           grep -q "m18: vfs cluster chain bytes=1300 ok" "$WORK/serial.log" &&
+           grep -qE "m18: initramfs bytes=[0-9]+ file_bytes=21" "$WORK/serial.log" &&
+           grep -q "m18: init from fat status=42 reap=reaped pid=.*" "$WORK/serial.log" &&
+           grep -q "m17: proc argv=init,basic env=M18=1" "$WORK/serial.log" &&
            grep -q "m17: proc argv=m17proc,basic env=M17=1" "$WORK/serial.log" &&
            grep -qE "m17: argv status=42 pid=[0-9]+ gen=[0-9]+" "$WORK/serial.log" &&
            grep -q "m17: concurrent statuses=42,43" "$WORK/serial.log" &&

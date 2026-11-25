@@ -1,7 +1,7 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-fallback boot test, the harness assertions, and the validation recorded for M14.
+fallback boot test, the harness assertions, and the validation recorded for M18.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -11,7 +11,7 @@ verification path for each milestone. Coverage gaps are documented below and in
 
 | Layer | Command | What it proves |
 | --- | --- | --- |
-| Host unit tests | part of `zig build test` | The host harness and the pure Limine binding test run. |
+| Host unit tests | part of `zig build test` | The host harness, Limine bindings, and the pure FAT/tar/VFS modules run. |
 | QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, per-CPU timers, ACPI/IOAPIC delivery, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
 | QEMU fallback boot | `tools/run.sh <fallback> --test-boot` | A `force_pit` image reaches the legacy PIT timer path and the idle transition. |
@@ -29,6 +29,10 @@ const std = @import("std");
 
 test {
     _ = @import("limine.zig");
+    _ = @import("fs/block.zig");
+    _ = @import("fs/fat.zig");
+    _ = @import("fs/tar.zig");
+    _ = @import("fs/vfs.zig");
 }
 
 test "host test harness works" {
@@ -36,11 +40,12 @@ test "host test harness works" {
 }
 ```
 
-Importing `limine.zig` from a test block pulls its
-`test "base revision marker layout"` into the same test binary. Only pure,
-platform-independent modules may be imported there; kernel subsystems are
-exercised through QEMU because they depend on x86_64 state and devices. The
-host test run currently executes three tests.
+Importing a module from a test block pulls its `test` declarations into the same
+test binary. Only pure, platform-independent modules may be imported there;
+kernel subsystems are exercised through QEMU because they depend on x86_64 state
+and devices. The host test run currently executes eleven tests: the harness and
+Limine marker checks, four FAT16/FAT32 tests that build images in memory, two
+tar tests, and two VFS mount/offset tests.
 
 ## QEMU selftest
 
@@ -80,8 +85,17 @@ initialization, `kmain` runs the checks in this order.
 | M14 IOAPIC delivery | `m14: ioapic ticks=5` | PIT IRQ0 routed through the IOAPIC reaches vector 242 and is acknowledged with a LAPIC EOI; the pin is then masked and checked. |
 | M14 CPU 0 timer | `timer: source=lapic`, `m14: cpu0 sleep ticks=5`, `m14: cpu0 preempted=1` | CPU 0's LAPIC timer wakes a local sleeper and preempts two CPU-bound tasks. |
 | M14 result | `M14 checks passed` | The ACPI/IOAPIC/CPU 0 timer group completed. |
+| M18 PCI | `m18: pci devices=<n>`, `m18: pci virtio-blk bus=... slot=... fn=... io=0x... irq=...` | Legacy config-space enumeration finds the virtio-blk device and an I/O BAR. |
+| M18 virtio-blk | `m18: virtio-blk sectors=8192 queue=... io=0x... ring_pages=...` | The legacy device reports the generated capacity, a valid queue, and a contiguous ring allocation. |
+| M18 sector read | `m18: sector read lba=0 signature=ok oem=ZIGKERNL` | Sector 0 has the FAT boot signature and the generated OEM name. |
+| M18 sector write | `m18: sector write/read lba=8191 bytes=512 ok` | A deterministic 512-byte pattern written to the final sector reads back identically. |
+| M18 FAT | `m18: fat type=fat16 clusters=... root_cluster=0 cluster_bytes=512` | The BPB is parsed and the FAT16 geometry is accepted. |
+| M18 VFS reads | `m18: vfs fat read file=/HELLO.TXT bytes=15`, `m18: vfs nested read file=/SUB/NESTED.TXT bytes=20`, `m18: vfs cluster chain bytes=1300 ok` | Single-cluster, subdirectory, and multi-cluster files resolve through the VFS and read correctly. |
+| M18 initramfs | `m18: initramfs bytes=... file_bytes=21` | The Limine module is found, its tar checksum is valid, and the same path resolves through the `/initramfs` mount. |
+| M18 init from FAT | `m17: proc argv=init,basic env=M18=1`, `m18: init from fat status=42 reap=reaped pid=...` | `INIT.ELF` is read from FAT, spawned, run, waited on, and reaped. |
+| M18 result | `M18 checks passed` | The storage group completed with an empty process table. |
 | `int3` | `returned from int3`, `M14 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
-| Success | `M14 checks passed` | Exits QEMU successfully. |
+| Success | `M18 checks passed` | Exits QEMU successfully after `int3` returns. |
 
 The selftest logs diagnostic lines such as:
 
@@ -263,6 +277,49 @@ The selftest and fault-test modes time out after 90 seconds. The fallback-boot
 mode times out after 20 seconds because the guest is expected to stay idle.
 
 ## Recorded validation
+
+### M18 validation
+
+M18 validation ran the full matrix:
+
+- `zig build` (default ReleaseSafe): passed;
+- default KVM `zig build test` (`SMP=4`): passed;
+- TCG `ZIG_KERNEL_NO_KVM=1 zig build test`: passed;
+- `ZIG_KERNEL_SMP=2 zig build test`: passed;
+- `ZIG_KERNEL_SMP=1 zig build test`: passed;
+- `zig build -Doptimize=Debug test`: passed.
+
+The default KVM run reported:
+
+```text
+selftest: checking M18 PCI, virtio-blk and VFS
+m18: pci devices=7
+m18: pci virtio-blk bus=0 slot=3 fn=0 io=0x6000 irq=11
+m18: virtio-blk sectors=8192 queue=256 io=0x6000 ring_pages=3
+m18: sector read lba=0 signature=ok oem=ZIGKERNL
+m18: sector write/read lba=8191 bytes=512 ok
+m18: fat type=fat16 clusters=8123 root_cluster=0 cluster_bytes=512
+m18: vfs fat read file=/HELLO.TXT bytes=15
+m18: vfs nested read file=/SUB/NESTED.TXT bytes=20
+m18: vfs cluster chain bytes=1300 ok
+m18: initramfs bytes=10240 file_bytes=21
+m17: proc argv=init,basic env=M18=1
+m18: init from fat status=42 reap=reaped pid=1
+selftest: M18 checks passed
+```
+
+The harness generates the disk and tar per run with `tools/mkdisk.py` and
+`tools/mkinitramfs.py`, copies the tar into the ESP, and passes it through
+`boot/limine.conf` as a Limine module. The ESP's own virtio-blk device is
+created with `disable-legacy=on` so the driver's legacy scan selects the
+generated test disk rather than the 504 MiB vvfat ESP. The TCG, `SMP=2`,
+`SMP=1`, and Debug runs produced the same markers. `zig fmt --check build.zig
+src` and `git diff --check` passed before the commit.
+
+M18 host tests build FAT16 and FAT32 images in memory and cover mounting,
+short-name and subdirectory lookup, multi-cluster reads at an offset, the boot
+signature check, tar lookup and checksum rejection, and VFS longest-prefix
+matching.
 
 ### M17 validation
 
@@ -482,16 +539,29 @@ commit. Earlier M10-M13 validation remains in
   non-canonical address.
 - Debug builds are validated by running the same test flow with
   `-Doptimize=Debug`, but there is no separate debug-only test suite.
+- M18 exercises one FAT16 image and one tar archive. It does not cover FAT32 on
+  a real device, a fragmented file, a directory chain longer than one cluster,
+  a corrupt FAT chain, an LFN that spans a sector boundary, a write to a real
+  filesystem, or a volume whose BPB has an unusual sector/cluster size.
+- The virtio-blk test covers one outstanding request and the polling path. It
+  does not test queue exhaustion, a device timeout, reset recovery, MSI-X, or
+  modern virtio. The write test uses one scratch sector at the end of the
+  generated image.
+- PCI enumeration is tested against QEMU's q35 device set. It does not cover
+  ECAM, a bridge with a secondary bus, a 64-bit BAR above 4 GiB, or a device
+  with a malformed capability list.
+- The VFS is exercised only from the single boot task; there is no concurrent
+  mount/open/read test and no mount-table exhaustion test.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Host test harness | **IMPLEMENTED** | Harness plus Limine marker test; three tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M17 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, timekeeping, join, priorities, ring 3, address-space isolation, user copies, general ELF loading, W^X/NX, argv/envp, process lifecycle, and `int3`. |
+| Host test harness | **IMPLEMENTED** | Harness, Limine marker, and pure FAT/tar/VFS tests; eleven tests total. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M18 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, timekeeping, join, priorities, ring 3, address-space isolation, user copies, general ELF loading, W^X/NX, argv/envp, process lifecycle, PCI/virtio-blk, FAT/VFS, initramfs, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
 | QEMU fallback boot test | **IMPLEMENTED** | `force_pit` image reaches the PIT timer path and idle transition. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M17 test results. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M18 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
 | TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |
