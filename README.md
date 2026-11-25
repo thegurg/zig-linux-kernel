@@ -119,6 +119,7 @@ src/
   fs/vfs.zig       fixed mount table with longest-prefix matching
   fs/tar.zig       read-only ustar reader for the initramfs
   initramfs.zig    Limine-module discovery and archive slice
+  storage.zig      shared PCI/virtio-blk/FAT/initramfs bring-up and status
   sched.zig        per-CPU scheduler, priorities, deadline heaps, join, user tasks, wait queues, mutex/condition, IPIs, TLB shootdown
   syscall.zig      int 0x80 ABI, saved-register frame, syscall dispatcher
   time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback

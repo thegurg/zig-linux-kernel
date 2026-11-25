@@ -103,8 +103,12 @@ starts on a 4096-byte boundary, as the legacy interface requires.
 
 Completion is polling: after publishing the available-ring index and notifying
 the device, the driver spins on the used-ring index with a bounded `pause` loop.
-A timeout returns `false`; there is no interrupt path in M18. `block.Device`
-serializes requests with an IRQ-safe spinlock.
+It compares the device index against its own count of consumed completions
+rather than sampling the device index immediately before notifying; otherwise a
+device that completes before the driver polls would make the driver wait for a
+completion that already happened. A timeout returns `false`; there is no
+interrupt path in M18. `block.Device` serializes requests with an IRQ-safe
+spinlock.
 
 ## Block layer
 

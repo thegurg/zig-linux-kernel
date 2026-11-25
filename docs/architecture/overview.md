@@ -98,6 +98,7 @@ user task: private low-half PML4 + shared high half -> iretq to ring 3
            int 0x80 -> swapgs -> syscall dispatcher -> validated user copy
 storage:   PCI -> legacy virtio-blk polling -> block layer
            -> FAT16/FAT32 + VFS; Limine module -> tar -> VFS
+           (storage.zig calls this sequence from both boot and the M18 test)
 ```
 
 Every CPU runs its own scheduler state and tick counter. CPU 0 and every AP use
@@ -130,6 +131,7 @@ shootdown after releasing the page-table lock.
 | [`src/fs/vfs.zig`](../../src/fs/vfs.zig) | Fixed mount table, longest-prefix matching, stateless file reads. |
 | [`src/fs/tar.zig`](../../src/fs/tar.zig) | Read-only ustar reader with checksum validation. |
 | [`src/initramfs.zig`](../../src/initramfs.zig) | Limine-module discovery and archive slice. |
+| [`src/storage.zig`](../../src/storage.zig) | Shared bring-up: PCI enumeration, virtio-blk, FAT at `/`, initramfs at `/initramfs`, with a non-fatal status summary. |
 | [`src/time.zig`](../../src/time.zig) | Invariant-TSC detection and calibration, cross-CPU synchronization, monotonic nanoseconds, tick fallback. |
 | [`src/sync.zig`](../../src/sync.zig) | Spinlocks and interrupt save/restore helpers. |
 | [`src/smp.zig`](../../src/smp.zig) | Limine MP bring-up, AP contexts, AP scheduler entry, SMP tests. |
