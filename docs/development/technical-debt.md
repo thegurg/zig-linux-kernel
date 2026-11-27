@@ -2,7 +2,7 @@
 
 **Purpose:** record correctness hazards, unsafe assumptions, and current
 limitations that are visible in the source. This document describes the state
-after M18; **RESOLVED** entries are kept so the audit trail and the remaining
+after M19; **RESOLVED** entries are kept so the audit trail and the remaining
 work stay separate.
 
 > **Status legend:** **OPEN** means the issue exists in the current source.
@@ -10,7 +10,7 @@ work stay separate.
 > **DEFERRED** means the issue is intentionally out of scope for the current
 > milestone and is tracked in the [roadmap](roadmap.md). **RESOLVED** means the
 > issue was fixed in the pre-M11 bugfix pass, M11, M12, M13, M14, M15, M16, or
-> M18.
+> M19.
 
 ## Critical
 
@@ -160,7 +160,7 @@ from the PMM while holding `table_lock`, so the lock order is `table_lock` befor
 [`src/test_root.zig`](../../src/test_root.zig),
 [`tools/run.sh`](../../tools/run.sh).
 
-Covered in M11, M12, M13, M14, M15, M16, M17, and M18:
+Covered in M11, M12, M13, M14, M15, M16, M17, M18, and M19:
 
 - AP scheduler workers, cross-CPU wake, AP `int3`/FPU state, TLB shootdown, and
   nested `IrqSpinLock` guards;
@@ -183,9 +183,12 @@ Covered in M11, M12, M13, M14, M15, M16, M17, and M18:
   sector write/readback, FAT16 mounting, single-cluster/subdirectory/
   multi-cluster VFS reads, the Limine-module tar, and loading/running
   `INIT.ELF` from FAT;
+- legacy virtio-net identification, MAC negotiation, both split queues, ARP
+  resolution of the gateway, an ICMP echo reply, ICMP and UDP over loopback,
+  and a DNS query/answer through the deterministic host stub;
 - the `force_pit` fallback boot path;
 - the smoke assertion builds its expected `smp: cpus=<N>` string from
-  `ZIG_KERNEL_SMP`, and checks the M11-M18 result markers.
+  `ZIG_KERNEL_SMP`, and checks the M11-M19 result markers.
 
 Still open:
 
@@ -201,7 +204,11 @@ Still open:
   unusual-BPB, or concurrent-VFS test;
 - no virtio-blk timeout/reset/queue-exhaustion test and no MSI-X/modern-virtio
   test;
-- no PCI bridge/secondary-bus, ECAM, or high-64-bit-BAR test.
+- no PCI bridge/secondary-bus, ECAM, or high-64-bit-BAR test;
+- no virtio-net queue-exhaustion, reset-recovery, malformed-ring, full-ARP-cache,
+  ARP-expiry, full-UDP-table, oversized-datagram, fragmentation, TCP, DHCP,
+  IPv6, or multi-record DNS test;
+- no off-subnet route test: the selftest only reaches the gateway and loopback.
 
 ### 12. ACPI/IOAPIC platform assumptions are narrow
 
@@ -407,6 +414,30 @@ mount table is not locked because mounts currently happen once during boot.
 The ring-3 ABI still has no `open`/`read`/`close`; `INIT.ELF` is loaded by the
 kernel from FAT and run, but a user program cannot open files itself.
 
+### 25. Networking is polling-only, static, and kernel-side
+
+**Status: PARTIAL.** **Sources:**
+[`src/drivers/virtio_net.zig`](../../src/drivers/virtio_net.zig),
+[`src/net/net.zig`](../../src/net/net.zig),
+[`src/network.zig`](../../src/network.zig).
+
+The network stack is one legacy virtio-net device with two polled split
+virtqueues. The receive path republishes completed buffers, but transmit allows
+one outstanding request and copies every frame through a single static buffer.
+MSI-X, modern virtio, checksum/segmentation offload, and mergeable receive
+buffers are not implemented.
+
+Configuration is static (`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`)
+and there is no DHCP, IPv6, TCP, fragmentation/reassembly, dynamic routing,
+retransmission, or congestion control. The ARP cache has eight non-ageing
+entries; the UDP table has eight fixed slots with one pending datagram each;
+and DNS supports a single A/IN question and one attempt.
+
+The network stack has no ring-3 interface. `open`/`read`/`socket`/`send`/`recv`
+syscalls do not exist yet, so user programs cannot use the network. The
+virtqueue layout arithmetic is also duplicated between `virtio_blk.zig` and
+`virtio_net.zig`; a third legacy virtio driver should factor it into one module.
+
 ## Implementation status summary
 
 | Area | Status | Notes |
@@ -435,13 +466,18 @@ kernel from FAT and run, but a user program cannot open files itself.
 | IOAPIC routing | **IMPLEMENTED** | Uncached MMIO, redirection read/write, mask/unmask, IRQ0 delivery test. |
 | PCI enumeration | **IMPLEMENTED** | Legacy `0xCF8`/`0xCFC`, BAR decode, capability walk; ECAM is deferred. |
 | virtio-blk polling | **IMPLEMENTED** | Legacy split queue, three-descriptor chain, sector read/write, bounded polling. |
-| MSI/MSI-X and modern virtio | **DEFERRED** | Polling and the legacy interface are the M18 path. |
+| MSI/MSI-X and modern virtio | **DEFERRED** | Polling and the legacy interface are the M18/M19 path. |
 | Block layer | **IMPLEMENTED** | Sector reads/writes with capacity checks. |
 | FAT16/FAT32 | **IMPLEMENTED** | Read-only, short and VFAT long names, cluster chains; FAT12 deferred. |
 | VFS | **PARTIAL** | Fixed mount table, longest-prefix matching, stateless reads; no permissions or writes. |
 | Initramfs | **IMPLEMENTED** | Limine module plus ustar reader. |
 | Filesystem writes | **DEFERRED** | No FAT mutation or user file syscalls. |
-| Test coverage | **PARTIAL** | M11-M18 tests added; gaps listed above. |
+| virtio-net polling | **IMPLEMENTED** | Legacy RX/TX split queues, MAC negotiation, polling, single outstanding TX. |
+| Ethernet/ARP/IPv4/ICMP/UDP | **IMPLEMENTED** | Checksums, gateway routing, loopback; no fragmentation or reassembly. |
+| UDP sockets | **PARTIAL** | Eight fixed slots, one pending datagram each, kernel-side only. |
+| DNS | **PARTIAL** | A/IN query and answer parsing; one attempt; deterministic test stub. |
+| TCP, DHCP, IPv6, socket syscalls | **DEFERRED** | Planned after M19. |
+| Test coverage | **PARTIAL** | M11-M19 tests added; gaps listed above. |
 | Resource limits | **PARTIAL** | 4 GiB PMM, 64 MiB heap, 32 tasks, 16 processes, 8 CPUs. |
 
 ## Related documentation

@@ -25,12 +25,13 @@ A from-scratch x86_64 kernel written in Zig, booted by [Limine](https://github.c
 - **M16 complete:** per-task low-half address spaces with a shared kernel high half, ring-3 entry, a DPL3 `int 0x80` gate, `swapgs`, per-task kernel stacks and TSS `RSP0`, validated `copyFromUser`/`copyToUser`, the `write`/`exit`/`yield`/`sleepMs`/`getpid` syscalls, CR3 switching, user-half teardown, and a minimal test-only ELF64 loader.
 - **M17 complete:** a validated general `ET_EXEC` ELF64 loader, W^X mappings (RX code, RO+NX data, RW+NX stacks), EFER.NXE on every CPU, a SysV `argc`/`argv`/`envp` initial stack, an unmapped user stack guard page, and a process table with `spawn`/`wait`/`reap`, exit-status storage, and generation-tagged handles.
 - **M18 complete:** legacy PCI enumeration, a legacy virtio-blk split-queue polling driver with sector reads and writes, a validated block interface, read-only FAT16/FAT32 with VFAT long names, a longest-prefix VFS, a Limine-module ustar initramfs, and generated FAT/tar test fixtures. `INIT.ELF` is loaded from FAT and run through the process model. MSI-X and modern virtio remain planned.
-- **Next:** M19 (planned). See the [roadmap](docs/development/roadmap.md).
+- **M19 complete:** a legacy virtio-net split-queue polling driver, Ethernet II, ARP resolution, IPv4 with checksums, ICMP echo, UDP, loopback, a fixed UDP socket table, and a DNS client. The smoke test resolves the QEMU gateway, pings it, exchanges UDP over loopback, and queries a deterministic host-side DNS stub through QEMU user networking. TCP, DHCP, MSI-X, and socket syscalls remain planned.
+- **Next:** M20 (planned). See the [roadmap](docs/development/roadmap.md).
 
 ## Requirements
 - Zig 0.17.0 (pinned in `.zig-version`)
 - QEMU (`qemu-system-x86_64`), OVMF (`/usr/share/edk2/x64/OVMF_CODE.4m.fd`)
-- Python 3 (generates the M18 FAT disk and initramfs tar; standard library only)
+- Python 3 (generates the M18 FAT disk and initramfs tar and runs the M19 DNS stub; standard library only)
 - Linux host (x86_64). No root/sudo required for development.
 
 ## Quick start
@@ -85,8 +86,11 @@ Build options:
   the FAT boot sector, write and read back the final sector, mount the generated
   FAT16 image, read single-cluster, nested, and multi-cluster files through the
   VFS, read the Limine-module tar initramfs through a second mount, and load and
-  run `INIT.ELF` from the filesystem with exit status 42; it then triggers `int3`
-  and must return from the handler (QEMU status 33);
+  run `INIT.ELF` from the filesystem with exit status 42; the M19 checks then
+  bring up the legacy virtio-net device, resolve the QEMU gateway with ARP,
+  receive an ICMP echo reply, verify ICMP and UDP over loopback, and parse a
+  DNS answer from a deterministic host stub; it then triggers `int3` and must
+  return from the handler (QEMU status 33);
 - the fault test dereferences NULL and must report `#PF` with `CR2` before
   exiting through the failure path (QEMU status 35);
 - the fallback image boots with `force_pit` and must log the PIT timer path and
@@ -107,19 +111,29 @@ src/
   console.zig      framebuffer text console + serial mirroring
   font.zig         8x16 bitmap font
   limine.zig       Limine protocol bindings
-  main.zig         _start, kmain, panic, boot sequence, M1c-M18 smoke tests
+  main.zig         _start, kmain, panic, boot sequence, M1c-M19 smoke tests
   memory/pmm.zig   bitmap physical page allocator from the Limine memory map
   memory/vmm.zig   4-level page tables, per-task address spaces, user copies, TLB shootdown
   memory/heap.zig  locked lazily mapped first-fit kernel heap + std.mem.Allocator
   process.zig      process table, spawn/wait/reap, exit status, generation handles
   drivers/pci.zig  legacy PCI config space, enumeration, BAR decode, capabilities
   drivers/virtio_blk.zig  legacy virtio-blk split queue, polling, sector transfer
+  drivers/virtio_net.zig  legacy virtio-net RX/TX queues, polling, MAC negotiation
   fs/block.zig     sector block-device interface
   fs/fat.zig       read-only FAT16/FAT32 with short and VFAT long names
   fs/vfs.zig       fixed mount table with longest-prefix matching
   fs/tar.zig       read-only ustar reader for the initramfs
   initramfs.zig    Limine-module discovery and archive slice
   storage.zig      shared PCI/virtio-blk/FAT/initramfs bring-up and status
+  network.zig      shared PCI/virtio-net bring-up and static IPv4 configuration
+  net/types.zig    MAC/IPv4 address helpers
+  net/ethernet.zig Ethernet II framing
+  net/arp.zig      ARP requests, replies, cache
+  net/ipv4.zig     IPv4 headers and checksums
+  net/icmp.zig     ICMP echo framing
+  net/udp.zig      UDP framing and pseudo-header checksums
+  net/dns.zig      DNS A query encoder and answer parser
+  net/net.zig      dispatch, ARP cache, loopback, UDP sockets, DNS client
   sched.zig        per-CPU scheduler, priorities, deadline heaps, join, user tasks, wait queues, mutex/condition, IPIs, TLB shootdown
   syscall.zig      int 0x80 ABI, saved-register frame, syscall dispatcher
   time.zig         invariant-TSC detection/calibration, cross-CPU sync, monotonic clock, tick fallback
@@ -136,6 +150,7 @@ tools/run.sh       Build ESP (vvfat), generate M18 fixtures, and launch QEMU
 tools/build-user.sh Regenerate src/user/demo.elf and src/user/proc.elf
 tools/mkdisk.py    Generate the M18 FAT16 test disk (standard library only)
 tools/mkinitramfs.py  Generate the M18 ustar initramfs module
+tools/dns_stub.py     Deterministic M19 DNS responder for the smoke test
 tools/genfont.py   Regenerate src/font.zig from a system font
 third_party/limine/ Vendored Limine UEFI binary (BOOTX64.EFI)
 docs/              Architecture and development documentation
@@ -153,6 +168,7 @@ and workflow:
 - [Synchronization](docs/architecture/synchronization.md)
 - [SMP bring-up](docs/architecture/smp.md)
 - [Storage, filesystems, and initramfs](docs/architecture/storage.md)
+- [Networking](docs/architecture/network.md)
 - [Building](docs/development/building.md)
 - [Testing](docs/development/testing.md)
 - [Technical debt and known issues](docs/development/technical-debt.md)

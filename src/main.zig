@@ -32,12 +32,15 @@ const qemu = @import("arch/x86_64/qemu.zig");
 const user = @import("user.zig");
 const pci = @import("drivers/pci.zig");
 const virtio_blk = @import("drivers/virtio_blk.zig");
+const virtio_net = @import("drivers/virtio_net.zig");
 const fat = @import("fs/fat.zig");
 const tar = @import("fs/tar.zig");
 const vfs = @import("fs/vfs.zig");
 const storage = @import("storage.zig");
+const net = @import("net/net.zig");
+const network = @import("network.zig");
 
-pub const version = "0.18.0-m18";
+pub const version = "0.19.0-m19";
 
 const timer_hz: u32 = time.tick_hz;
 const timer_test_ticks: u64 = 30;
@@ -73,6 +76,13 @@ const m17_basic_env = [_][]const u8{"M17=1"};
 const m18_wait_timeout_ms: u64 = 2_000;
 const m18_init_argv = [_][]const u8{ "init", "basic" };
 const m18_init_env = [_][]const u8{"M18=1"};
+
+const m19_arp_timeout_ns: u64 = 1_000_000_000;
+const m19_ping_timeout_ns: u64 = 2_000_000_000;
+const m19_udp_timeout_ns: u64 = 200_000_000;
+const m19_dns_timeout_ns: u64 = 3_000_000_000;
+const m19_udp_port: u16 = 49160;
+const m19_dns_name = "example.com";
 var m17_elf_copy: [16 * 1024]u8 = undefined;
 var m17_bad_elf: [64]u8 = @splat(0);
 var m17_big_arg: [20_000]u8 = @splat('x');
@@ -659,6 +669,13 @@ export fn kmain() callconv(.c) noreturn {
         }
         serial.write("selftest: M18 checks passed\n");
 
+        serial.write("selftest: checking M19 virtio-net and network stack\n");
+        if (!selftestM19()) {
+            serial.write("selftest: M19 checks failed\n");
+            qemu.exit(qemu.EXIT_FAILURE);
+        }
+        serial.write("selftest: M19 checks passed\n");
+
         serial.write("selftest: triggering int3\n");
         asm volatile ("int3");
         serial.write("selftest: returned from int3\n");
@@ -673,6 +690,21 @@ export fn kmain() callconv(.c) noreturn {
         @intFromBool(storage_status.fat),
         @intFromBool(storage_status.initramfs),
     });
+
+    const network_status = network.init();
+    if (network_status.configured) {
+        var mac_buffer: [18]u8 = undefined;
+        var ip_buffer: [16]u8 = undefined;
+        const mac_text = net.macString(&mac_buffer, network_status.info.?.mac);
+        const ip_text = net.ipv4String(&ip_buffer, network.guest_ip);
+        console.print("network: pci={d} device=1 configured=1 mac={s} ip={s}\n", .{
+            network_status.pci_devices, mac_text, ip_text,
+        });
+    } else {
+        console.print("network: pci={d} device={d} configured=0\n", .{
+            network_status.pci_devices, @intFromBool(network_status.device),
+        });
+    }
 
     console.print("\nboot: {s} initialized (memory, per-CPU scheduler, SMP)\n", .{version});
 
@@ -2409,6 +2441,108 @@ fn selftestM18() bool {
 
     const stats = process.stats();
     return stats.slots == 0 and stats.live == 0;
+}
+
+/// M19: bring up the legacy virtio-net device, resolve the gateway with ARP,
+/// exchange an ICMP echo, exercise UDP loopback, and attempt a DNS query.
+fn selftestM19() bool {
+    const status = network.init();
+    console.print("m19: pci devices={d}\n", .{status.pci_devices});
+    if (!status.device) {
+        if (status.init_error) |err| {
+            console.print("m19: legacy virtio-net unavailable: {s}\n", .{@errorName(err)});
+        } else {
+            console.write("m19: legacy virtio-net not found\n");
+        }
+        return false;
+    }
+
+    const device = pci.find(pci.virtio_vendor_id, pci.virtio_legacy_net_device_id) orelse return false;
+    const bar = device.bar(0) orelse return false;
+    const info = status.info orelse return false;
+
+    var mac_buffer: [18]u8 = undefined;
+    const mac_text = net.macString(&mac_buffer, info.mac);
+    console.print("m19: pci virtio-net bus={d} slot={d} fn={d} io=0x{x} irq={d}\n", .{
+        device.bus, device.device, device.function, bar.base, device.irq_line,
+    });
+    console.print("m19: virtio-net mac={s} rxq={d} txq={d} io=0x{x} ring_pages={d}/{d}\n", .{
+        mac_text,           info.rx_queue_size, info.tx_queue_size, info.io_base,
+        info.rx_ring_pages, info.tx_ring_pages,
+    });
+    if (info.rx_queue_size == 0 or info.tx_queue_size == 0 or
+        info.rx_ring_pages == 0 or info.tx_ring_pages == 0) return false;
+
+    var ip_buffer: [16]u8 = undefined;
+    var gateway_buffer: [16]u8 = undefined;
+    var dns_buffer: [16]u8 = undefined;
+    const ip_text = net.ipv4String(&ip_buffer, network.guest_ip);
+    const gateway_text = net.ipv4String(&gateway_buffer, network.gateway_ip);
+    const dns_text = net.ipv4String(&dns_buffer, network.dns_ip);
+    console.print("m19: ipv4 address={s} gateway={s} dns={s}\n", .{
+        ip_text, gateway_text, dns_text,
+    });
+
+    const gateway_mac = net.arpResolve(network.gateway_ip, m19_arp_timeout_ns) orelse {
+        console.write("m19: arp gateway failed\n");
+        return false;
+    };
+    var gateway_mac_buffer: [18]u8 = undefined;
+    console.print("m19: arp gateway mac={s}\n", .{
+        net.macString(&gateway_mac_buffer, gateway_mac),
+    });
+
+    if (!net.ping(network.gateway_ip, m19_ping_timeout_ns)) {
+        console.write("m19: icmp gateway echo failed\n");
+        return false;
+    }
+    console.print("m19: icmp echo reply gateway={s}\n", .{gateway_text});
+
+    const loopback: net.Ipv4 = .{ 127, 0, 0, 1 };
+    if (!net.ping(loopback, m19_udp_timeout_ns)) {
+        console.write("m19: icmp loopback echo failed\n");
+        return false;
+    }
+    console.print("m19: icmp loopback reply=1\n", .{});
+
+    if (!net.udpBind(m19_udp_port)) {
+        console.write("m19: udp bind failed\n");
+        return false;
+    }
+    defer net.udpUnbind(m19_udp_port);
+
+    const payload = "m19 loopback datagram";
+    if (!net.udpSend(m19_udp_port, loopback, m19_udp_port, payload)) {
+        console.write("m19: udp loopback send failed\n");
+        return false;
+    }
+    var datagram_buffer: [64]u8 = undefined;
+    const datagram = net.udpRecv(m19_udp_port, m19_udp_timeout_ns, &datagram_buffer) orelse {
+        console.write("m19: udp loopback receive failed\n");
+        return false;
+    };
+    if (!std.mem.eql(u8, datagram_buffer[0..datagram.len], payload)) return false;
+    console.print("m19: udp loopback port={d} bytes={d}\n", .{ m19_udp_port, datagram.len });
+
+    const dns_result = net.dnsQueryTo(
+        network.stub_dns_ip,
+        network.stub_dns_port,
+        m19_dns_name,
+        m19_dns_timeout_ns,
+    );
+    if (dns_result) |address| {
+        var answer_buffer: [16]u8 = undefined;
+        console.print("m19: dns query name={s} status=ok address={s}\n", .{
+            m19_dns_name, net.ipv4String(&answer_buffer, address),
+        });
+    } else |err| {
+        console.print("m19: dns query name={s} status={s}\n", .{
+            m19_dns_name, @errorName(err),
+        });
+        return false;
+    }
+
+    return true;
 }
 
 /// Verify that an unmap after the APs are running triggers a TLB shootdown that

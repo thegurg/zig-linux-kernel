@@ -12,6 +12,13 @@ test {
     _ = @import("fs/fat.zig");
     _ = @import("fs/tar.zig");
     _ = @import("fs/vfs.zig");
+    _ = @import("net/arp.zig");
+    _ = @import("net/checksum.zig");
+    _ = @import("net/dns.zig");
+    _ = @import("net/ethernet.zig");
+    _ = @import("net/icmp.zig");
+    _ = @import("net/ipv4.zig");
+    _ = @import("net/udp.zig");
 }
 
 test "host test harness works" {

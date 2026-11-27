@@ -1,7 +1,7 @@
 # Testing
 
 **Purpose:** describe the host tests, the QEMU selftest, the fault test, the
-fallback boot test, the harness assertions, and the validation recorded for M18.
+fallback boot test, the harness assertions, and the validation recorded for M19.
 
 **Implementation status:** the test flow is **IMPLEMENTED** and is the required
 verification path for each milestone. Coverage gaps are documented below and in
@@ -11,7 +11,7 @@ verification path for each milestone. Coverage gaps are documented below and in
 
 | Layer | Command | What it proves |
 | --- | --- | --- |
-| Host unit tests | part of `zig build test` | The host harness, Limine bindings, and the pure FAT/tar/VFS modules run. |
+| Host unit tests | part of `zig build test` | The host harness, Limine bindings, and the pure FAT/tar/VFS and network packet modules run. |
 | QEMU selftest | `tools/run.sh <selftest> --test` | Boot, memory, interrupts, per-CPU scheduling, per-CPU timers, ACPI/IOAPIC delivery, synchronization, FPU, LAPIC/IPIs, concurrent allocation, and TLB-shootdown tests work together. |
 | QEMU fault test | `tools/run.sh <fault-test> --test-fault` | The `#PF` gate, `CR2` reporting, and fatal-exception exit path work. |
 | QEMU fallback boot | `tools/run.sh <fallback> --test-boot` | A `force_pit` image reaches the legacy PIT timer path and the idle transition. |
@@ -33,6 +33,13 @@ test {
     _ = @import("fs/fat.zig");
     _ = @import("fs/tar.zig");
     _ = @import("fs/vfs.zig");
+    _ = @import("net/arp.zig");
+    _ = @import("net/checksum.zig");
+    _ = @import("net/dns.zig");
+    _ = @import("net/ethernet.zig");
+    _ = @import("net/icmp.zig");
+    _ = @import("net/ipv4.zig");
+    _ = @import("net/udp.zig");
 }
 
 test "host test harness works" {
@@ -43,9 +50,11 @@ test "host test harness works" {
 Importing a module from a test block pulls its `test` declarations into the same
 test binary. Only pure, platform-independent modules may be imported there;
 kernel subsystems are exercised through QEMU because they depend on x86_64 state
-and devices. The host test run currently executes eleven tests: the harness and
-Limine marker checks, four FAT16/FAT32 tests that build images in memory, two
-tar tests, and two VFS mount/offset tests.
+and devices. The host test run currently executes twenty-six tests: the harness
+and Limine marker checks, four FAT16/FAT32 tests that build images in memory,
+two tar tests, two VFS mount/offset tests, and fifteen network tests covering
+Ethernet framing, ARP, IPv4, ICMP, UDP, checksums, and DNS encoding and answer
+decompression.
 
 ## QEMU selftest
 
@@ -94,8 +103,16 @@ initialization, `kmain` runs the checks in this order.
 | M18 initramfs | `m18: initramfs bytes=... file_bytes=21` | The Limine module is found, its tar checksum is valid, and the same path resolves through the `/initramfs` mount. |
 | M18 init from FAT | `m17: proc argv=init,basic env=M18=1`, `m18: init from fat status=42 reap=reaped pid=...` | `INIT.ELF` is read from FAT, spawned, run, waited on, and reaped. |
 | M18 result | `M18 checks passed` | The storage group completed with an empty process table. |
+| M19 PCI | `m19: pci devices=<n>`, `m19: pci virtio-net bus=... slot=... fn=... io=0x... irq=...` | Legacy enumeration finds the virtio-net device and an I/O BAR. |
+| M19 virtio-net | `m19: virtio-net mac=... rxq=256 txq=256 io=0x... ring_pages=3/3` | MAC negotiation succeeds and both queues have contiguous rings. |
+| M19 config | `m19: ipv4 address=10.0.2.15 gateway=10.0.2.2 dns=10.0.2.3` | The static QEMU user-mode configuration is installed. |
+| M19 ARP | `m19: arp gateway mac=...` | An ARP request for the gateway receives a reply. |
+| M19 ICMP | `m19: icmp echo reply gateway=10.0.2.2`, `m19: icmp loopback reply=1` | Echo works through the NIC and through loopback. |
+| M19 UDP | `m19: udp loopback port=49160 bytes=21` | A bound UDP socket receives the datagram sent to `127.0.0.1`. |
+| M19 DNS | `m19: dns query name=example.com status=ok address=93.184.216.34` | A real UDP DNS query is sent through the NIC and the A answer is parsed. |
+| M19 result | `M19 checks passed` | The network group completed. |
 | `int3` | `returned from int3`, `M14 checks passed` | Triggers a breakpoint on the BSP and proves the handler resumes. |
-| Success | `M18 checks passed` | Exits QEMU successfully after `int3` returns. |
+| Success | `M19 checks passed` | Exits QEMU successfully after `int3` returns. |
 
 The selftest logs diagnostic lines such as:
 
@@ -278,6 +295,45 @@ mode times out after 20 seconds because the guest is expected to stay idle.
 
 ## Recorded validation
 
+### M19 validation
+
+M19 validation ran the full matrix:
+
+- `zig build` (default ReleaseSafe): passed;
+- default KVM `zig build test` (`SMP=4`): passed;
+- TCG `ZIG_KERNEL_NO_KVM=1 zig build test`: passed;
+- `ZIG_KERNEL_SMP=2 zig build test`: passed;
+- `ZIG_KERNEL_SMP=1 zig build test`: passed;
+- `zig build -Doptimize=Debug test`: passed.
+
+The default KVM run reported:
+
+```text
+selftest: checking M19 virtio-net and network stack
+m19: pci devices=8
+m19: pci virtio-net bus=0 slot=4 fn=0 io=0x60e0 irq=10
+m19: virtio-net mac=52:54:00:12:34:56 rxq=256 txq=256 io=0x60e0 ring_pages=3/3
+m19: ipv4 address=10.0.2.15 gateway=10.0.2.2 dns=10.0.2.3
+m19: arp gateway mac=52:55:0a:00:02:02
+m19: icmp echo reply gateway=10.0.2.2
+m19: icmp loopback reply=1
+m19: udp loopback port=49160 bytes=21
+m19: dns query name=example.com status=ok address=93.184.216.34
+selftest: M19 checks passed
+```
+
+QEMU now always receives `-netdev user,id=net0` and one legacy
+`virtio-net-pci` device (`disable-modern=on`). For the smoke test the harness
+also starts [`tools/dns_stub.py`](../../tools/dns_stub.py) on the host; QEMU user
+networking carries the guest's query to the `10.0.2.2` host alias and the stub
+answers with `93.184.216.34`. That keeps the DNS check independent of the host
+resolver and internet access.
+
+M19 host tests cover Ethernet framing, ARP request/reply round trips, IPv4
+header checksums and subnet matching, ICMP checksums, UDP pseudo-header
+checksums, DNS query encoding, compressed answer parsing, and rejection of
+corrupt or truncated packets.
+
 ### M18 validation
 
 M18 validation ran the full matrix:
@@ -293,7 +349,7 @@ The default KVM run reported:
 
 ```text
 selftest: checking M18 PCI, virtio-blk and VFS
-m18: pci devices=7
+m18: pci devices=8
 m18: pci virtio-blk bus=0 slot=3 fn=0 io=0x6000 irq=11
 m18: virtio-blk sectors=8192 queue=256 io=0x6000 ring_pages=3
 m18: sector read lba=0 signature=ok oem=ZIGKERNL
@@ -552,16 +608,24 @@ commit. Earlier M10-M13 validation remains in
   with a malformed capability list.
 - The VFS is exercised only from the single boot task; there is no concurrent
   mount/open/read test and no mount-table exhaustion test.
+- M19 exercises one legacy virtio-net device, one static address, and one
+  transmit request at a time. It does not cover queue exhaustion, device reset,
+  a malformed ring, an off-subnet route, a full ARP cache, ARP expiry, a full
+  UDP socket table, an oversized datagram, IP fragmentation, TCP, DHCP, IPv6,
+  or a DNS response with multiple questions or non-A records.
+- ICMP coverage is echo only. There is no destination-unreachable or
+  time-exceeded handling.
+- The network stack is not exercised from ring 3 and has no socket syscalls.
 
 ## Implementation status
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Host test harness | **IMPLEMENTED** | Harness, Limine marker, and pure FAT/tar/VFS tests; eleven tests total. |
-| QEMU selftest | **IMPLEMENTED** | Checks M1c-M18 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, timekeeping, join, priorities, ring 3, address-space isolation, user copies, general ELF loading, W^X/NX, argv/envp, process lifecycle, PCI/virtio-blk, FAT/VFS, initramfs, and `int3`. |
+| Host test harness | **IMPLEMENTED** | Harness, Limine marker, and pure FAT/tar/VFS and network tests; twenty-six tests total. |
+| QEMU selftest | **IMPLEMENTED** | Checks M1c-M19 behavior, AP scheduling, IPIs, per-CPU timers, ACPI/IOAPIC delivery, concurrent allocation, TLB hardening, timekeeping, join, priorities, ring 3, address-space isolation, user copies, general ELF loading, W^X/NX, argv/envp, process lifecycle, PCI/virtio-blk, FAT/VFS, initramfs, virtio-net, ARP/ICMP/UDP/DNS, and `int3`. |
 | QEMU fault test | **IMPLEMENTED** | Verifies #PF and CR2 with APs online. |
 | QEMU fallback boot test | **IMPLEMENTED** | `force_pit` image reaches the PIT timer path and idle transition. |
-| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M18 test results. |
+| Log-marker assertions | **IMPLEMENTED** | Marker list plus dynamic `smp: cpus=<N>` and M11-M19 test results. |
 | Dynamic SMP assertion | **IMPLEMENTED** | Derived from `ZIG_KERNEL_SMP`; verified with 1, 2, and 4 CPUs. |
 | AP exception/FPU test | **IMPLEMENTED** | `int3` on CPU 1 with XMM5 preservation. |
 | TLB-shootdown test | **IMPLEMENTED** | Counter check, IRQ-off target, and concurrent shootdowns. |

@@ -39,6 +39,10 @@ kernel requests:
 | MP | Asks Limine to bootstrap and park secondary CPUs until the kernel publishes `goto_address`. |
 | Module | Supplies the initramfs tar passed by `boot/limine.conf` as `MODULE_PATH` with `MODULE_STRING: initramfs`. |
 
+Normal boot initializes storage and the network after the selftest/fault/boot
+decision and logs one non-fatal summary line for each before starting the timer
+path and exiting to idle.
+
 The menu entry also declares `module_path: boot():/initramfs.tar` and
 `module_string: initramfs`. [`tools/run.sh`](../../tools/run.sh) generates the
 archive and copies it into the ESP before boot, so the same menu works for the
@@ -134,7 +138,7 @@ The build creates four images from the same source using `build_options` in
 | Variant | Options | Behavior |
 | --- | --- | --- |
 | Normal kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = false` | Reports boot information, starts the APs into their scheduler idle loops, starts CPU 0's LAPIC timer (PIT fallback if calibration failed), and exits the boot task into the BSP idle task. |
-| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M17 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, M14 ACPI/IOAPIC/CPU 0 timer, M15 time/join/priority/deadline, M16 ring-3/address-space, and M17 ELF/process-lifecycle checks; M18 then enumerates PCI, initializes legacy virtio-blk, mounts FAT and the Limine-module initramfs, and runs `INIT.ELF`; it finally triggers `int3` and exits QEMU with success. |
+| Selftest kernel | `exit_after_boot = true`, `test_page_fault = false`, `force_pit = false` | Skips the early AP release, runs the M1c-M17 self-tests, then `selftestSmp()` starts the APs and runs the M11 SMP, M12 allocator/TLB, M13 per-CPU timer, M14 ACPI/IOAPIC/CPU 0 timer, M15 time/join/priority/deadline, M16 ring-3/address-space, and M17 ELF/process-lifecycle checks; M18 then enumerates PCI, initializes legacy virtio-blk, mounts FAT and the Limine-module initramfs, and runs `INIT.ELF`; M19 initializes legacy virtio-net, resolves and pings the gateway, exercises loopback and UDP, and queries the deterministic DNS stub; it finally triggers `int3` and exits QEMU with success. |
 | Fault-test kernel | `exit_after_boot = false`, `test_page_fault = true`, `force_pit = false` | Starts the APs into their scheduler idle loops, then deliberately dereferences NULL to exercise the #PF path and the failure exit. |
 | Fallback kernel | `exit_after_boot = false`, `test_page_fault = false`, `force_pit = true` | Boots normally but forces the PIT IRQ0 timer path and the tick clocksource so `--test-boot` can assert the fallback. |
 

@@ -53,6 +53,8 @@ pub const Device = struct {
 pub const virtio_vendor_id: u16 = 0x1af4;
 pub const virtio_legacy_blk_device_id: u16 = 0x1001;
 pub const virtio_modern_blk_device_id: u16 = 0x1042;
+pub const virtio_legacy_net_device_id: u16 = 0x1000;
+pub const virtio_modern_net_device_id: u16 = 0x1041;
 
 const command_io_space: u16 = 1 << 0;
 const command_memory_space: u16 = 1 << 1;

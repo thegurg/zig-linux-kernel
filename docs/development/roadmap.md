@@ -4,9 +4,9 @@
 in this document is implemented unless it is also described as implemented in
 the architecture documents.
 
-**Current status:** M0-M18 are complete and validated through the QEMU test
-flow. M19 is the next milestone. M19-M20 are planned and are recorded below with
-their scope and verification criteria.
+**Current status:** M0-M19 are complete and validated through the QEMU test
+flow. M20 is the next milestone and is recorded below with its scope and
+verification criteria.
 
 ## Pre-M11 bugfix pass (complete)
 
@@ -650,7 +650,7 @@ Validation ran the full matrix: default KVM, TCG, `SMP=2`, `SMP=1`, and Debug
 all passed. The default run logged:
 
 ```text
-m18: pci devices=7
+m18: pci devices=8
 m18: pci virtio-blk bus=0 slot=3 fn=0 io=0x6000 irq=11
 m18: virtio-blk sectors=8192 queue=256 io=0x6000 ring_pages=3
 m18: sector read lba=0 signature=ok oem=ZIGKERNL
@@ -672,7 +672,7 @@ FAT12 unsupported, no directory streams or permissions in the VFS, no
 recorded in [technical debt](../development/technical-debt.md) and in the
 [storage architecture page](../architecture/storage.md).
 
-## M19: virtio-net and network stack (planned)
+## M19: virtio-net and network stack (complete)
 
 ### Goal
 
@@ -692,6 +692,67 @@ Add a small, testable network path.
 - Answer ARP and receive an ICMP echo reply from the QEMU gateway.
 - Exchange a UDP datagram and verify loopback.
 - All earlier milestones remain green under KVM and TCG.
+
+### Results
+
+The network path landed with polling only and a static IPv4 configuration.
+TCP, DHCP, MSI-X, modern virtio, and socket syscalls remain deferred.
+
+- [`src/drivers/virtio_net.zig`](../../src/drivers/virtio_net.zig) implements
+  the legacy virtio-net device (`0x1000`) over the I/O BAR. It negotiates only
+  `VIRTIO_NET_F_MAC`, sets up receive queue 0 and transmit queue 1, keeps one
+  physically contiguous ring per queue, and handles the legacy 10-byte
+  virtio-net header. The receive ring holds sixteen 2 KiB buffers in one
+  contiguous pool; a completed buffer is copied out and republished
+  immediately. Transmit uses one static buffer and one outstanding request.
+  Completion polling compares the device's used index with a driver-side count
+  of consumed completions, so a completion that arrives before the driver
+  polls is not lost.
+- [`src/net/ethernet.zig`](../../src/net/ethernet.zig),
+  [`arp.zig`](../../src/net/arp.zig), [`ipv4.zig`](../../src/net/ipv4.zig),
+  [`icmp.zig`](../../src/net/icmp.zig), [`udp.zig`](../../src/net/udp.zig), and
+  [`dns.zig`](../../src/net/dns.zig) are pure packet modules with host tests.
+  IPv4 rejects fragments and bad header checksums; ICMP implements echo;
+  UDP validates the pseudo-header checksum; DNS builds A/IN queries and walks
+  compressed answers.
+- [`src/net/net.zig`](../../src/net/net.zig) dispatches frames, keeps an
+  eight-entry ARP cache, selects the gateway for off-subnet destinations,
+  delivers loopback packets through the normal receive path, and exposes an
+  eight-slot UDP socket table. `udpBind`/`udpRecv`/`udpUnbind` and
+  `dnsQuery`/`dnsQueryTo` are the kernel-side API.
+- [`src/network.zig`](../../src/network.zig) owns the fixed QEMU addresses:
+  `10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`.
+- [`tools/dns_stub.py`](../../tools/dns_stub.py) answers `10.0.2.2:5353` with a
+  fixed A record, so the DNS smoke test is deterministic and does not depend on
+  the host resolver or internet access. QEMU user networking carries the query
+  from the guest to the host alias.
+- `tools/run.sh` replaces `-net none` with a user-mode netdev and a legacy
+  virtio-net device (`disable-modern=on`), starts the DNS stub for the smoke
+  test, and asserts the M19 markers.
+
+Validation ran the full matrix: default KVM, TCG, `SMP=2`, `SMP=1`, and Debug
+all passed. The default run logged:
+
+```text
+selftest: checking M19 virtio-net and network stack
+m19: pci devices=8
+m19: pci virtio-net bus=0 slot=4 fn=0 io=0x60e0 irq=10
+m19: virtio-net mac=52:54:00:12:34:56 rxq=256 txq=256 io=0x60e0 ring_pages=3/3
+m19: ipv4 address=10.0.2.15 gateway=10.0.2.2 dns=10.0.2.3
+m19: arp gateway mac=52:55:0a:00:02:02
+m19: icmp echo reply gateway=10.0.2.2
+m19: icmp loopback reply=1
+m19: udp loopback port=49160 bytes=21
+m19: dns query name=example.com status=ok address=93.184.216.34
+selftest: M19 checks passed
+```
+
+Limitations carried forward: polling only, no MSI-X or modern virtio, one NIC,
+one outstanding transmit, static configuration, no DHCP/TCP/IPv6, no
+fragmentation or reassembly, no dynamic routing, a small non-ageing ARP cache,
+one pending datagram per UDP socket, and no ring-3 socket syscalls. These are
+recorded in [technical debt](../development/technical-debt.md) and in the
+[network architecture page](../architecture/network.md).
 
 ## M20: robustness, SMP maturity, and observability (planned)
 
@@ -766,8 +827,8 @@ dependency, not by priority.
 | M15 | **IMPLEMENTED** | Invariant-TSC detection and calibration, cross-CPU sync, monotonic nanosecond clock, tick fallback, deadline queue, sleep helpers, join, priorities with ageing. |
 | M16 | **IMPLEMENTED** | Ring 3, per-task low-half address spaces with shared kernel high half, `int 0x80` gate, `swapgs`, per-task kernel stacks/TSS `RSP0`, validated user copies, syscalls, CR3 switching, user-half teardown, minimal test-only ELF loader. |
 | M17 | **IMPLEMENTED** | General `ET_EXEC` ELF64 validation, W^X/NX, `argc`/`argv`/`envp`, stack guard page, `spawn`/`wait`/`reap`, process table, generation handles, leak-free teardown. |
-| M18 | **PLANNED** | PCI enumeration, virtio-blk polling, optional MSI-X extension, block layer, VFS, FAT, initramfs. |
-| M19 | **PLANNED** | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP, loopback, minimal socket API. |
+| M18 | **IMPLEMENTED** | Legacy PCI enumeration, virtio-blk polling, block layer, VFS, FAT16/FAT32, initramfs, generated fixtures. |
+| M19 | **IMPLEMENTED** | Legacy virtio-net polling, Ethernet/ARP/IPv4/ICMP/UDP, loopback, fixed UDP sockets, DNS client and deterministic stub. |
 | M20 | **PLANNED** | Shell, panic unwinding, cross-CPU NMI watchdog, migration, failure injection, stress. |
 
 ## Related documentation
@@ -776,6 +837,7 @@ dependency, not by priority.
 - [Scheduling](../architecture/scheduling.md)
 - [Synchronization](../architecture/synchronization.md)
 - [SMP bring-up](../architecture/smp.md)
+- [Networking](../architecture/network.md)
 - [Technical debt](technical-debt.md)
 - [Testing](testing.md)
 - [Building](building.md)

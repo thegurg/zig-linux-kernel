@@ -47,7 +47,14 @@ done
 [ $missing -eq 0 ] || exit 1
 
 WORK="$(mktemp -d /tmp/zig-kernel.XXXXXX)"
-cleanup() { rm -rf "$WORK"; }
+DNS_STUB_PID=""
+cleanup() {
+  if [ -n "$DNS_STUB_PID" ]; then
+    kill "$DNS_STUB_PID" 2>/dev/null || true
+    wait "$DNS_STUB_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 ESP="$WORK/esp"
@@ -78,6 +85,15 @@ if [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${ZIG_KERNEL_NO_KVM:-0}" != "1" ]; t
   fi
 fi
 
+# The M19 smoke test sends a DNS query to the host alias through QEMU user
+# networking. A fixed local responder makes the result deterministic even when
+# the host has no resolver or internet access.
+if [ "$MODE" = "smoke" ]; then
+  python3 "$ROOT/tools/dns_stub.py" --port 5353 >"$WORK/dns-stub.log" 2>&1 &
+  DNS_STUB_PID=$!
+  sleep 0.3
+fi
+
 QEMU=(
   qemu-system-x86_64
   -machine q35
@@ -90,11 +106,12 @@ QEMU=(
   -device virtio-blk-pci,drive=esp,disable-legacy=on
   -drive "format=raw,file=$WORK/disk.img,if=none,id=blk0"
   -device virtio-blk-pci,drive=blk0,disable-modern=on
+  -netdev user,id=net0
+  -device virtio-net-pci,netdev=net0,disable-modern=on
   -boot order=c
   -device isa-debug-exit,iobase=0xf4,iosize=0x04
   -no-reboot
   -display none
-  -net none
 )
 
 if [ "$MODE" != "run" ]; then
@@ -134,6 +151,16 @@ if [ "$MODE" != "run" ]; then
            grep -q "m16: aspace created=9 destroyed=9" "$WORK/serial.log" &&
            grep -q "M17 checks passed" "$WORK/serial.log" &&
            grep -q "M18 checks passed" "$WORK/serial.log" &&
+           grep -q "M19 checks passed" "$WORK/serial.log" &&
+           grep -q "m19: pci devices=" "$WORK/serial.log" &&
+           grep -q "m19: pci virtio-net bus=.* io=0x.* irq=" "$WORK/serial.log" &&
+           grep -qE "m19: virtio-net mac=([0-9a-f]{2}:){5}[0-9a-f]{2} rxq=[0-9]+ txq=[0-9]+ io=0x[0-9a-f]+ ring_pages=[0-9]+/[0-9]+" "$WORK/serial.log" &&
+           grep -q "m19: ipv4 address=10.0.2.15 gateway=10.0.2.2 dns=10.0.2.3" "$WORK/serial.log" &&
+           grep -q "m19: arp gateway mac=" "$WORK/serial.log" &&
+           grep -q "m19: icmp echo reply gateway=10.0.2.2" "$WORK/serial.log" &&
+           grep -q "m19: icmp loopback reply=1" "$WORK/serial.log" &&
+           grep -q "m19: udp loopback port=49160 bytes=21" "$WORK/serial.log" &&
+           grep -q "m19: dns query name=example.com status=ok address=93.184.216.34" "$WORK/serial.log" &&
            grep -q "m18: pci devices=" "$WORK/serial.log" &&
            grep -q "m18: pci virtio-blk bus=.* io=0x.* irq=" "$WORK/serial.log" &&
            grep -qE "m18: virtio-blk sectors=[0-9]+ queue=[0-9]+ io=0x[0-9a-f]+ ring_pages=[0-9]+" "$WORK/serial.log" &&
